@@ -101,6 +101,9 @@ typedef enum {
     ZL_StandardNodeID_hilbert3_u16,
     ZL_StandardNodeID_hilbert3_i32,
 
+    ZL_StandardNodeID_morton3_u16,
+    ZL_StandardNodeID_morton3_i32,
+
     ZL_StandardNodeID_public_end // last id, used to detect end of public range
 } ZL_StandardNodeID;
 

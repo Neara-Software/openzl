@@ -323,6 +323,9 @@ typedef enum {
     ZL_StandardTransformID_hilbert3_u16 = 68,
     ZL_StandardTransformID_hilbert3_i32 = 69,
 
+    ZL_StandardTransformID_morton3_u16 = 70,
+    ZL_StandardTransformID_morton3_i32 = 71,
+
     ZL_StandardTransformID_end =
             128 // last id, used to detect end of ID range (impacts
                 // header encoding) give some room to be able to add new
