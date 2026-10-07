@@ -276,6 +276,8 @@ const InternalGraphDesc GR_standardGraphs[ZL_PrivateStandardGraphID_end] = {
     REGISTER_STATIC_GRAPH(ZL_PrivateStandardGraphID_transformer_static_delta_tok_mono_lz, "!zl.private.transformer_static_delta_tok_mono_lz", ZL_Type_numeric, ZL_StandardNodeID_delta_int, _1_SUCCESSOR(ZL_PrivateStandardGraphID_transformer_static_tok_mono_lz), TRANSFORMER_NUMERIC_MIN_LIBRARY_VERSION),
     REGISTER_SELECTOR(ZL_PrivateStandardGraphID_transformer_static_fallback, "!zl.private.transformer_static_fallback", SI_transformer_static_fallback_select, ZL_Type_numeric, TRANSFORMER_NUMERIC_MIN_LIBRARY_VERSION),
     REGISTER_SELECTOR(ZL_PrivateStandardGraphID_transformer_numeric1, "!zl.private.transformer_numeric1", SI_transformer_numeric_select, ZL_Type_numeric, TRANSFORMER_NUMERIC_MIN_LIBRARY_VERSION),
+
+    REGISTER_SELECTOR(ZL_PrivateStandardGraphID_brute_force, "!zl.private.brute_force", SI_selector_brute_force, ZL_Type_serial | ZL_Type_numeric | ZL_Type_struct | ZL_Type_string, 200),
 };
 // clang-format on
 
