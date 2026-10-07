@@ -14,6 +14,11 @@ ZL_Report DI_hilbert3_u16(ZL_Decoder* dictx, const ZL_Input* ins[]);
 #define DI_HILBERT3_U16(id) \
     { .transform_f = DI_hilbert3_u16, .name = "hilbert3_u16" }
 
+ZL_Report DI_hilbert3_i32(ZL_Decoder* dictx, const ZL_Input* ins[]);
+
+#define DI_HILBERT3_I32(id) \
+    { .transform_f = DI_hilbert3_i32, .name = "hilbert3_i32" }
+
 ZL_END_C_DECLS
 
 #endif

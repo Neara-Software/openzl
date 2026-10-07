@@ -142,6 +142,7 @@ const StandardDTransform SDecoders_array[ZL_StandardTransformID_end] = {
     REGISTER_TTRANSFORM_G(ZL_StandardTransformID_sparse_num, 26, DI_SPARSE_NUM, SPARSE_NUM_GRAPH),
     REGISTER_TTRANSFORM_G(ZL_StandardTransformID_pivco_huffman, 27, DI_PIVCO_HUFFMAN, PIVCO_HUFFMAN_GRAPH),
     REGISTER_TTRANSFORM_G(ZL_StandardTransformID_hilbert3_u16, 27, DI_HILBERT3_U16, HILBERT3_U16_GRAPH),
+    REGISTER_TTRANSFORM_G(ZL_StandardTransformID_hilbert3_i32, 27, DI_HILBERT3_I32, HILBERT3_I32_GRAPH),
 
     REGISTER_VOTRANSFORM_G(ZL_StandardTransformID_splitn, 9, DI_SPLITN, GRAPH_VO_SERIAL),
     REGISTER_VOTRANSFORM_G(ZL_StandardTransformID_splitn_struct, 14, DI_SPLITN_STRUCT, GRAPH_VO_STRUCT),

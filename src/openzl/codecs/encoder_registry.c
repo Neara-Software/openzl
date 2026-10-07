@@ -142,6 +142,7 @@ const CNode ER_standardNodes[STANDARD_ENCODERS_NB] = {
     REGISTER_TRANSFORM(ZL_StandardNodeID_sparse_num, ZL_StandardTransformID_sparse_num, 26, 202, EI_SPARSE_NUM),
     REGISTER_TRANSFORM(ZL_StandardNodeID_sparse_num_auto, ZL_StandardTransformID_sparse_num, 26, 202, EI_SPARSE_NUM_AUTO),
     REGISTER_TRANSFORM(ZL_StandardNodeID_hilbert3_u16, ZL_StandardTransformID_hilbert3_u16, 27, 204, EI_HILBERT3_U16),
+    REGISTER_TRANSFORM(ZL_StandardNodeID_hilbert3_i32, ZL_StandardTransformID_hilbert3_i32, 27, 204, EI_HILBERT3_I32),
 
     // Private Nodes
     REGISTER_TRANSFORM(ZL_PrivateStandardNodeID_set_string_lens,           ZL_StandardTransformID_convert_serial_string, 10, 200, EI_SETSTRINGLENS),

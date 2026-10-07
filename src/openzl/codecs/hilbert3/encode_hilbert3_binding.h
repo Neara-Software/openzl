@@ -17,6 +17,14 @@ EI_hilbert3_u16(ZL_Encoder* eictx, const ZL_Input* ins[], size_t nbIns);
       .transform_f = EI_hilbert3_u16,        \
       .name        = "!zl.hilbert3_u16" }
 
+ZL_Report
+EI_hilbert3_i32(ZL_Encoder* eictx, const ZL_Input* ins[], size_t nbIns);
+
+#define EI_HILBERT3_I32(id)                  \
+    { .gd          = HILBERT3_I32_GRAPH(id), \
+      .transform_f = EI_hilbert3_i32,        \
+      .name        = "!zl.hilbert3_i32" }
+
 ZL_END_C_DECLS
 
 #endif
