@@ -83,6 +83,15 @@ void CCTX_free(ZL_CCtx* cctx);
 ZL_CCtx* CCTX_createDerivedCCtx(const ZL_CCtx* originalCCtx);
 
 /**
+ * When enabled, the trial compressions of @p cctx (tryGraph, e.g. under the
+ * brute-force selector) also call its introspection hooks. Off by default,
+ * because hooks such as the compression tracer expect one top-level
+ * compression. Training sample collection enables it so it sees the inputs
+ * of every brute-force candidate, not only the chosen one.
+ */
+void CCTX_setIntrospectTrials(ZL_CCtx* cctx, bool enable);
+
+/**
  * @brief Function pointer type for Graph2 compression graph generation
  * functions.
  *

@@ -142,6 +142,7 @@ struct ZL_CCtx_s {
     size_t tryGraphCodecOutputCacheMaxBytes; // 0 disables automatic caching
     bool tryGraphCodecOutputCacheActive;
     bool tryGraphCodecOutputCacheStatsEnabled;
+    bool introspectTrials; // derived (trial) contexts inherit the hooks
     GCParams requestedGCParams; // User selection, at CCtx level
     GCParams appliedGCParams;   // Employed at compression time;
                                 // CCtx > Compressor > default
@@ -268,6 +269,12 @@ ZL_Report ZL_CCtx_attachIntrospectionHooks(
     oc->compressIntrospectionHooks = *hooks;
     oc->hasCompressionHooks        = true;
     return ZL_returnSuccess();
+}
+
+void CCTX_setIntrospectTrials(ZL_CCtx* cctx, bool enable)
+{
+    ZL_ASSERT_NN(cctx);
+    cctx->introspectTrials = enable;
 }
 
 ZL_Report ZL_CCtx_detachAllIntrospectionHooks(ZL_CCtx* cctx)
@@ -2118,6 +2125,13 @@ ZL_CCtx* CCTX_createDerivedCCtx(const ZL_CCtx* originalCCtx)
             originalCCtx->tryGraphCodecOutputCacheMaxBytes;
     cctx->tryGraphCodecOutputCacheStatsEnabled =
             originalCCtx->tryGraphCodecOutputCacheStatsEnabled;
+    if (originalCCtx->introspectTrials) {
+        cctx->opCtx.compressIntrospectionHooks =
+                originalCCtx->opCtx.compressIntrospectionHooks;
+        cctx->opCtx.hasCompressionHooks =
+                originalCCtx->opCtx.hasCompressionHooks;
+        cctx->introspectTrials = true;
+    }
     return cctx;
 }
 
