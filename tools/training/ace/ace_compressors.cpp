@@ -69,6 +69,7 @@ std::vector<ACENode> makeAllNodes()
     n.push_back(buildNode(nodes::ConvertStructToNumBE{}));
     n.push_back(buildNode(nodes::SeparateStringComponents{}));
     n.push_back(buildNode(nodes::Hilbert3U16{}));
+    n.push_back(buildNode(nodes::Hilbert3I32{}));
     return n;
 }
 

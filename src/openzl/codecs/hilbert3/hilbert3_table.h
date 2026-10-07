@@ -400,4 +400,10 @@ static const uint16_t ZL_hilbert3_T3[12 * 512] = {
 static const uint8_t ZL_hilbert3_topM[8] = { 0, 1, 3, 2, 6, 7, 5, 4 };
 static const uint8_t ZL_hilbert3_topS[8] = { 0, 4, 4, 11, 11, 5, 5, 2 };
 
+/* 32-level keys: the top 2 levels (6 key bits, bits 90-95) -> packed top
+ * xyz bits (x | y << 2 | z << 4) and the ZL_hilbert3_T3 state for the next
+ * 30 levels. */
+static const uint8_t ZL_hilbert3_top2M[64] = { 0, 4, 20, 16, 17, 21, 5, 1, 2, 18, 19, 3, 7, 23, 22, 6, 10, 26, 27, 11, 15, 31, 30, 14, 13, 12, 8, 9, 25, 24, 28, 29, 45, 44, 40, 41, 57, 56, 60, 61, 62, 46, 47, 63, 59, 43, 42, 58, 54, 38, 39, 55, 51, 35, 34, 50, 49, 53, 37, 33, 32, 36, 52, 48 };
+static const uint8_t ZL_hilbert3_top2S[64] = { 4, 8, 8, 3, 3, 9, 9, 6, 8, 0, 0, 7, 7, 1, 1, 10, 8, 0, 0, 7, 7, 1, 1, 10, 1, 6, 6, 8, 8, 7, 7, 3, 1, 6, 6, 8, 8, 7, 7, 3, 10, 3, 3, 6, 6, 2, 2, 8, 10, 3, 3, 6, 6, 2, 2, 8, 7, 9, 9, 1, 1, 8, 8, 5 };
+
 #endif

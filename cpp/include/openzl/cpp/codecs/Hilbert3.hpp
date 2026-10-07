@@ -20,5 +20,17 @@ struct Hilbert3U16 : public SimplePipeNode<Hilbert3U16> {
                 "6-byte xyz u16 records to u64 gaps of their 3D Hilbert keys",
     };
 };
+
+struct Hilbert3I32 : public SimplePipeNode<Hilbert3I32> {
+   public:
+    static constexpr NodeID node = ZL_NODE_HILBERT3_I32;
+
+    static constexpr NodeMetadata<1, 1> metadata = {
+        .inputs           = { InputMetadata{ .type = Type::Struct } },
+        .singletonOutputs = { OutputMetadata{ .type = Type::Numeric } },
+        .description =
+                "12-byte xyz i32 records to u64 gaps of their 3D Hilbert keys",
+    };
+};
 } // namespace nodes
 } // namespace openzl

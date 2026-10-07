@@ -14,4 +14,8 @@
         .soTypes    = ZL_STREAMTYPELIST(ZL_Type_numeric), \
     }
 
+/* Input 0: struct stream, 12-byte records (x, y, z as Int32LE)
+ * Output 0: numeric u64 stream of 96-bit 3D Hilbert key gaps with escapes */
+#define HILBERT3_I32_GRAPH(id) HILBERT3_U16_GRAPH(id)
+
 #endif
