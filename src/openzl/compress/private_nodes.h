@@ -248,6 +248,10 @@ typedef enum {
     ZL_PrivateStandardGraphID_transformer_static_fallback,
     ZL_PrivateStandardGraphID_transformer_numeric1,
 
+    /// Name-only alias of ZL_GRAPH_BRUTE_FORCE, kept so compressors serialized
+    /// by ar/hilbert3 (which registered the selector privately) deserialize.
+    ZL_PrivateStandardGraphID_brute_force,
+
     ZL_PrivateStandardGraphID_end // last id, used to detect out-of-bound enum
                                   // values
 } ZL_PrivateStandardGraphID;
