@@ -672,6 +672,150 @@ compressProfiles()
                 nullptr,
                 true);
 
+        std::string kPointsMk16Name = "points-mk16";
+        mp[kPointsMk16Name]         = std::make_shared<CompressProfile>(
+                kPointsMk16Name,
+                "Points of 6-byte records (x, y, z UInt16LE), sorted by 3D Morton key: morton3_u16 key gaps compressed by ACE",
+                [](ZL_Compressor* comp, void*, const ProfileArgs& args) {
+                    ZL_GraphID graph = ZL_Compressor_buildACEGraphWithDefault(
+                            comp, ZL_GRAPH_FIELD_LZ);
+                    graph = ZL_Compressor_registerStaticGraph_fromNode1o(
+                            comp, ZL_NODE_MORTON3_U16, graph);
+                    ZL_NodeID const toStruct = unwrap(
+                            ZL_Compressor_parameterizeConvertSerialToStructNode(
+                                    comp, 6),
+                            "Failed to set up points-mk16 profile",
+                            comp);
+                    graph = ZL_Compressor_registerStaticGraph_fromNode1o(
+                            comp, toStruct, graph);
+                    size_t chunkSize = args.chunkSize().value_or(
+                            ZL_DEFAULT_SEGMENTER_CHUNK_BYTE_SIZE);
+                    return ZL_Compressor_buildSerialSegmenter(
+                            comp, chunkSize - chunkSize % 6, graph);
+                },
+                nullptr,
+                true);
+
+        std::string kPointsMk32Name = "points-mk32";
+        mp[kPointsMk32Name]         = std::make_shared<CompressProfile>(
+                kPointsMk32Name,
+                "Points of 12-byte records (x, y, z Int32LE), sorted by 3D Morton key: morton3_i32 key gaps compressed by ACE",
+                [](ZL_Compressor* comp, void*, const ProfileArgs& args) {
+                    ZL_GraphID graph = ZL_Compressor_buildACEGraphWithDefault(
+                            comp, ZL_GRAPH_FIELD_LZ);
+                    graph = ZL_Compressor_registerStaticGraph_fromNode1o(
+                            comp, ZL_NODE_MORTON3_I32, graph);
+                    ZL_NodeID const toStruct = unwrap(
+                            ZL_Compressor_parameterizeConvertSerialToStructNode(
+                                    comp, 12),
+                            "Failed to set up points-mk32 profile",
+                            comp);
+                    graph = ZL_Compressor_registerStaticGraph_fromNode1o(
+                            comp, toStruct, graph);
+                    size_t chunkSize = args.chunkSize().value_or(
+                            ZL_DEFAULT_SEGMENTER_CHUNK_BYTE_SIZE);
+                    return ZL_Compressor_buildSerialSegmenter(
+                            comp, chunkSize - chunkSize % 12, graph);
+                },
+                nullptr,
+                true);
+
+        std::string kPointsU16MAutoName = "points-u16-mauto";
+        mp[kPointsU16MAutoName]         = std::make_shared<CompressProfile>(
+                kPointsU16MAutoName,
+                "Points of 6-byte records (x, y, z UInt16LE): per frame, the smaller of per-axis u16 fields -> ACE and morton3_u16 key gaps -> ACE",
+                [](ZL_Compressor* comp, void*, const ProfileArgs& args) {
+                    const size_t fieldSizes[3] = { 2, 2, 2 };
+                    ZL_GraphID axes[3];
+                    for (auto& axis : axes) {
+                        axis = ZL_Compressor_registerStaticGraph_fromNode1o(
+                                comp,
+                                ZL_NODE_CONVERT_STRUCT_TO_NUM_LE,
+                                ZL_Compressor_buildACEGraphWithDefault(
+                                        comp, ZL_GRAPH_FIELD_LZ));
+                    }
+                    ZL_GraphID const perAxis =
+                            ZL_Compressor_registerSplitByStructGraph(
+                                    comp, fieldSizes, axes, 3);
+
+                    ZL_GraphID morton = ZL_Compressor_buildACEGraphWithDefault(
+                            comp, ZL_GRAPH_FIELD_LZ);
+                    morton = ZL_Compressor_registerStaticGraph_fromNode1o(
+                            comp, ZL_NODE_MORTON3_U16, morton);
+                    ZL_NodeID const toStruct = unwrap(
+                            ZL_Compressor_parameterizeConvertSerialToStructNode(
+                                    comp, 6),
+                            "Failed to set up points-u16-mauto profile",
+                            comp);
+                    morton = ZL_Compressor_registerStaticGraph_fromNode1o(
+                            comp, toStruct, morton);
+
+                    const ZL_GraphID candidates[2] = { perAxis, morton };
+                    const ZL_GraphParameters selectorParams = {
+                        .customGraphs   = candidates,
+                        .nbCustomGraphs = 2,
+                    };
+                    ZL_GraphID const smallest = unwrap(
+                            ZL_Compressor_parameterizeGraph(
+                                    comp, ZL_GRAPH_BRUTE_FORCE, &selectorParams),
+                            "Failed to set up points-u16-mauto profile",
+                            comp);
+                    size_t chunkSize = args.chunkSize().value_or(
+                            ZL_DEFAULT_SEGMENTER_CHUNK_BYTE_SIZE);
+                    return ZL_Compressor_buildSerialSegmenter(
+                            comp, chunkSize - chunkSize % 6, smallest);
+                },
+                nullptr,
+                true);
+
+        std::string kPointsI32MAutoName = "points-i32-mauto";
+        mp[kPointsI32MAutoName]         = std::make_shared<CompressProfile>(
+                kPointsI32MAutoName,
+                "Points of 12-byte records (x, y, z Int32LE): per frame, the smaller of per-axis i32 fields -> ACE and morton3_i32 key gaps -> ACE",
+                [](ZL_Compressor* comp, void*, const ProfileArgs& args) {
+                    const size_t fieldSizes[3] = { 4, 4, 4 };
+                    ZL_GraphID axes[3];
+                    for (auto& axis : axes) {
+                        axis = ZL_Compressor_registerStaticGraph_fromNode1o(
+                                comp,
+                                ZL_NODE_CONVERT_STRUCT_TO_NUM_LE,
+                                ZL_Compressor_buildACEGraphWithDefault(
+                                        comp, ZL_GRAPH_FIELD_LZ));
+                    }
+                    ZL_GraphID const perAxis =
+                            ZL_Compressor_registerSplitByStructGraph(
+                                    comp, fieldSizes, axes, 3);
+
+                    ZL_GraphID morton = ZL_Compressor_buildACEGraphWithDefault(
+                            comp, ZL_GRAPH_FIELD_LZ);
+                    morton = ZL_Compressor_registerStaticGraph_fromNode1o(
+                            comp, ZL_NODE_MORTON3_I32, morton);
+                    ZL_NodeID const toStruct = unwrap(
+                            ZL_Compressor_parameterizeConvertSerialToStructNode(
+                                    comp, 12),
+                            "Failed to set up points-i32-mauto profile",
+                            comp);
+                    morton = ZL_Compressor_registerStaticGraph_fromNode1o(
+                            comp, toStruct, morton);
+
+                    const ZL_GraphID candidates[2] = { perAxis, morton };
+                    const ZL_GraphParameters selectorParams = {
+                        .customGraphs   = candidates,
+                        .nbCustomGraphs = 2,
+                    };
+                    ZL_GraphID const smallest = unwrap(
+                            ZL_Compressor_parameterizeGraph(
+                                    comp, ZL_GRAPH_BRUTE_FORCE, &selectorParams),
+                            "Failed to set up points-i32-mauto profile",
+                            comp);
+                    size_t chunkSize = args.chunkSize().value_or(
+                            ZL_DEFAULT_SEGMENTER_CHUNK_BYTE_SIZE);
+                    return ZL_Compressor_buildSerialSegmenter(
+                            comp, chunkSize - chunkSize % 12, smallest);
+                },
+                nullptr,
+                true);
+
         std::string kParquetName = "parquet";
         mp[kParquetName]         = std::make_shared<CompressProfile>(
                 kParquetName,
