@@ -19,6 +19,7 @@
 #include "openzl/codecs/entropy/encode_entropy_binding.h"
 #include "openzl/codecs/flatpack/encode_flatpack_binding.h"
 #include "openzl/codecs/float_deconstruct/encode_float_deconstruct_binding.h"
+#include "openzl/codecs/hilbert3/encode_hilbert3_binding.h"
 #include "openzl/codecs/interleave/encode_interleave_binding.h"
 #include "openzl/codecs/lz/encode_lz_binding.h"
 #include "openzl/codecs/lz4/encode_lz4_binding.h"
@@ -140,6 +141,7 @@ const CNode ER_standardNodes[STANDARD_ENCODERS_NB] = {
     REGISTER_TRANSFORM(ZL_StandardNodeID_mux_lengths, ZL_StandardTransformID_mux_lengths, 24, 200, EI_MUX_LENGTHS),
     REGISTER_TRANSFORM(ZL_StandardNodeID_sparse_num, ZL_StandardTransformID_sparse_num, 26, 202, EI_SPARSE_NUM),
     REGISTER_TRANSFORM(ZL_StandardNodeID_sparse_num_auto, ZL_StandardTransformID_sparse_num, 26, 202, EI_SPARSE_NUM_AUTO),
+    REGISTER_TRANSFORM(ZL_StandardNodeID_hilbert3_u16, ZL_StandardTransformID_hilbert3_u16, 27, 204, EI_HILBERT3_U16),
 
     // Private Nodes
     REGISTER_TRANSFORM(ZL_PrivateStandardNodeID_set_string_lens,           ZL_StandardTransformID_convert_serial_string, 10, 200, EI_SETSTRINGLENS),

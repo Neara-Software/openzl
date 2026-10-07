@@ -19,6 +19,7 @@
 #include "openzl/cpp/codecs/FieldLz.hpp"          // IWYU pragma: export
 #include "openzl/cpp/codecs/Flatpack.hpp"         // IWYU pragma: export
 #include "openzl/cpp/codecs/FloatDeconstruct.hpp" // IWYU pragma: export
+#include "openzl/cpp/codecs/Hilbert3.hpp"         // IWYU pragma: export
 #include "openzl/cpp/codecs/Illegal.hpp"          // IWYU pragma: export
 #include "openzl/cpp/codecs/Lz.hpp"               // IWYU pragma: export
 #include "openzl/cpp/codecs/Lz4.hpp"              // IWYU pragma: export

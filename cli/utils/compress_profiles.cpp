@@ -528,6 +528,30 @@ compressProfiles()
         addIntProfile(mp, IntSignedness::SIGNED, 64, IntEndianness::BIG);
         addIntProfile(mp, IntSignedness::UNSIGNED, 64, IntEndianness::BIG);
 
+        std::string kPointsHk16Name = "points-hk16";
+        mp[kPointsHk16Name]         = std::make_shared<CompressProfile>(
+                kPointsHk16Name,
+                "Points of 6-byte records (x, y, z UInt16LE), sorted by 3D Hilbert key: hilbert3_u16 key gaps compressed by ACE",
+                [](ZL_Compressor* comp, void*, const ProfileArgs& args) {
+                    ZL_GraphID graph = ZL_Compressor_buildACEGraphWithDefault(
+                            comp, ZL_GRAPH_FIELD_LZ);
+                    graph = ZL_Compressor_registerStaticGraph_fromNode1o(
+                            comp, ZL_NODE_HILBERT3_U16, graph);
+                    ZL_NodeID const toStruct = unwrap(
+                            ZL_Compressor_parameterizeConvertSerialToStructNode(
+                                    comp, 6),
+                            "Failed to set up points-hk16 profile",
+                            comp);
+                    graph = ZL_Compressor_registerStaticGraph_fromNode1o(
+                            comp, toStruct, graph);
+                    size_t chunkSize = args.chunkSize().value_or(
+                            ZL_DEFAULT_SEGMENTER_CHUNK_BYTE_SIZE);
+                    return ZL_Compressor_buildSerialSegmenter(
+                            comp, chunkSize - chunkSize % 6, graph);
+                },
+                nullptr,
+                true);
+
         std::string kParquetName = "parquet";
         mp[kParquetName]         = std::make_shared<CompressProfile>(
                 kParquetName,
