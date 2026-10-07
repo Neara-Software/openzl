@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <vector>
@@ -53,6 +54,17 @@ std::vector<float> fitnessFromResult(
     }
     auto fitness = result->asFloatVector();
     adjustResults(gene, fitness);
+    // ACE_SIZE_ONLY: time axes stay constant so dominance and crowding use
+    // size alone. ACE_NO_CTIME: drop only the compression-time objective, so
+    // the front trades size against decompression time.
+    static const bool sizeOnly = std::getenv("ACE_SIZE_ONLY") != nullptr;
+    static const bool noCTime  = std::getenv("ACE_NO_CTIME") != nullptr;
+    if (sizeOnly || noCTime) {
+        fitness[1] = 0;
+    }
+    if (sizeOnly) {
+        fitness[2] = 0;
+    }
     return fitness;
 }
 
