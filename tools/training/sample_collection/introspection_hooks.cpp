@@ -2,6 +2,7 @@
 
 #include <cstring>
 #include <map>
+#include <string_view>
 #include <stdexcept>
 
 #include "openzl/zl_graph_api.h"
@@ -63,6 +64,17 @@ void SampleCollectionHook::on_migraphEncode_start(
             return;
         }
         encodeInputs.add(InputCopy(edgeInputData));
+    }
+    // A brute-force selector compresses its chosen candidate twice (trial,
+    // then for real); keep one copy.
+    std::string key = graphName;
+    for (const auto& in : *encodeInputs) {
+        key += std::to_string(std::hash<std::string_view>{}(std::string_view(
+                static_cast<const char*>(in.ptr()), in.contentSize())));
+        key += ',';
+    }
+    if (!seen_.insert(std::move(key)).second) {
+        return;
     }
     inputs_[graphName].push_back(std::move(encodeInputs));
 }

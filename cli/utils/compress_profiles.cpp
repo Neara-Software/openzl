@@ -552,6 +552,54 @@ compressProfiles()
                 nullptr,
                 true);
 
+        std::string kPointsU16AutoName = "points-u16-auto";
+        mp[kPointsU16AutoName]         = std::make_shared<CompressProfile>(
+                kPointsU16AutoName,
+                "Points of 6-byte records (x, y, z UInt16LE): per frame, the smaller of per-axis u16 fields -> ACE and hilbert3_u16 key gaps -> ACE",
+                [](ZL_Compressor* comp, void*, const ProfileArgs& args) {
+                    const size_t fieldSizes[3] = { 2, 2, 2 };
+                    ZL_GraphID axes[3];
+                    for (auto& axis : axes) {
+                        axis = ZL_Compressor_registerStaticGraph_fromNode1o(
+                                comp,
+                                ZL_NODE_CONVERT_STRUCT_TO_NUM_LE,
+                                ZL_Compressor_buildACEGraphWithDefault(
+                                        comp, ZL_GRAPH_FIELD_LZ));
+                    }
+                    ZL_GraphID const perAxis =
+                            ZL_Compressor_registerSplitByStructGraph(
+                                    comp, fieldSizes, axes, 3);
+
+                    ZL_GraphID hilbert = ZL_Compressor_buildACEGraphWithDefault(
+                            comp, ZL_GRAPH_FIELD_LZ);
+                    hilbert = ZL_Compressor_registerStaticGraph_fromNode1o(
+                            comp, ZL_NODE_HILBERT3_U16, hilbert);
+                    ZL_NodeID const toStruct = unwrap(
+                            ZL_Compressor_parameterizeConvertSerialToStructNode(
+                                    comp, 6),
+                            "Failed to set up points-u16-auto profile",
+                            comp);
+                    hilbert = ZL_Compressor_registerStaticGraph_fromNode1o(
+                            comp, toStruct, hilbert);
+
+                    const ZL_GraphID candidates[2] = { perAxis, hilbert };
+                    const ZL_GraphParameters selectorParams = {
+                        .customGraphs   = candidates,
+                        .nbCustomGraphs = 2,
+                    };
+                    ZL_GraphID const smallest = unwrap(
+                            ZL_Compressor_parameterizeGraph(
+                                    comp, ZL_GRAPH_BRUTE_FORCE, &selectorParams),
+                            "Failed to set up points-u16-auto profile",
+                            comp);
+                    size_t chunkSize = args.chunkSize().value_or(
+                            ZL_DEFAULT_SEGMENTER_CHUNK_BYTE_SIZE);
+                    return ZL_Compressor_buildSerialSegmenter(
+                            comp, chunkSize - chunkSize % 6, smallest);
+                },
+                nullptr,
+                true);
+
         std::string kPointsHk32Name = "points-hk32";
         mp[kPointsHk32Name]         = std::make_shared<CompressProfile>(
                 kPointsHk32Name,

@@ -3,6 +3,7 @@
 #include <map>
 #include <vector>
 
+#include "openzl/compress/cctx.h"
 #include "openzl/cpp/Exception.hpp"
 #include "openzl/zl_compress.h"
 
@@ -56,6 +57,7 @@ std::map<std::string, std::vector<MultiInput>> collectInputStreams(
                         cctx.get(), hooks.getRawHooks()),
                 "Failed to attach introspection hooks",
                 cctx.get());
+        CCTX_setIntrospectTrials(cctx.get(), true);
 
         cctx.compress(*mi);
 
@@ -70,6 +72,7 @@ std::map<std::string, std::vector<MultiInput>> collectInputStreams(
                 ZL_CCtx_detachAllIntrospectionHooks(cctx.get()),
                 "Failed to detach introspection hooks",
                 cctx.get());
+        CCTX_setIntrospectTrials(cctx.get(), false);
     }
 
     return result;

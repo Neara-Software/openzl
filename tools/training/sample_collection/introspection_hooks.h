@@ -2,6 +2,7 @@
 
 #pragma once
 #include <map>
+#include <set>
 #include <memory>
 #include <string>
 #include <vector>
@@ -62,6 +63,7 @@ class SampleCollectionHook : public openzl::CompressIntrospectionHooks {
     poly::span<const std::string> targetGraphNames_;
     poly::span<const std::string> targetNodeNames_;
     std::map<std::string, std::vector<MultiInput>> inputs_{};
+    std::set<std::string> seen_{};
     std::string errorMessage_{};
 };
 
