@@ -127,6 +127,16 @@ AutomatedCompressorExplorer::splitInputs(
     return batches;
 }
 
+/* static */ std::vector<float> AutomatedCompressorExplorer::computeFitness(
+        const ACECompressor& gene,
+        poly::span<const Input> inputs,
+        uint32_t formatVersion,
+        int compressionLevel)
+{
+    return fitnessFromResult(
+            gene, gene.benchmark(inputs, formatVersion, compressionLevel));
+}
+
 std::vector<float> AutomatedCompressorExplorer::computeFitness(
         const ACECompressor& gene)
 {
@@ -165,7 +175,7 @@ std::vector<std::vector<float>> AutomatedCompressorExplorer::computeFitness(
                         formatVersion_, compressionLevel_));
         eval.batchResults.reserve(inputBatches_.size());
         for (const auto& batch : inputBatches_) {
-            eval.batchResults.emplace_back(threadPool_.run([compressor, batch] {
+            eval.batchResults.emplace_back(threadPool_->run([compressor, batch] {
                 return benchmarkOnThreadContexts(*compressor, batch);
             }));
         }
@@ -259,7 +269,7 @@ ACECompressor AutomatedCompressorExplorer::polishBackends(
         }
         std::vector<std::future<std::vector<float>>> futures;
         for (const auto& t : tries) {
-            futures.push_back(threadPool_.run([&inputs = inputs_,
+            futures.push_back(threadPool_->run([&inputs = inputs_,
                                                &t,
                                                formatVersion = formatVersion_,
                                                compressionLevel =
