@@ -6,11 +6,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <future>
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include "openzl/cpp/Compressor.hpp"
@@ -28,6 +31,7 @@
 #include "tools/training/utils/mutation.h"
 #include "tools/training/utils/pareto_combination.h"
 #include "tools/training/utils/serialized_compressor_internal.h"
+#include "tools/training/utils/thread_pool.h"
 #include "tools/training/utils/utils.h"
 
 namespace openzl::training {
@@ -267,24 +271,29 @@ AutomatedCompressorExplorer::Parameters aceParameters(
 void runTraining(
         AutomatedCompressorExplorer& ace,
         size_t graphIdx,
-        size_t numGraphs)
+        size_t numGraphs,
+        std::mutex& logMutex)
 {
     const bool census = std::getenv("ACE_CENSUS") != nullptr;
     for (;;) {
-        if (census && ace.generation() > 0) {
-            logCensus(ace, graphIdx);
+        {
+            std::lock_guard<std::mutex> lock(logMutex);
+            if (census && ace.generation() > 0) {
+                logCensus(ace, graphIdx);
+            }
+            Logger::logProgress(
+                    INFO,
+                    ace.progress(),
+                    "Training ACE graph %zu / %zu: ACE progress",
+                    graphIdx,
+                    numGraphs);
         }
-        Logger::logProgress(
-                INFO,
-                ace.progress(),
-                "Training ACE graph %zu / %zu: ACE progress",
-                graphIdx,
-                numGraphs);
         if (ace.finished()) {
             break;
         }
         ace.step();
     }
+    std::lock_guard<std::mutex> lock(logMutex);
     Logger::finalizeProgress(INFO);
 }
 
@@ -732,6 +741,14 @@ void addSpecialists(
     const char* sg        = std::getenv("ACE_SPEC_GENERATIONS");
     params.maxGenerations = sg ? std::strtoul(sg, nullptr, 10) : 60;
     params.maxTime        = poly::nullopt;
+    // The searches are independent and share params.threadPool, so they run
+    // at the same time; their genes are added in group order.
+    struct Spec {
+        std::string name;
+        std::vector<Input> inputs;
+        std::unique_ptr<AutomatedCompressorExplorer> explorer;
+    };
+    std::vector<Spec> specs;
     for (const auto& [name, members] : groups) {
         if (members.size() < 4) {
             continue;
@@ -741,15 +758,27 @@ void addSpecialists(
         for (auto m : members) {
             sub.push_back(InputRef(const_cast<ZL_Input*>(flattened[m].get())));
         }
-        AutomatedCompressorExplorer spec(sub, params);
-        spec.run();
+        specs.push_back({ name, std::move(sub), nullptr });
+    }
+    std::vector<std::future<void>> runs;
+    for (auto& spec : specs) {
+        spec.explorer =
+                std::make_unique<AutomatedCompressorExplorer>(spec.inputs, params);
+        runs.push_back(std::async(std::launch::async, [&spec] {
+            spec.explorer->run();
+        }));
+    }
+    for (auto& run : runs) {
+        run.get();
+    }
+    for (const auto& spec : specs) {
         fprintf(stderr,
                 "ACE_SPEC graph=%zu group=%s inputs=%zu best=%.0f\n",
                 graphIdx,
-                name.c_str(),
-                sub.size(),
-                (double)spec.solution()[0].second[0]);
-        ace.loadPopulation(spec.savePopulation(10));
+                spec.name.c_str(),
+                spec.inputs.size(),
+                (double)spec.explorer->solution()[0].second[0]);
+        ace.loadPopulation(spec.explorer->savePopulation(10));
     }
 }
 
@@ -889,15 +918,67 @@ std::vector<SerializedCompressorInternal> ACETrainer::train(
                 + std::chrono::seconds(*trainParams.maxTimeSecs);
     }
 
-    size_t graphIdx        = 0;
     const size_t numGraphs = autoBackendGraphs.size();
+    struct GraphSlot {
+        size_t graphIdx;
+        std::string backendGraph;
+        // Heap-owned: a brute slot keeps its explorer, which references these
+        // inputs, until after the loop.
+        std::unique_ptr<std::vector<Input>> flattened;
+        poly::optional<std::string> savedAceState;
+        poly::optional<std::chrono::seconds> maxTime;
+        std::unique_ptr<AutomatedCompressorExplorer> ace;
+    };
+
+    // Graph searches are independent, so without a time budget they run at
+    // the same time and share one pool of trainParams.threads threads. That
+    // keeps the pool busy while one search waits on its slowest candidate.
+    // With a budget, each graph's share depends on what the earlier graphs
+    // left, so they run one after another.
+    const bool concurrentGraphs = !deadline.has_value() && !skipTraining_;
+    auto sharedPool             = std::make_shared<ThreadPool>(
+            trainParams.threads.value_or(
+                    std::thread::hardware_concurrency() / 2));
+    std::mutex progressMutex;
+
+    auto trainSlot = [&](GraphSlot& slot) {
+        auto params = aceParameters(
+                trainParams, formatVersion, compressionLevel, slot.maxTime);
+        params.threadPool = sharedPool;
+        const auto& flattened = *slot.flattened;
+        slot.ace = std::make_unique<AutomatedCompressorExplorer>(flattened, params);
+        auto& ace = *slot.ace;
+        if (slot.savedAceState.has_value()) {
+            ace.loadPopulation(*slot.savedAceState);
+        }
+        if (!skipTraining_) {
+            addIslands(ace, flattened, params, slot.graphIdx);
+            runTraining(ace, slot.graphIdx, numGraphs, progressMutex);
+            if (std::getenv("ACE_SPECIALISTS") != nullptr) {
+                auto specParams = aceParameters(
+                        trainParams,
+                        formatVersion,
+                        compressionLevel,
+                        poly::nullopt);
+                specParams.threadPool = sharedPool;
+                addSpecialists(
+                        ace,
+                        samples[slot.backendGraph],
+                        flattened,
+                        specParams,
+                        slot.graphIdx);
+            }
+            addPool(ace, flattened, params, slot.graphIdx);
+        }
+    };
+
+    std::vector<GraphSlot> slots;
+    size_t graphIdx = 0;
     for (const auto& backendGraph : autoBackendGraphs) {
         ++graphIdx;
         // Skip graphs with no training samples (e.g., optional fields that
         // aren't present in the training data). These will use default
         // compression.
-        // Heap-owned: a brute slot keeps its explorer, which references these
-        // inputs, until after the loop.
         auto flattenedOwned = std::make_unique<std::vector<Input>>(
                 flattenSamples(samples[backendGraph]));
         const auto& flattened = *flattenedOwned;
@@ -951,33 +1032,31 @@ std::vector<SerializedCompressorInternal> ACETrainer::train(
                     std::max<int64_t>(
                             1, remaining.count() / int64_t(graphsLeft)));
         }
-
-        auto params = aceParameters(
-                trainParams, formatVersion, compressionLevel, maxTime);
-        auto acePtr =
-                std::make_unique<AutomatedCompressorExplorer>(flattened, params);
-        auto& ace = *acePtr;
-        if (savedAceState.has_value()) {
-            ace.loadPopulation(*savedAceState);
+        slots.push_back({ graphIdx,
+                          backendGraph,
+                          std::move(flattenedOwned),
+                          savedAceState,
+                          maxTime,
+                          nullptr });
+        if (!concurrentGraphs) {
+            trainSlot(slots.back());
         }
-        if (!skipTraining_) {
-            addIslands(ace, flattened, params, graphIdx);
-            runTraining(ace, graphIdx, numGraphs);
-            if (std::getenv("ACE_SPECIALISTS") != nullptr) {
-                addSpecialists(
-                        ace,
-                        samples[backendGraph],
-                        flattened,
-                        aceParameters(
-                                trainParams,
-                                formatVersion,
-                                compressionLevel,
-                                poly::nullopt),
-                        graphIdx);
-            }
-            addPool(ace, flattened, params, graphIdx);
+    }
+    if (concurrentGraphs) {
+        // One driver thread per graph; the drivers only wait on the pool.
+        std::vector<std::future<void>> drivers;
+        for (auto& slot : slots) {
+            drivers.push_back(std::async(
+                    std::launch::async, [&trainSlot, &slot] { trainSlot(slot); }));
         }
+        for (auto& driver : drivers) {
+            driver.get();
+        }
+    }
 
+    for (auto& slot : slots) {
+        const auto& backendGraph = slot.backendGraph;
+        auto& ace                = *slot.ace;
         // Every candidate for a graph shares that graph's ACE state
         auto aceState =
                 std::make_shared<const std::string>(ace.savePopulation());
@@ -996,8 +1075,8 @@ std::vector<SerializedCompressorInternal> ACETrainer::train(
         }
         if (brute) {
             bruteSlots.push_back({ backendGraph,
-                                   std::move(flattenedOwned),
-                                   std::move(acePtr),
+                                   std::move(slot.flattened),
+                                   std::move(slot.ace),
                                    savedState,
                                    inputGroups(samples[backendGraph]) });
         } else {
