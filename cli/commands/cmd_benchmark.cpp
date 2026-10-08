@@ -5,6 +5,8 @@
 #include <chrono>
 #include <iostream>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string_view>
 
@@ -17,6 +19,7 @@
 #include "cli/utils/util.h"
 #include "tools/io/OutputNull.h"
 #include "tools/logger/Logger.h"
+#include "tools/training/utils/thread_pool.h"
 
 namespace openzl::cli {
 
@@ -129,17 +132,10 @@ BenchmarkResult runCompressionBenchmarks(const BenchmarkArgs& args)
     BenchmarkResult finalResult{};
     const auto iters = args.numIters;
 
-    // create compressor, context, and decompression context
-    auto cctx = createCompressionContext(
-            *args.compressor(), args.formatVersion, args.level, args.strict);
     std::optional<FatBundleDictLoader> fatBundleLoader;
-    DCtx dctx;
-
-    // Load dict bundle into DCtx if available
     if (!args.dictBundleData.empty()) {
         fatBundleLoader.emplace();
         fatBundleLoader->loadFatBundle(args.dictBundleData);
-        dctx.refDictLoader(*fatBundleLoader);
     }
 
     // if output is not specified, don't write csv-formatted summary statistics
@@ -150,33 +146,44 @@ BenchmarkResult runCompressionBenchmarks(const BenchmarkArgs& args)
     csvOut << "srcSize,compressedSize,compressionRatio,ctimeMs,dtimeMs,iters,path"
            << std::endl;
 
-    // benchmark compression and decompression
-    auto cdur                      = std::chrono::nanoseconds::zero();
-    auto ddur                      = std::chrono::nanoseconds::zero();
-    size_t total_compressed_size   = 0;
-    size_t total_uncompressed_size = 0;
-    size_t total_inputs            = 0;
-    for (const auto& inputs : args.inputs) {
+    struct SampleResult {
+        size_t uncompressedSize{ 0 };
+        size_t compressedSize{ 0 };
+        std::chrono::nanoseconds cdur{ 0 };
+        std::chrono::nanoseconds ddur{ 0 };
+    };
+    // Warnings go through the Logger, which is not thread-safe.
+    std::mutex warningsMutex;
+    auto benchmarkSample = [&](const training::MultiInput& inputs) {
+        auto cctx = createCompressionContext(
+                *args.compressor(),
+                args.formatVersion,
+                args.level,
+                args.strict);
+        DCtx dctx;
+        if (fatBundleLoader.has_value()) {
+            dctx.refDictLoader(*fatBundleLoader);
+        }
+        auto logWarnings = [&](const auto& ctx) {
+            std::lock_guard<std::mutex> lock(warningsMutex);
+            util::logWarnings(ctx);
+        };
         auto& inputVec = *inputs;
-        total_inputs++;
-        size_t uncompressed_size = 0;
-        for (const auto& input : *inputs) {
-            uncompressed_size += input.contentSize();
+        SampleResult result;
+        for (const auto& input : inputVec) {
+            result.uncompressedSize += input.contentSize();
         }
         // get the compressed size
         const auto compressed = cctx.compress(inputVec);
-
-        util::logWarnings(cctx);
-
-        total_compressed_size += compressed.size();
-        total_uncompressed_size += uncompressed_size;
+        logWarnings(cctx);
+        result.compressedSize = compressed.size();
 
         // benchmark compression and decompression speeds
         const auto compression_start = std::chrono::steady_clock::now();
         for (size_t n = 0; n < iters; ++n) {
             const auto curr_compressed_size = cctx.compress(inputVec).size();
 
-            util::logWarnings(cctx);
+            logWarnings(cctx);
 
             if (curr_compressed_size != compressed.size()) {
                 throw std::runtime_error("Non-deterministic compression!");
@@ -194,11 +201,43 @@ BenchmarkResult runCompressionBenchmarks(const BenchmarkArgs& args)
                     throw std::runtime_error("Round-trip failure!");
                 }
             }
-            util::logWarnings(dctx);
+            logWarnings(dctx);
         }
         const auto decompression_end = std::chrono::steady_clock::now();
-        cdur += compression_end - compression_start;
-        ddur += decompression_end - decompression_start;
+        result.cdur = compression_end - compression_start;
+        result.ddur = decompression_end - decompression_start;
+        return result;
+    };
+
+    // Samples run on args.threads threads; results are reported in input
+    // order. Concurrent samples share the machine, so speeds measured with
+    // more than one thread are lower bounds.
+    std::optional<training::ThreadPool> pool;
+    std::vector<std::future<SampleResult>> futures;
+    if (args.threads > 1 && args.inputs.size() > 1) {
+        pool.emplace(std::min(args.threads, args.inputs.size()));
+        for (const auto& inputs : args.inputs) {
+            futures.push_back(pool->run(
+                    [&benchmarkSample, &inputs] {
+                        return benchmarkSample(inputs);
+                    }));
+        }
+    }
+
+    auto cdur                      = std::chrono::nanoseconds::zero();
+    auto ddur                      = std::chrono::nanoseconds::zero();
+    size_t total_compressed_size   = 0;
+    size_t total_uncompressed_size = 0;
+    size_t total_inputs            = 0;
+    for (size_t s = 0; s < args.inputs.size(); ++s) {
+        const auto& inputs = args.inputs[s];
+        const auto result =
+                pool.has_value() ? futures[s].get() : benchmarkSample(inputs);
+        total_inputs++;
+        total_compressed_size += result.compressedSize;
+        total_uncompressed_size += result.uncompressedSize;
+        cdur += result.cdur;
+        ddur += result.ddur;
         finalResult = updateResults(
                 total_inputs,
                 iters,
@@ -206,14 +245,15 @@ BenchmarkResult runCompressionBenchmarks(const BenchmarkArgs& args)
                 total_uncompressed_size,
                 cdur,
                 ddur);
-        csvOut << uncompressed_size << "," << compressed.size() << ","
-               << compressionRatio(uncompressed_size, compressed.size()) << ","
-               << std::chrono::duration<double, std::milli>(
-                          compression_end - compression_start)
+        csvOut << result.uncompressedSize << "," << result.compressedSize
+               << ","
+               << compressionRatio(
+                          result.uncompressedSize, result.compressedSize)
+               << ","
+               << std::chrono::duration<double, std::milli>(result.cdur)
                           .count()
                << ","
-               << std::chrono::duration<double, std::milli>(
-                          decompression_end - decompression_start)
+               << std::chrono::duration<double, std::milli>(result.ddur)
                           .count()
                << "," << iters << ",";
         // The command line builds one input source per row.

@@ -130,6 +130,8 @@ struct BenchmarkArgs : public GlobalArgs, public ProfileArgs {
     std::optional<int> level;
 
     size_t numIters = 10;
+    /// Samples benchmarked at once. Training sets this to its thread count.
+    size_t threads = 1;
     bool strict     = false;
 
     int formatVersion = ZL_MAX_FORMAT_VERSION;
