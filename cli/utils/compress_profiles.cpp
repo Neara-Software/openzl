@@ -586,6 +586,65 @@ compressProfiles()
                 nullptr,
                 true);
 
+        std::string kPointsI32AutoTfName = "points-i32-auto-tf";
+        mp[kPointsI32AutoTfName]         = std::make_shared<CompressProfile>(
+                kPointsI32AutoTfName,
+                "Points of 12-byte records (x, y, z Int32LE): per frame, the smallest of per-axis i32 fields -> Compression Transformer, per-axis i32 fields -> ACE, and hilbert3_i32 key gaps -> ACE",
+                [](ZL_Compressor* comp, void*, const ProfileArgs& args) {
+                    const size_t fieldSizes[3] = { 4, 4, 4 };
+                    ZL_GraphID axes[3];
+                    for (auto& axis : axes) {
+                        axis = ZL_Compressor_registerStaticGraph_fromNode1o(
+                                comp,
+                                ZL_NODE_CONVERT_STRUCT_TO_NUM_LE,
+                                ZL_Compressor_buildACEGraphWithDefault(
+                                        comp, ZL_GRAPH_FIELD_LZ));
+                    }
+                    ZL_GraphID const perAxis =
+                            ZL_Compressor_registerSplitByStructGraph(
+                                    comp, fieldSizes, axes, 3);
+
+                    ZL_GraphID hilbert = ZL_Compressor_buildACEGraphWithDefault(
+                            comp, ZL_GRAPH_FIELD_LZ);
+                    hilbert = ZL_Compressor_registerStaticGraph_fromNode1o(
+                            comp, ZL_NODE_HILBERT3_I32, hilbert);
+                    ZL_NodeID const toStruct = unwrap(
+                            ZL_Compressor_parameterizeConvertSerialToStructNode(
+                                    comp, 12),
+                            "Failed to set up points-i32-auto-tf profile",
+                            comp);
+                    hilbert = ZL_Compressor_registerStaticGraph_fromNode1o(
+                            comp, toStruct, hilbert);
+
+                    ZL_GraphID tfAxes[3];
+                    for (auto& axis : tfAxes) {
+                        axis = ZL_Compressor_registerStaticGraph_fromNode1o(
+                                comp,
+                                ZL_NODE_CONVERT_STRUCT_TO_NUM_LE,
+                                ZL_GRAPH_TRANSFORMER_NUMERIC);
+                    }
+                    ZL_GraphID const perAxisTf =
+                            ZL_Compressor_registerSplitByStructGraph(
+                                    comp, fieldSizes, tfAxes, 3);
+
+                    const ZL_GraphID candidates[3] = { perAxis, hilbert, perAxisTf };
+                    const ZL_GraphParameters selectorParams = {
+                        .customGraphs   = candidates,
+                        .nbCustomGraphs = 3,
+                    };
+                    ZL_GraphID const smallest = unwrap(
+                            ZL_Compressor_parameterizeGraph(
+                                    comp, ZL_GRAPH_BRUTE_FORCE, &selectorParams),
+                            "Failed to set up points-i32-auto-tf profile",
+                            comp);
+                    size_t chunkSize = args.chunkSize().value_or(
+                            ZL_DEFAULT_SEGMENTER_CHUNK_BYTE_SIZE);
+                    return ZL_Compressor_buildSerialSegmenter(
+                            comp, chunkSize - chunkSize % 12, smallest);
+                },
+                nullptr,
+                true);
+
         std::string kPointsMk16Name = "points-mk16";
         mp[kPointsMk16Name]         = std::make_shared<CompressProfile>(
                 kPointsMk16Name,
@@ -721,6 +780,65 @@ compressProfiles()
                             ZL_Compressor_parameterizeGraph(
                                     comp, ZL_GRAPH_BRUTE_FORCE, &selectorParams),
                             "Failed to set up points-i32-mauto profile",
+                            comp);
+                    size_t chunkSize = args.chunkSize().value_or(
+                            ZL_DEFAULT_SEGMENTER_CHUNK_BYTE_SIZE);
+                    return ZL_Compressor_buildSerialSegmenter(
+                            comp, chunkSize - chunkSize % 12, smallest);
+                },
+                nullptr,
+                true);
+
+        std::string kPointsI32MAutoTfName = "points-i32-mauto-tf";
+        mp[kPointsI32MAutoTfName]         = std::make_shared<CompressProfile>(
+                kPointsI32MAutoTfName,
+                "Points of 12-byte records (x, y, z Int32LE): per frame, the smallest of per-axis i32 fields -> Compression Transformer, per-axis i32 fields -> ACE, and morton3_i32 key gaps -> ACE",
+                [](ZL_Compressor* comp, void*, const ProfileArgs& args) {
+                    const size_t fieldSizes[3] = { 4, 4, 4 };
+                    ZL_GraphID axes[3];
+                    for (auto& axis : axes) {
+                        axis = ZL_Compressor_registerStaticGraph_fromNode1o(
+                                comp,
+                                ZL_NODE_CONVERT_STRUCT_TO_NUM_LE,
+                                ZL_Compressor_buildACEGraphWithDefault(
+                                        comp, ZL_GRAPH_FIELD_LZ));
+                    }
+                    ZL_GraphID const perAxis =
+                            ZL_Compressor_registerSplitByStructGraph(
+                                    comp, fieldSizes, axes, 3);
+
+                    ZL_GraphID morton = ZL_Compressor_buildACEGraphWithDefault(
+                            comp, ZL_GRAPH_FIELD_LZ);
+                    morton = ZL_Compressor_registerStaticGraph_fromNode1o(
+                            comp, ZL_NODE_MORTON3_I32, morton);
+                    ZL_NodeID const toStruct = unwrap(
+                            ZL_Compressor_parameterizeConvertSerialToStructNode(
+                                    comp, 12),
+                            "Failed to set up points-i32-mauto-tf profile",
+                            comp);
+                    morton = ZL_Compressor_registerStaticGraph_fromNode1o(
+                            comp, toStruct, morton);
+
+                    ZL_GraphID tfAxes[3];
+                    for (auto& axis : tfAxes) {
+                        axis = ZL_Compressor_registerStaticGraph_fromNode1o(
+                                comp,
+                                ZL_NODE_CONVERT_STRUCT_TO_NUM_LE,
+                                ZL_GRAPH_TRANSFORMER_NUMERIC);
+                    }
+                    ZL_GraphID const perAxisTf =
+                            ZL_Compressor_registerSplitByStructGraph(
+                                    comp, fieldSizes, tfAxes, 3);
+
+                    const ZL_GraphID candidates[3] = { perAxis, morton, perAxisTf };
+                    const ZL_GraphParameters selectorParams = {
+                        .customGraphs   = candidates,
+                        .nbCustomGraphs = 3,
+                    };
+                    ZL_GraphID const smallest = unwrap(
+                            ZL_Compressor_parameterizeGraph(
+                                    comp, ZL_GRAPH_BRUTE_FORCE, &selectorParams),
+                            "Failed to set up points-i32-mauto-tf profile",
                             comp);
                     size_t chunkSize = args.chunkSize().value_or(
                             ZL_DEFAULT_SEGMENTER_CHUNK_BYTE_SIZE);
