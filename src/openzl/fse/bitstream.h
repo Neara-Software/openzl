@@ -259,7 +259,7 @@ MEM_STATIC size_t BIT_initDStream(BIT_DStream_t* bitD, const void* srcBuffer, si
 
     if (srcSize >=  sizeof(bitD->bitContainer)) {  /* normal case */
         bitD->ptr   = (const char*)srcBuffer + srcSize - sizeof(bitD->bitContainer);
-        bitD->bitContainer = MEM_readLEST(bitD->ptr);
+        bitD->bitContainer = MEM_readLE64(bitD->ptr);
         { BYTE const lastByte = ((const BYTE*)srcBuffer)[srcSize-1];
           bitD->bitsConsumed = lastByte ? 8 - ZSTD_highbit32(lastByte) : 0;  /* ensures bitsConsumed is always set */
           if (lastByte == 0) return ERROR(GENERIC); /* endMark not present */ }
@@ -268,22 +268,22 @@ MEM_STATIC size_t BIT_initDStream(BIT_DStream_t* bitD, const void* srcBuffer, si
         bitD->bitContainer = *(const BYTE*)(bitD->start);
         switch(srcSize)
         {
-        case 7: bitD->bitContainer += (size_t)(((const BYTE*)(srcBuffer))[6]) << (sizeof(bitD->bitContainer)*8 - 16);
+        case 7: bitD->bitContainer += (uint64_t)(((const BYTE*)(srcBuffer))[6]) << (sizeof(bitD->bitContainer)*8 - 16);
                 ZSTD_FALLTHROUGH;
 
-        case 6: bitD->bitContainer += (size_t)(((const BYTE*)(srcBuffer))[5]) << (sizeof(bitD->bitContainer)*8 - 24);
+        case 6: bitD->bitContainer += (uint64_t)(((const BYTE*)(srcBuffer))[5]) << (sizeof(bitD->bitContainer)*8 - 24);
                 ZSTD_FALLTHROUGH;
 
-        case 5: bitD->bitContainer += (size_t)(((const BYTE*)(srcBuffer))[4]) << (sizeof(bitD->bitContainer)*8 - 32);
+        case 5: bitD->bitContainer += (uint64_t)(((const BYTE*)(srcBuffer))[4]) << (sizeof(bitD->bitContainer)*8 - 32);
                 ZSTD_FALLTHROUGH;
 
-        case 4: bitD->bitContainer += (size_t)(((const BYTE*)(srcBuffer))[3]) << 24;
+        case 4: bitD->bitContainer += (uint64_t)(((const BYTE*)(srcBuffer))[3]) << 24;
                 ZSTD_FALLTHROUGH;
 
-        case 3: bitD->bitContainer += (size_t)(((const BYTE*)(srcBuffer))[2]) << 16;
+        case 3: bitD->bitContainer += (uint64_t)(((const BYTE*)(srcBuffer))[2]) << 16;
                 ZSTD_FALLTHROUGH;
 
-        case 2: bitD->bitContainer += (size_t)(((const BYTE*)(srcBuffer))[1]) <<  8;
+        case 2: bitD->bitContainer += (uint64_t)(((const BYTE*)(srcBuffer))[1]) <<  8;
                 ZSTD_FALLTHROUGH;
 
         default: break;
@@ -298,12 +298,12 @@ MEM_STATIC size_t BIT_initDStream(BIT_DStream_t* bitD, const void* srcBuffer, si
     return srcSize;
 }
 
-MEM_STATIC FORCE_INLINE_ATTR size_t BIT_getUpperBits(size_t bitContainer, U32 const start)
+MEM_STATIC FORCE_INLINE_ATTR uint64_t BIT_getUpperBits(uint64_t bitContainer, U32 const start)
 {
     return bitContainer >> start;
 }
 
-MEM_STATIC FORCE_INLINE_ATTR size_t BIT_getMiddleBits(size_t bitContainer, U32 const start, U32 const nbBits)
+MEM_STATIC FORCE_INLINE_ATTR size_t BIT_getMiddleBits(uint64_t bitContainer, U32 const start, U32 const nbBits)
 {
     U32 const regMask = sizeof(bitContainer)*8 - 1;
     /* if start > regMask, bitstream is corrupted, and result is undefined */
@@ -314,9 +314,9 @@ MEM_STATIC FORCE_INLINE_ATTR size_t BIT_getMiddleBits(size_t bitContainer, U32 c
      * importance.
      */
 #if defined(__x86_64__) || defined(_M_X86)
-    return (bitContainer >> (start & regMask)) & ((((U64)1) << nbBits) - 1);
+    return (size_t)((bitContainer >> (start & regMask)) & ((((U64)1) << nbBits) - 1));
 #else
-    return (bitContainer >> (start & regMask)) & BIT_mask[nbBits];
+    return (size_t)((bitContainer >> (start & regMask)) & BIT_mask[nbBits]);
 #endif
 }
 
@@ -388,7 +388,7 @@ MEM_STATIC BIT_DStream_status BIT_reloadDStreamFast(BIT_DStream_t* bitD)
     assert(bitD->bitsConsumed <= sizeof(bitD->bitContainer)*8);
     bitD->ptr -= bitD->bitsConsumed >> 3;
     bitD->bitsConsumed &= 7;
-    bitD->bitContainer = MEM_readLEST(bitD->ptr);
+    bitD->bitContainer = MEM_readLE64(bitD->ptr);
     return BIT_DStream_unfinished;
 }
 
@@ -418,7 +418,7 @@ MEM_STATIC BIT_DStream_status BIT_reloadDStream(BIT_DStream_t* bitD)
         }
         bitD->ptr -= nbBytes;
         bitD->bitsConsumed -= nbBytes*8;
-        bitD->bitContainer = MEM_readLEST(bitD->ptr);   /* reminder : srcSize > sizeof(bitD->bitContainer), otherwise bitD->ptr == bitD->start */
+        bitD->bitContainer = MEM_readLE64(bitD->ptr);   /* reminder : srcSize > sizeof(bitD->bitContainer), otherwise bitD->ptr == bitD->start */
         return result;
     }
 }

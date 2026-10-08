@@ -13,11 +13,11 @@
 
 ZL_BEGIN_C_DECLS
 
-#define ZS_BITSTREAM_WRITE_MAX_BITS (sizeof(size_t) * 8 - 1)
-#define ZS_BITSTREAM_READ_MAX_BITS (sizeof(size_t) * 8)
+#define ZS_BITSTREAM_WRITE_MAX_BITS (sizeof(uint64_t) * 8 - 1)
+#define ZS_BITSTREAM_READ_MAX_BITS (sizeof(uint64_t) * 8)
 
 typedef struct {
-    size_t container;
+    uint64_t container;
     size_t nbBits;
     uint8_t* ptr;
     uint8_t* limit;
@@ -129,7 +129,7 @@ ZL_INLINE void ZS_BitCStreamFF_writeExpGolomb(
 }
 
 typedef struct {
-    size_t container;
+    uint64_t container;
     size_t nbBitsRead;
     uint8_t const* ptr;
     uint8_t const* limit;
@@ -245,7 +245,7 @@ ZS_BitDStreamFF_readExpGolomb(ZS_BitDStreamFF* bits, size_t order)
 ZL_INLINE ZS_BitCStreamFF ZS_BitCStreamFF_init(uint8_t* dst, size_t dstCapacity)
 {
     const size_t limit =
-            dstCapacity < sizeof(size_t) ? 0 : dstCapacity - sizeof(size_t) + 1;
+            dstCapacity < sizeof(uint64_t) ? 0 : dstCapacity - sizeof(uint64_t) + 1;
     return (ZS_BitCStreamFF){
         .container = 0,
         .nbBits    = 0,
@@ -275,7 +275,7 @@ ZL_INLINE void
 ZS_BitCStreamFF_write(ZS_BitCStreamFF* bits, size_t value, size_t nbBits)
 {
     ZL_ASSERT_LE(bits->nbBits + nbBits, ZS_BITSTREAM_WRITE_MAX_BITS);
-    size_t const mask = (((size_t)1 << nbBits) - 1);
+    uint64_t const mask = (((uint64_t)1 << nbBits) - 1);
     bits->container |= (value & mask) << bits->nbBits;
     bits->nbBits += nbBits;
 }
@@ -286,7 +286,7 @@ ZL_INLINE void ZS_BitCStreamFF_flush(ZS_BitCStreamFF* bits)
         return;
     }
     size_t const nbBytes = bits->nbBits >> 3;
-    ZL_writeLEST(bits->ptr, bits->container);
+    ZL_writeLE64(bits->ptr, bits->container);
     bits->ptr += nbBytes;
     bits->nbBits &= 7;
     bits->container >>= (nbBytes << 3);
@@ -311,7 +311,7 @@ ZL_INLINE uint8_t* ZS_BitCStreamFF_reserveAlignedBits(
         return NULL;
     }
 
-    ZL_ASSERT_LE(bufferedBytes, sizeof(size_t));
+    ZL_ASSERT_LE(bufferedBytes, sizeof(uint64_t));
     if (bufferedBytes != 0) {
         ZL_writeLE64_N(bits->ptr, bits->container, bufferedBytes);
         bits->ptr += bufferedBytes;
@@ -344,14 +344,14 @@ ZL_INLINE void ZS_BitCStreamFF_commitReservedBits(ZS_BitCStreamFF* bits)
  * container and a full-width load would read out of bounds.
  *
  * @param src Source bytes.
- * @param nbBytes Number of bytes to load; must be < sizeof(size_t).
+ * @param nbBytes Number of bytes to load; must be < sizeof(uint64_t).
  * @return The loaded bytes packed little-endian into the low bits of the word.
  */
-ZL_INLINE size_t ZS_BitDStreamFF_loadPartial(uint8_t const* src, size_t nbBytes)
+ZL_INLINE uint64_t ZS_BitDStreamFF_loadPartial(uint8_t const* src, size_t nbBytes)
 {
-    size_t container = 0;
+    uint64_t container = 0;
     for (size_t i = 0; i < nbBytes; ++i) {
-        container |= (size_t)src[i] << (i << 3);
+        container |= (uint64_t)src[i] << (i << 3);
     }
     return container;
 }
@@ -359,12 +359,12 @@ ZL_INLINE size_t ZS_BitDStreamFF_loadPartial(uint8_t const* src, size_t nbBytes)
 ZL_INLINE ZS_BitDStreamFF
 ZS_BitDStreamFF_init(uint8_t const* src, size_t srcSize)
 {
-    if (ZL_LIKELY(srcSize >= sizeof(size_t))) {
+    if (ZL_LIKELY(srcSize >= sizeof(uint64_t))) {
         ZS_BitDStreamFF bits = {
-            .container  = ZL_readLEST(src),
+            .container  = ZL_readLE64(src),
             .nbBitsRead = 0,
             .ptr        = src,
-            .limit      = src + srcSize - sizeof(size_t) + 1,
+            .limit      = src + srcSize - sizeof(uint64_t) + 1,
             .end        = src + srcSize,
             .begin      = src,
         };
@@ -373,7 +373,7 @@ ZS_BitDStreamFF_init(uint8_t const* src, size_t srcSize)
         uint8_t const* const end = srcSize > 0 ? src + srcSize : src;
         ZS_BitDStreamFF bits     = {
                 .container  = ZS_BitDStreamFF_loadPartial(src, srcSize),
-                .nbBitsRead = (sizeof(size_t) - srcSize) * 8,
+                .nbBitsRead = (sizeof(uint64_t) - srcSize) * 8,
                 .ptr        = end,
                 .limit      = src,
                 .end        = end,
@@ -392,8 +392,8 @@ ZL_INLINE ZL_Report ZS_BitDStreamFF_finish(ZS_BitDStreamFF const* bits)
     size_t bytesRead = (size_t)(bits->ptr - bits->begin);
     bytesRead += bits->nbBitsRead >> 3;
     bytesRead += (bits->nbBitsRead & 7) != 0;
-    if ((size_t)(bits->end - bits->begin) < sizeof(size_t)) {
-        bytesRead -= sizeof(size_t);
+    if ((size_t)(bits->end - bits->begin) < sizeof(uint64_t)) {
+        bytesRead -= sizeof(uint64_t);
     }
     return ZL_returnValue(bytesRead);
 }
@@ -413,7 +413,7 @@ ZS_BitDStreamFF_peek(ZS_BitDStreamFF const* bits, size_t nbBits)
 #else
     // return _bzhi_u64(bits->container, nbBits);
     // return bits->container << (64 - nbBits) >> (64 - nbBits);
-    return bits->container & (((size_t)1 << (nbBits & 63)) - 1);
+    return (size_t)(bits->container & (((uint64_t)1 << (nbBits & 63)) - 1));
 #endif
 }
 
@@ -429,7 +429,7 @@ ZL_INLINE void ZS_BitDStreamFF_reload(ZS_BitDStreamFF* bits)
     if (ZL_LIKELY(ptr < bits->limit)) {
         bits->ptr = ptr;
         bits->nbBitsRead &= 7;
-        bits->container = ZL_readLEST(ptr) >> bits->nbBitsRead;
+        bits->container = ZL_readLE64(ptr) >> bits->nbBitsRead;
         return;
     }
 
@@ -444,7 +444,7 @@ ZL_INLINE void ZS_BitDStreamFF_reload(ZS_BitDStreamFF* bits)
     size_t const skippedBits  = (size_t)((ptr - tail) << 3);
     bits->ptr                 = ptr;
     bits->nbBitsRead &= 7;
-    bits->container = ZL_readLEST(tail) >> (bits->nbBitsRead + skippedBits);
+    bits->container = ZL_readLE64(tail) >> (bits->nbBitsRead + skippedBits);
 }
 
 ZL_INLINE uint8_t const* ZS_BitDStreamFF_popAlignedBits(
@@ -467,8 +467,8 @@ ZL_INLINE uint8_t const* ZS_BitDStreamFF_popAlignedBits(
 
     size_t consumedBits =
             (size_t)(bits->ptr - bits->begin) * 8 + bits->nbBitsRead;
-    if (streamSize < sizeof(size_t)) {
-        consumedBits -= sizeof(size_t) * 8;
+    if (streamSize < sizeof(uint64_t)) {
+        consumedBits -= sizeof(uint64_t) * 8;
     }
 
     size_t const bitSize = streamSize * 8;
@@ -488,16 +488,16 @@ ZL_INLINE uint8_t const* ZS_BitDStreamFF_popAlignedBits(
     uint8_t const* const pos = bits->begin + bitPos / 8;
     size_t const bitShift    = bitPos & 7;
 
-    if (streamSize >= sizeof(size_t)) {
+    if (streamSize >= sizeof(uint64_t)) {
         // Refill the 64-bit window at `pos`, clamping the load back from the
         // end when fewer than 8 bytes remain; the matching shift exposes the
         // same bit either way. A shift of the full word width (the whole
         // stream consumed) leaves an empty window.
-        uint8_t const* const tail = bits->end - sizeof(size_t);
+        uint8_t const* const tail = bits->end - sizeof(uint64_t);
         uint8_t const* const load = pos <= tail ? pos : tail;
         size_t const shift        = bitPos - (size_t)(load - bits->begin) * 8;
         bits->container =
-                shift < sizeof(size_t) * 8 ? ZL_readLEST(load) >> shift : 0;
+                shift < sizeof(uint64_t) * 8 ? ZL_readLE64(load) >> shift : 0;
         bits->nbBitsRead = bitShift;
         bits->ptr        = pos;
     } else {
@@ -505,7 +505,7 @@ ZL_INLINE uint8_t const* ZS_BitDStreamFF_popAlignedBits(
         size_t const remaining = (size_t)(bits->end - pos);
         bits->container        = ZS_BitDStreamFF_loadPartial(pos, remaining);
         bits->container >>= bitShift;
-        bits->nbBitsRead = (sizeof(size_t) - remaining) * 8 + bitShift;
+        bits->nbBitsRead = (sizeof(uint64_t) - remaining) * 8 + bitShift;
         bits->ptr        = bits->end;
     }
     return out;
