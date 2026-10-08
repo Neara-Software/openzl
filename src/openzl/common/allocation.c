@@ -195,8 +195,8 @@ static Arena kRawAllocator = {
  */
 
 typedef struct {
-    size_t index;
-    size_t size;
+    uint64_t index;
+    uint64_t size;
 #if ZL_POISON_SUPPORTED
     uint8_t redzone[ZL_REDZONE_SIZE];
 #endif
@@ -219,9 +219,6 @@ typedef struct {
 static void*
 ALLOC_HeapArena_allocImpl(HeapArena* arena, HeapMeta* meta, size_t size)
 {
-    ZL_STATIC_ASSERT(
-            sizeof(size_t) == 8,
-            "OpenZL currently only supports 64-bit platforms");
 
     if (meta == NULL) {
         return NULL;
