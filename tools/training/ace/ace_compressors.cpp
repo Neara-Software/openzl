@@ -77,11 +77,19 @@ std::vector<ACENode> makeAllNodes()
     return n;
 }
 
+// ACE_NO_TRANSFORMER: leave the Compression Transformer out of the search.
+bool transformerAllowed()
+{
+    return std::getenv("ACE_NO_TRANSFORMER") == nullptr;
+}
+
 std::vector<ACEGraph> makeAllGraphs()
 {
     std::vector<ACEGraph> g;
     g.push_back(buildGraph(graphs::Compress{}));
-    g.push_back(buildGraph(graphs::TransformerNumeric{}));
+    if (transformerAllowed()) {
+        g.push_back(buildGraph(graphs::TransformerNumeric{}));
+    }
     g.push_back(buildGraph(graphs::Entropy{}));
     g.push_back(buildGraph(graphs::Bitpack{}));
     g.push_back(buildGraph(graphs::Constant{}));
@@ -150,7 +158,6 @@ std::vector<ACECompressor> makePrebuiltNumericCompressors()
     ACECompressor quantizeLengths(
             buildNode(nodes::QuantizeOffsets{}), { fse, store });
     std::vector<ACECompressor> prebuilt = {
-        transformer,
         fieldLz,
         zstd,
         transpose,
@@ -173,6 +180,9 @@ std::vector<ACECompressor> makePrebuiltNumericCompressors()
         quantizeOffsets,
         quantizeLengths,
     };
+    if (transformerAllowed()) {
+        prebuilt.insert(prebuilt.begin(), transformer);
+    }
     compressors.insert(compressors.end(), prebuilt.begin(), prebuilt.end());
     // ACE_TOK_SEEDS: tokenize-first chains that won the big points slots of
     // the strongest cross-corpus model, so every slot starts with them in the
