@@ -3,6 +3,7 @@
 #pragma once
 
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include "openzl/openzl.hpp"
@@ -178,9 +179,21 @@ class AutomatedCompressorExplorer : public GeneticAlgorithm<ACECompressor> {
     std::vector<std::vector<float>> computeFitness(
             poly::span<const ACECompressor> genes) override;
 
+    /// With ACE_POLISH=N, also adds backend-polished copies of the N smallest
+    /// not-yet-polished front-0 genes to the children (see polishBackends).
+    std::unordered_set<ACECompressor> reproduce(size_t numChildren) override;
+
     static constexpr size_t kAceStateParamId = 592;
 
    private:
+    using Base::reproduce;
+
+    /// One coordinate-descent pass over the leaf graphs of @p gene: each leaf
+    /// in turn is set to the backend that gives the smallest total size.
+    ACECompressor polishBackends(const ACECompressor& gene, float size);
+
+    std::unordered_set<uint64_t> polished_;
+
     static std::vector<float> computeFitness(
             const ACECompressor& compressor,
             poly::span<const Input> inputs,

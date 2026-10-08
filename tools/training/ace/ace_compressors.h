@@ -31,6 +31,17 @@ std::vector<ACENode> getNodesComptabileWith(
 /// @p inputType
 poly::span<const ACEGraph> getGraphsComptabileWith(Type inputType);
 
+/// Picks one of @p nodes uniformly. With ACE_FAMILY set, picks a node name
+/// uniformly first, then a parameter variant of it, so nodes with many
+/// variants (bitunpack has 63) do not dominate. @p nodes must not be empty.
+const ACENode& pickRandomNode(
+        std::mt19937_64& rng,
+        poly::span<const ACENode> nodes);
+
+/// @returns The small fixed set of leaf graphs that ACE_POLISH tries at each
+/// leaf of a candidate.
+poly::span<const ACEGraph> getPolishBackends();
+
 /// @returns The set of pre-built compressors that are compatible with the given
 /// @p inputType. These are hand crafted compressors that can work well for
 /// inputs of the given type. These are used to seed the initial population of

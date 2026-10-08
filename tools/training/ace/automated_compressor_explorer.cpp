@@ -129,6 +129,105 @@ struct ArenaDeleter {
 };
 } // namespace
 
+namespace {
+/// @returns @p gene with its @p leaf-th graph component (in forEachComponent
+/// order) replaced by @p graph.
+ACECompressor replaceLeaf(
+        const ACECompressor& gene,
+        Type inputType,
+        size_t leaf,
+        const ACEGraph& graph)
+{
+    size_t seen = 0;
+    return gene.replace(
+            inputType,
+            [&](const ACECompressor& c,
+                Type,
+                size_t) -> poly::optional<ACECompressor> {
+                if (c.isNode()) {
+                    return poly::nullopt;
+                }
+                if (seen++ == leaf) {
+                    return ACECompressor(ACEGraphCompressor(graph));
+                }
+                return c;
+            });
+}
+} // namespace
+
+ACECompressor AutomatedCompressorExplorer::polishBackends(
+        const ACECompressor& gene,
+        float size)
+{
+    const auto backends = getPolishBackends();
+    std::vector<Type> leafTypes;
+    gene.forEachComponent(inputType(), [&](const ACECompressor& c, Type t) {
+        if (!c.isNode()) {
+            leafTypes.push_back(t);
+        }
+    });
+    ACECompressor best = gene;
+    for (size_t leaf = 0; leaf < leafTypes.size(); ++leaf) {
+        std::vector<ACECompressor> tries;
+        for (const auto& b : backends) {
+            if (isCompatible(b.inputTypeMask, leafTypes[leaf])) {
+                tries.push_back(replaceLeaf(best, inputType(), leaf, b));
+            }
+        }
+        std::vector<std::future<std::vector<float>>> futures;
+        for (const auto& t : tries) {
+            futures.push_back(threadPool_.run([&inputs = inputs_,
+                                               &t,
+                                               formatVersion = formatVersion_,
+                                               compressionLevel =
+                                                       compressionLevel_] {
+                return computeFitness(
+                        t, inputs, formatVersion, compressionLevel);
+            }));
+        }
+        for (size_t i = 0; i < tries.size(); ++i) {
+            auto f = futures[i].get();
+            if (f[0] < size) {
+                size = f[0];
+                best = tries[i];
+            }
+        }
+    }
+    return best;
+}
+
+std::unordered_set<ACECompressor> AutomatedCompressorExplorer::reproduce(
+        size_t numChildren)
+{
+    static const size_t numPolish = [] {
+        const char* p = std::getenv("ACE_POLISH");
+        return p ? (size_t)std::strtoul(p, nullptr, 10) : 0;
+    }();
+    auto children = Base::reproduce(numChildren);
+    if (numPolish == 0) {
+        return children;
+    }
+    std::vector<size_t> order;
+    for (size_t i = 0; i < population().size(); ++i) {
+        if (rank()[i] == 0 && polished_.count(population()[i].hash()) == 0) {
+            order.push_back(i);
+        }
+    }
+    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        return fitness()[a][0] < fitness()[b][0];
+    });
+    for (size_t k = 0; k < std::min(numPolish, order.size()); ++k) {
+        const auto& gene = population()[order[k]];
+        polished_.insert(gene.hash());
+        auto better = polishBackends(gene, fitness()[order[k]][0]);
+        polished_.insert(better.hash());
+        if (better != gene && populationSet().count(better) == 0) {
+            children.insert(std::move(better));
+        }
+    }
+    return children;
+}
+
 std::string AutomatedCompressorExplorer::savePopulation() const
 {
     return savePopulation(population().size());

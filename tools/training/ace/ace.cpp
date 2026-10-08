@@ -378,6 +378,8 @@ class ACEBruteMutation : public BackendGraphMutation {
  * best size so far). With ACE_BRUTE_TOL=t every gene whose size is within
  * (1 + t) of the smallest is a candidate, not only front 0.
  *
+ * @param groupOf The training file of each input, for ACE_BRUTE_BALANCE.
+ * @param extra More candidates (other slots' fronts, ACE_BRUTE_CROSS_SLOT).
  * @param rates Receives each pick's decode cost in ns per KiB of input when
  * ACE_BRUTE_LAMBDA is set.
  */
@@ -385,6 +387,8 @@ std::vector<ACECompressor> pickComplementary(
         const AutomatedCompressorExplorer& ace,
         const std::string& backendGraph,
         size_t maxPicks,
+        const std::vector<std::string>& groupOf,
+        const std::vector<ACECompressor>& extra,
         std::vector<int>& rates)
 {
     auto solutions = ace.solution();
@@ -400,6 +404,9 @@ std::vector<ACECompressor> pickComplementary(
                 solutions.emplace_back(ace.population()[i], ace.fitness()[i]);
             }
         }
+    }
+    for (const auto& e : extra) {
+        solutions.emplace_back(e, ace.fitness()[0]);
     }
     const auto inputs = ace.inputs();
     const size_t n    = inputs.size();
@@ -430,6 +437,39 @@ std::vector<ACECompressor> pickComplementary(
     }
     std::vector<ACECompressor> picked;
     std::vector<double> pickedDtime;
+    if (cands.empty()) {
+        return picked;
+    }
+    // ACE_BRUTE_BALANCE=1: weight each input by 1 / (bytes of its training
+    // file under the smallest single candidate), so every file counts the
+    // same in the greedy objective instead of in proportion to its bytes.
+    if (std::getenv("ACE_BRUTE_BALANCE") != nullptr && groupOf.size() == n) {
+        size_t ref    = 0;
+        double refTot = std::numeric_limits<double>::infinity();
+        for (size_t c = 0; c < cands.size(); ++c) {
+            double t = 0;
+            for (size_t i = 0; i < n; ++i) {
+                t += sizes[c][i];
+            }
+            if (t < refTot) {
+                refTot = t;
+                ref    = c;
+            }
+        }
+        std::map<std::string, double> groupBytes;
+        for (size_t i = 0; i < n; ++i) {
+            groupBytes[groupOf[i]] += sizes[ref][i];
+        }
+        for (auto& s : sizes) {
+            for (size_t i = 0; i < n; ++i) {
+                s[i] /= groupBytes[groupOf[i]];
+            }
+        }
+    }
+    const char* dc      = std::getenv("ACE_BRUTE_DEC_CAP");
+    const double decCap = dc ? std::strtod(dc, nullptr) : 0;
+    const char* de      = std::getenv("ACE_DEC_EPS");
+    const double decEps = de ? std::strtod(de, nullptr) : 0;
     // Each extra pick costs a full trial compression per stream, so it must
     // save at least ACE_BRUTE_MIN_GAIN (default 0.2%) on the training inputs.
     const char* minGainEnv = std::getenv("ACE_BRUTE_MIN_GAIN");
@@ -444,6 +484,12 @@ std::vector<ACECompressor> pickComplementary(
             if (used[c]) {
                 continue;
             }
+            // ACE_BRUTE_DEC_CAP=f: after the first pick, skip candidates that
+            // decode the training inputs more than f times slower than it.
+            if (decCap > 0 && !picked.empty()
+                && dtime[c] > decCap * pickedDtime[0]) {
+                continue;
+            }
             double t = 0;
             for (size_t i = 0; i < n; ++i) {
                 t += std::min(best[i], sizes[c][i]);
@@ -451,6 +497,24 @@ std::vector<ACECompressor> pickComplementary(
             if (t < bestTot) {
                 bestTot = t;
                 bestIdx = c;
+            }
+        }
+        // ACE_DEC_EPS=e: among candidates whose total is within (1 + e) of
+        // the best next total, take the one that decodes fastest.
+        if (decEps > 0 && bestIdx != cands.size()) {
+            const double limit = bestTot * (1 + decEps);
+            for (size_t c = 0; c < cands.size(); ++c) {
+                if (used[c] || dtime[c] >= dtime[bestIdx]) {
+                    continue;
+                }
+                double t = 0;
+                for (size_t i = 0; i < n; ++i) {
+                    t += std::min(best[i], sizes[c][i]);
+                }
+                if (t <= limit && t < total) {
+                    bestIdx = c;
+                    bestTot = t;
+                }
             }
         }
         if (bestIdx == cands.size()
@@ -540,10 +604,13 @@ std::vector<std::unique_ptr<BackendGraphMutation>> makeBruteMutations(
         const std::string& backendGraph,
         const AutomatedCompressorExplorer& ace,
         std::shared_ptr<const std::string> aceState,
-        size_t bruteK)
+        size_t bruteK,
+        const std::vector<std::string>& groupOf,
+        const std::vector<ACECompressor>& extra)
 {
     std::vector<int> rates;
-    auto picks = pickComplementary(ace, backendGraph, bruteK, rates);
+    auto picks = pickComplementary(
+            ace, backendGraph, bruteK, groupOf, extra, rates);
     std::vector<std::unique_ptr<BackendGraphMutation>> mutations;
     if (picks.empty()) {
         return mutations;
@@ -578,6 +645,45 @@ std::vector<std::unique_ptr<BackendGraphMutation>> makeBruteMutations(
     return mutations;
 }
 
+/// @returns The training file of each flattened input of @p samples: the file
+/// name prefix before "__" (see bench.py link_dir).
+std::vector<std::string> inputGroups(const std::vector<MultiInput>& samples)
+{
+    std::vector<std::string> groupOf;
+    for (const auto& sample : samples) {
+        std::string g = sample.group();
+        g             = g.substr(g.find_last_of('/') + 1);
+        g             = g.substr(0, g.find("__"));
+        for (size_t i = 0; i < sample->size(); ++i) {
+            groupOf.push_back(g);
+        }
+    }
+    return groupOf;
+}
+
+/// ACE_CENSUS: logs the ACE node/graph universe for each input type.
+void logNodeCensus(uint32_t formatVersion)
+{
+    for (auto t : { Type::Serial, Type::Struct, Type::Numeric }) {
+        std::map<std::string, size_t> byName;
+        for (const auto& n : getNodesComptabileWith(t, formatVersion)) {
+            ++byName[n.name];
+        }
+        for (const auto& [name, count] : byName) {
+            fprintf(stderr,
+                    "ACE_NODES type=%d name=%s count=%zu\n",
+                    (int)t,
+                    name.c_str(),
+                    count);
+        }
+        fprintf(stderr,
+                "ACE_NODES type=%d graphs=%zu prebuilt=%zu\n",
+                (int)t,
+                getGraphsComptabileWith(t).size(),
+                getPrebuiltCompressors(t).size());
+    }
+}
+
 /**
  * ACE_SPECIALISTS: runs one search per training file (inputs grouped by the
  * file-name prefix before "__") for ACE_SPEC_GENERATIONS generations (default
@@ -593,14 +699,9 @@ void addSpecialists(
         size_t graphIdx)
 {
     std::map<std::string, std::vector<size_t>> groups;
-    size_t idx = 0;
-    for (const auto& sample : samples) {
-        std::string g = sample.group();
-        g             = g.substr(g.find_last_of('/') + 1);
-        g             = g.substr(0, g.find("__"));
-        for (size_t i = 0; i < sample->size(); ++i) {
-            groups[g].push_back(idx++);
-        }
+    const auto groupOf = inputGroups(samples);
+    for (size_t i = 0; i < groupOf.size(); ++i) {
+        groups[groupOf[i]].push_back(i);
     }
     if (groups.size() < 2) {
         return;
@@ -626,6 +727,66 @@ void addSpecialists(
                 sub.size(),
                 (double)spec.solution()[0].second[0]);
         ace.loadPopulation(spec.savePopulation(10));
+    }
+}
+
+/**
+ * ACE_ISLANDS=K: runs K-1 extra searches with different seeds first, and seeds
+ * @p ace with their final populations.
+ */
+void addIslands(
+        AutomatedCompressorExplorer& ace,
+        poly::span<const Input> inputs,
+        const AutomatedCompressorExplorer::Parameters& params,
+        size_t graphIdx)
+{
+    const char* k = std::getenv("ACE_ISLANDS");
+    if (k == nullptr) {
+        return;
+    }
+    const bool census    = std::getenv("ACE_CENSUS") != nullptr;
+    const size_t islands = std::strtoul(k, nullptr, 10);
+    for (size_t isl = 1; isl < islands; ++isl) {
+        auto islandParams = params;
+        islandParams.seed = params.seed + 7919 * isl;
+        AutomatedCompressorExplorer island(inputs, islandParams);
+        island.run();
+        if (census) {
+            logCensus(island, graphIdx);
+        }
+        ace.loadPopulation(island.savePopulation());
+    }
+}
+
+/**
+ * ACE_POOL=K: runs K-1 more independent searches (different seeds, same
+ * budget each) after the main one, and adds their final populations to
+ * @p ace. The brute picks (ACE_BRUTE_K) can then combine candidates from
+ * independent searches.
+ */
+void addPool(
+        AutomatedCompressorExplorer& ace,
+        poly::span<const Input> inputs,
+        const AutomatedCompressorExplorer::Parameters& params,
+        size_t graphIdx)
+{
+    const char* k = std::getenv("ACE_POOL");
+    if (k == nullptr) {
+        return;
+    }
+    const bool census = std::getenv("ACE_CENSUS") != nullptr;
+    const size_t pool = std::strtoul(k, nullptr, 10);
+    for (size_t i = 1; i < pool; ++i) {
+        auto poolParams = params;
+        poolParams.seed = params.seed + 104729 * i;
+        AutomatedCompressorExplorer other(inputs, poolParams);
+        while (!other.finished()) {
+            other.step();
+            if (census) {
+                logCensus(other, graphIdx);
+            }
+        }
+        ace.loadPopulation(other.savePopulation());
     }
 }
 
@@ -685,6 +846,17 @@ std::vector<SerializedCompressorInternal> ACETrainer::train(
             ? nullptr
             : std::getenv("ACE_BRUTE_K1_OUT");
     MergedParetoFrontier::BackendGraphMutationsMap k1Candidates;
+    struct BruteSlot {
+        std::string backendGraph;
+        std::unique_ptr<std::vector<Input>> inputs;
+        std::unique_ptr<AutomatedCompressorExplorer> ace;
+        std::shared_ptr<const std::string> aceState;
+        std::vector<std::string> groupOf;
+    };
+    std::vector<BruteSlot> bruteSlots;
+    if (std::getenv("ACE_CENSUS") != nullptr) {
+        logNodeCensus(formatVersion);
+    }
 
     // One budget for the whole phase: each graph builds its own explorer, so
     // an unshared deadline is spent once per graph.
@@ -701,7 +873,11 @@ std::vector<SerializedCompressorInternal> ACETrainer::train(
         // Skip graphs with no training samples (e.g., optional fields that
         // aren't present in the training data). These will use default
         // compression.
-        auto flattened = flattenSamples(samples[backendGraph]);
+        // Heap-owned: a brute slot keeps its explorer, which references these
+        // inputs, until after the loop.
+        auto flattenedOwned = std::make_unique<std::vector<Input>>(
+                flattenSamples(samples[backendGraph]));
+        const auto& flattened = *flattenedOwned;
         if (flattened.empty()) {
             Logger::log(
                     VERBOSE1,
@@ -753,14 +929,16 @@ std::vector<SerializedCompressorInternal> ACETrainer::train(
                             1, remaining.count() / int64_t(graphsLeft)));
         }
 
-        AutomatedCompressorExplorer ace(
-                flattened,
-                aceParameters(
-                        trainParams, formatVersion, compressionLevel, maxTime));
+        auto params = aceParameters(
+                trainParams, formatVersion, compressionLevel, maxTime);
+        auto acePtr =
+                std::make_unique<AutomatedCompressorExplorer>(flattened, params);
+        auto& ace = *acePtr;
         if (savedAceState.has_value()) {
             ace.loadPopulation(*savedAceState);
         }
         if (!skipTraining_) {
+            addIslands(ace, flattened, params, graphIdx);
             runTraining(ace, graphIdx, numGraphs);
             if (std::getenv("ACE_SPECIALISTS") != nullptr) {
                 addSpecialists(
@@ -774,6 +952,7 @@ std::vector<SerializedCompressorInternal> ACETrainer::train(
                                 poly::nullopt),
                         graphIdx);
             }
+            addPool(ace, flattened, params, graphIdx);
         }
 
         // Every candidate for a graph shares that graph's ACE state
@@ -786,21 +965,56 @@ std::vector<SerializedCompressorInternal> ACETrainer::train(
                         aceState,
                         /* onlySaveAceState */ true));
         auto savedState = trainParams.saveAceState ? aceState : nullptr;
-        std::vector<std::unique_ptr<BackendGraphMutation>> mutations;
-        if (brute) {
-            mutations = makeBruteMutations(backendGraph, ace, savedState, bruteK);
-        }
-        if (mutations.empty()) {
-            mutations = makeAceMutations(
-                    backendGraph, ace, savedState, trainParams.paretoFrontier);
-        }
         if (k1Out != nullptr) {
             k1Candidates.emplace(
                     backendGraph,
                     makeAceMutations(
                             backendGraph, ace, savedState, /* paretoFrontier */ false));
         }
-        candidates.emplace(backendGraph, std::move(mutations));
+        if (brute) {
+            bruteSlots.push_back({ backendGraph,
+                                   std::move(flattenedOwned),
+                                   std::move(acePtr),
+                                   savedState,
+                                   inputGroups(samples[backendGraph]) });
+        } else {
+            candidates.emplace(
+                    backendGraph,
+                    makeAceMutations(
+                            backendGraph,
+                            ace,
+                            savedState,
+                            trainParams.paretoFrontier));
+        }
+    }
+
+    // ACE_BRUTE_CROSS_SLOT=1: each slot's brute picks may also use the front
+    // of every other slot with the same input type (x/y/z of points are the
+    // same kind of data, and one slot's search can miss a regime).
+    const bool crossSlot = std::getenv("ACE_BRUTE_CROSS_SLOT") != nullptr;
+    for (const auto& slot : bruteSlots) {
+        std::vector<ACECompressor> extra;
+        for (const auto& other : bruteSlots) {
+            if (!crossSlot || &other == &slot
+                || other.ace->inputType() != slot.ace->inputType()) {
+                continue;
+            }
+            for (auto& [cand, _] : other.ace->solution()) {
+                extra.push_back(cand);
+            }
+        }
+        auto mutations = makeBruteMutations(
+                slot.backendGraph,
+                *slot.ace,
+                slot.aceState,
+                bruteK,
+                slot.groupOf,
+                extra);
+        if (mutations.empty()) {
+            mutations = makeAceMutations(
+                    slot.backendGraph, *slot.ace, slot.aceState, false);
+        }
+        candidates.emplace(slot.backendGraph, std::move(mutations));
     }
 
     checkPoint_.emplace(

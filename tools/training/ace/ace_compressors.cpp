@@ -2,7 +2,9 @@
 
 #include "tools/training/ace/ace_compressors.h"
 
+#include <algorithm>
 #include <cstdlib>
+#include <string_view>
 
 #include "openzl/openzl.hpp"
 #include "openzl/zl_reflection.h"
@@ -410,6 +412,46 @@ poly::span<const ACECompressor> getPrebuiltCompressors(Type inputType)
     return compressors->at(inputType);
 }
 
+const ACENode& pickRandomNode(
+        std::mt19937_64& rng,
+        poly::span<const ACENode> nodes)
+{
+    assert(!nodes.empty());
+    static const bool byFamily = std::getenv("ACE_FAMILY") != nullptr;
+    if (!byFamily) {
+        std::uniform_int_distribution<size_t> dist(0, nodes.size() - 1);
+        return nodes[dist(rng)];
+    }
+    std::vector<std::string_view> names;
+    for (const auto& n : nodes) {
+        if (std::find(names.begin(), names.end(), n.name) == names.end()) {
+            names.push_back(n.name);
+        }
+    }
+    std::uniform_int_distribution<size_t> nameDist(0, names.size() - 1);
+    const auto name = names[nameDist(rng)];
+    std::vector<const ACENode*> variants;
+    for (const auto& n : nodes) {
+        if (n.name == name) {
+            variants.push_back(&n);
+        }
+    }
+    std::uniform_int_distribution<size_t> varDist(0, variants.size() - 1);
+    return *variants[varDist(rng)];
+}
+
+poly::span<const ACEGraph> getPolishBackends()
+{
+    static auto graphs = new std::vector<ACEGraph>{
+        buildGraph(graphs::Entropy{}),  buildGraph(graphs::Huffman{}),
+        buildGraph(graphs::Fse{}),      buildGraph(graphs::FieldLz{}),
+        buildGraph(graphs::Zstd{}),     buildGraph(graphs::Bitpack{}),
+        buildGraph(graphs::Constant{}), buildGraph(graphs::Store{}),
+        buildGraph(graphs::Flatpack{}),
+    };
+    return *graphs;
+}
+
 ACECompressor buildRandomGraphCompressor(std::mt19937_64& rng, Type inputType)
 {
     return ACEGraphCompressor(
@@ -431,7 +473,7 @@ ACECompressor buildRandomNodeCompressor(
         // single graph.
         return buildRandomGraphCompressor(rng, inputType);
     }
-    auto node = randomChoice(
+    auto node = pickRandomNode(
             rng,
             poly::span<const ACENode>(compatible.data(), compatible.size()));
     assert(isCompatible(node.inputType, inputType));
