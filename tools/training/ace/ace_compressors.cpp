@@ -77,10 +77,13 @@ std::vector<ACENode> makeAllNodes()
     return n;
 }
 
-// ACE_NO_TRANSFORMER: leave the Compression Transformer out of the search.
+// The Compression Transformer is off by default: on points it made trained
+// compressors ~2.4x slower to compress without making them smaller.
+// ACE_TRANSFORMER=1 brings back upstream's behaviour (Transformer as an ACE
+// backend graph and prebuilt seed).
 bool transformerAllowed()
 {
-    return std::getenv("ACE_NO_TRANSFORMER") == nullptr;
+    return std::getenv("ACE_TRANSFORMER") != nullptr;
 }
 
 std::vector<ACEGraph> makeAllGraphs()
