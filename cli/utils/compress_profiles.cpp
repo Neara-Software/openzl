@@ -7,6 +7,8 @@
 #include <string.h>
 
 #include <limits>
+#include <tuple>
+#include <vector>
 
 #include "openzl/codecs/zl_conversion.h"
 #include "openzl/codecs/zl_generic.h"
@@ -200,6 +202,56 @@ makeProfileDescription(bool isSigned, size_t bitWidth, bool isBigEndian)
     return std::string(isBigEndian ? "Big-endian " : "Little-endian ")
             + (isSigned ? "signed " : "unsigned ") + std::to_string(bitWidth)
             + "-bit data";
+}
+
+// Points profiles with Compression Transformer candidates: per frame, the
+// brute-force selector picks the smallest of per-axis fields -> ACE,
+// curve key gaps -> ACE, per-axis fields -> Transformer and curve key gaps ->
+// Transformer.
+static ZL_GraphID buildPointsAutoTf(
+        ZL_Compressor* comp,
+        const ProfileArgs& args,
+        size_t fieldSize,
+        ZL_NodeID curve,
+        const char* errMsg)
+{
+    const size_t fieldSizes[3] = { fieldSize, fieldSize, fieldSize };
+    const size_t recordSize    = 3 * fieldSize;
+    ZL_GraphID aceAxes[3];
+    ZL_GraphID tfAxes[3];
+    for (size_t i = 0; i < 3; ++i) {
+        aceAxes[i] = ZL_Compressor_registerStaticGraph_fromNode1o(
+                comp,
+                ZL_NODE_CONVERT_STRUCT_TO_NUM_LE,
+                ZL_Compressor_buildACEGraphWithDefault(comp, ZL_GRAPH_FIELD_LZ));
+        tfAxes[i] = ZL_Compressor_registerStaticGraph_fromNode1o(
+                comp, ZL_NODE_CONVERT_STRUCT_TO_NUM_LE, ZL_GRAPH_TRANSFORMER_NUMERIC);
+    }
+    ZL_NodeID const toStruct = unwrap(
+            ZL_Compressor_parameterizeConvertSerialToStructNode(comp, recordSize),
+            errMsg,
+            comp);
+    auto viaCurve = [&](ZL_GraphID backend) {
+        ZL_GraphID g = ZL_Compressor_registerStaticGraph_fromNode1o(comp, curve, backend);
+        return ZL_Compressor_registerStaticGraph_fromNode1o(comp, toStruct, g);
+    };
+    const ZL_GraphID candidates[4] = {
+        ZL_Compressor_registerSplitByStructGraph(comp, fieldSizes, aceAxes, 3),
+        viaCurve(ZL_Compressor_buildACEGraphWithDefault(comp, ZL_GRAPH_FIELD_LZ)),
+        ZL_Compressor_registerSplitByStructGraph(comp, fieldSizes, tfAxes, 3),
+        viaCurve(ZL_GRAPH_TRANSFORMER_NUMERIC),
+    };
+    const ZL_GraphParameters selectorParams = {
+        .customGraphs   = candidates,
+        .nbCustomGraphs = 4,
+    };
+    ZL_GraphID const smallest = unwrap(
+            ZL_Compressor_parameterizeGraph(comp, ZL_GRAPH_BRUTE_FORCE, &selectorParams),
+            errMsg,
+            comp);
+    size_t chunkSize = args.chunkSize().value_or(ZL_DEFAULT_SEGMENTER_CHUNK_BYTE_SIZE);
+    return ZL_Compressor_buildSerialSegmenter(
+            comp, chunkSize - chunkSize % recordSize, smallest);
 }
 
 static ZL_GraphID
@@ -847,6 +899,26 @@ compressProfiles()
                 },
                 nullptr,
                 true);
+
+        for (const auto& [name, fieldSize, curve, desc] :
+             std::vector<std::tuple<std::string, size_t, ZL_NodeID, std::string>>{
+                     { "points-u16-auto-tf4", 2, ZL_NODE_HILBERT3_U16, "UInt16LE, hilbert3_u16" },
+                     { "points-u16-mauto-tf4", 2, ZL_NODE_MORTON3_U16, "UInt16LE, morton3_u16" },
+                     { "points-i32-auto-tf4", 4, ZL_NODE_HILBERT3_I32, "Int32LE, hilbert3_i32" },
+                     { "points-i32-mauto-tf4", 4, ZL_NODE_MORTON3_I32, "Int32LE, morton3_i32" },
+             }) {
+            mp[name] = std::make_shared<CompressProfile>(
+                    name,
+                    "Points of x, y, z " + desc
+                            + ": per frame, the smallest of per-axis -> ACE, key gaps -> ACE, per-axis -> Compression Transformer, key gaps -> Compression Transformer",
+                    [fieldSize, curve, name](
+                            ZL_Compressor* comp, void*, const ProfileArgs& args) {
+                        return buildPointsAutoTf(
+                                comp, args, fieldSize, curve, name.c_str());
+                    },
+                    nullptr,
+                    true);
+        }
 
         std::string kParquetName = "parquet";
         mp[kParquetName]         = std::make_shared<CompressProfile>(
