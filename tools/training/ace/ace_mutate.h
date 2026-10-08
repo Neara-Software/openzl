@@ -2,6 +2,9 @@
 
 #pragma once
 
+#include <cstdlib>
+#include <vector>
+
 #include "tools/training/ace/ace_compressor.h"
 #include "tools/training/ace/ace_compressors.h"
 #include "tools/training/ace/ace_sampling.h"
@@ -111,12 +114,29 @@ class ACEMutate {
         if (depth >= maxDepth_) {
             return randomSimpleCompressor(inputType);
         }
-        ACEReservoirSampler<const ACENode> sampler(rng_);
         // Bind to a named local: getNodesComptabileWith returns a vector by
         // value, and the sampler stores pointers into it that are dereferenced
         // after the loop.
         const auto compatibleNodes =
                 getNodesComptabileWith(inputType, formatVersion_);
+        static const bool byFamily = std::getenv("ACE_FAMILY") != nullptr;
+        if (byFamily) {
+            std::vector<ACENode> accepted;
+            for (const auto& node : compatibleNodes) {
+                if (node.outputTypes.size() == 1
+                    && compressor.acceptsInputType(node.outputTypes[0])) {
+                    accepted.push_back(node);
+                }
+            }
+            if (accepted.empty()) {
+                return randomSimpleCompressor(inputType);
+            }
+            auto node = pickRandomNode(
+                    rng_,
+                    poly::span<const ACENode>(accepted.data(), accepted.size()));
+            return ACECompressor(std::move(node), { compressor });
+        }
+        ACEReservoirSampler<const ACENode> sampler(rng_);
         for (const auto& node : compatibleNodes) {
             if (node.outputTypes.size() == 1
                 && compressor.acceptsInputType(node.outputTypes[0])) {
