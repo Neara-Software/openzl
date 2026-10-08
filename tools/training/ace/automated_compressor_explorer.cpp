@@ -30,6 +30,35 @@ std::vector<ACECompressor> AutomatedCompressorExplorer::initialPopulation()
 }
 
 namespace {
+/// @returns Up to @p maxParts contiguous runs of @p inputs with about the
+/// same number of bytes each.
+std::vector<poly::span<const Input>> splitInputs(
+        poly::span<const Input> inputs,
+        size_t maxParts)
+{
+    const size_t numParts = std::max<size_t>(
+            1, std::min(maxParts, inputs.size()));
+    size_t total = 0;
+    for (const auto& input : inputs) {
+        total += input.contentSize();
+    }
+    std::vector<poly::span<const Input>> parts;
+    size_t begin = 0;
+    size_t bytes = 0;
+    for (size_t i = 0; i < inputs.size(); ++i) {
+        bytes += inputs[i].contentSize();
+        const bool last = parts.size() + 1 == numParts;
+        if (!last && bytes * numParts >= total * (parts.size() + 1)) {
+            parts.push_back(inputs.subspan(begin, i + 1 - begin));
+            begin = i + 1;
+        }
+    }
+    if (begin < inputs.size()) {
+        parts.push_back(inputs.subspan(begin));
+    }
+    return parts;
+}
+
 /// Put small evolutionary pressure on the results to be simpler.
 /// Adjusts cSize on the scale of 0.1%, and times on the scale of 1%, given a
 /// typical number of components of ~10.
@@ -44,13 +73,10 @@ void adjustResults(const ACECompressor& gene, std::vector<float>& results)
 }
 } // namespace
 
-/* static */ std::vector<float> AutomatedCompressorExplorer::computeFitness(
+/* static */ std::vector<float> AutomatedCompressorExplorer::fitnessOf(
         const ACECompressor& gene,
-        poly::span<const Input> inputs,
-        uint32_t formatVersion,
-        int compressionLevel)
+        const poly::optional<ACECompressionResult>& result)
 {
-    auto result = gene.benchmark(inputs, formatVersion, compressionLevel);
     if (!result.has_value()) {
         return std::vector<float>(3, std::numeric_limits<float>::infinity());
     }
@@ -70,6 +96,16 @@ void adjustResults(const ACECompressor& gene, std::vector<float>& results)
     return fitness;
 }
 
+/* static */ std::vector<float> AutomatedCompressorExplorer::computeFitness(
+        const ACECompressor& gene,
+        poly::span<const Input> inputs,
+        uint32_t formatVersion,
+        int compressionLevel)
+{
+    return fitnessOf(
+            gene, gene.benchmark(inputs, formatVersion, compressionLevel));
+}
+
 std::vector<float> AutomatedCompressorExplorer::computeFitness(
         const ACECompressor& gene)
 {
@@ -79,33 +115,52 @@ std::vector<float> AutomatedCompressorExplorer::computeFitness(
 std::vector<std::vector<float>> AutomatedCompressorExplorer::computeFitness(
         poly::span<const ACECompressor> genes)
 {
-    std::vector<std::future<std::vector<float>>> futures;
-    futures.reserve(genes.size());
-    for (const auto& gene : genes) {
-        auto cache = cachedFitness_.find(gene.hash());
+    // Each gene is benchmarked in up to numThreads parts of the inputs, so a
+    // slow gene does not hold the generation on one thread. Sizes and times
+    // are integer sums, so the parts add up to the whole-input result.
+    const auto parts = splitInputs(inputs_, threadPool_->numThreads);
+    using PartResult = poly::optional<ACECompressionResult>;
+    std::vector<poly::optional<std::vector<float>>> cached(genes.size());
+    std::vector<std::vector<std::future<PartResult>>> futures(genes.size());
+    for (size_t g = 0; g < genes.size(); ++g) {
+        const auto& gene = genes[g];
+        auto cache       = cachedFitness_.find(gene.hash());
         if (cache != cachedFitness_.end()) {
             std::uniform_int_distribution<size_t> dist(0, cache->second.first);
             if (dist(rng()) != 0) {
-                std::promise<std::vector<float>> promise;
-                promise.set_value(cache->second.second);
-                futures.emplace_back(promise.get_future());
+                cached[g] = cache->second.second;
                 continue;
             }
         }
-        futures.emplace_back(
-                threadPool_.run([&inputs = inputs_,
-                                 &gene,
-                                 formatVersion    = formatVersion_,
-                                 compressionLevel = compressionLevel_] {
-                    return computeFitness(
-                            gene, inputs, formatVersion, compressionLevel);
-                }));
+        for (const auto& part : parts) {
+            futures[g].push_back(threadPool_->run(
+                    [part,
+                     &gene,
+                     formatVersion    = formatVersion_,
+                     compressionLevel = compressionLevel_] {
+                        return gene.benchmark(
+                                part, formatVersion, compressionLevel);
+                    }));
+        }
     }
 
     std::vector<std::vector<float>> results;
     results.reserve(genes.size());
     for (size_t i = 0; i < genes.size(); ++i) {
-        auto result            = futures[i].get();
+        if (cached[i].has_value()) {
+            results.push_back(std::move(*cached[i]));
+            continue;
+        }
+        PartResult total = ACECompressionResult{};
+        for (auto& future : futures[i]) {
+            auto part = future.get();
+            if (!part.has_value()) {
+                total = poly::nullopt;
+            } else if (total.has_value()) {
+                *total += *part;
+            }
+        }
+        auto result            = fitnessOf(genes[i], total);
         auto [cache, inserted] = cachedFitness_.emplace(
                 genes[i].hash(), std::make_pair(1, result));
         if (!inserted) {
@@ -176,7 +231,7 @@ ACECompressor AutomatedCompressorExplorer::polishBackends(
         }
         std::vector<std::future<std::vector<float>>> futures;
         for (const auto& t : tries) {
-            futures.push_back(threadPool_.run([&inputs = inputs_,
+            futures.push_back(threadPool_->run([&inputs = inputs_,
                                                &t,
                                                formatVersion = formatVersion_,
                                                compressionLevel =

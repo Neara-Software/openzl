@@ -417,13 +417,24 @@ std::vector<ACECompressor> pickComplementary(
     std::vector<std::vector<double>> sizes;
     std::vector<double> dtime;
     std::vector<ACECompressor> cands;
-    for (auto& [cand, _] : solutions) {
+    using Result = poly::optional<ACECompressionResult>;
+    std::vector<std::vector<std::future<Result>>> futures(solutions.size());
+    for (size_t c = 0; c < solutions.size(); ++c) {
+        for (size_t i = 0; i < n; ++i) {
+            futures[c].push_back(ace.threadPool().run(
+                    [&benchmarkOne, &cand = solutions[c].first, i] {
+                        return benchmarkOne(cand, i);
+                    }));
+        }
+    }
+    for (size_t c = 0; c < solutions.size(); ++c) {
+        const auto& cand = solutions[c].first;
         std::vector<double> s(n);
         double dns = 0;
         bool ok    = true;
-        for (size_t i = 0; i < n && ok; ++i) {
-            auto r = benchmarkOne(cand, i);
-            ok     = r.has_value();
+        for (size_t i = 0; i < n; ++i) {
+            auto r = futures[c][i].get();
+            ok     = ok && r.has_value();
             if (ok) {
                 s[i] = (double)r->compressedSize;
                 dns += (double)r->decompressionTime.count();
@@ -577,17 +588,30 @@ std::vector<ACECompressor> pickComplementary(
         for (size_t i = 0; i < n; ++i) {
             bytes += (double)inputs[i].contentSize();
         }
-        for (const auto& p : picked) {
-            double ns = 0;
+        // Each input of each pick is timed as its own pool task.
+        std::vector<std::vector<std::future<double>>> timings(picked.size());
+        for (size_t k = 0; k < picked.size(); ++k) {
             for (size_t i = 0; i < n; ++i) {
-                double m = std::numeric_limits<double>::infinity();
-                for (int rep = 0; rep < 3; ++rep) {
-                    auto r = benchmarkOne(p, i);
-                    if (r.has_value()) {
-                        m = std::min(m, (double)r->decompressionTime.count());
-                    }
-                }
-                ns += std::isfinite(m) ? m : 0;
+                timings[k].push_back(ace.threadPool().run(
+                        [&benchmarkOne, &p = picked[k], i] {
+                            double m = std::numeric_limits<double>::infinity();
+                            for (int rep = 0; rep < 3; ++rep) {
+                                auto r = benchmarkOne(p, i);
+                                if (r.has_value()) {
+                                    m = std::min(
+                                            m,
+                                            (double)r->decompressionTime
+                                                    .count());
+                                }
+                            }
+                            return std::isfinite(m) ? m : 0;
+                        }));
+            }
+        }
+        for (auto& perInput : timings) {
+            double ns = 0;
+            for (auto& t : perInput) {
+                ns += t.get();
             }
             rates.push_back((int)std::lround(ns / bytes * 1024.0));
         }

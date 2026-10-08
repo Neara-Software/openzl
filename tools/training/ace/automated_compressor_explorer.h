@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include <memory>
 #include <thread>
 #include <unordered_set>
 #include <vector>
@@ -55,6 +56,10 @@ class AutomatedCompressorExplorer : public GeneticAlgorithm<ACECompressor> {
 
     struct Parameters : public Base::Parameters {
         size_t numThreads{ std::thread::hardware_concurrency() / 2 };
+        /// Runs the fitness benchmarks when set, so several explorers can
+        /// share one set of threads. Otherwise the explorer owns a pool of
+        /// numThreads threads.
+        std::shared_ptr<ThreadPool> threadPool;
         /// Target format version. Must be set explicitly; a value of 0 is
         /// rejected at construction.
         uint32_t formatVersion{ 0 };
@@ -86,7 +91,10 @@ class AutomatedCompressorExplorer : public GeneticAlgorithm<ACECompressor> {
               inputs_(std::move(inputs)),
               formatVersion_(params.formatVersion),
               compressionLevel_(params.compressionLevel),
-              threadPool_(params.numThreads),
+              threadPool_(
+                      params.threadPool
+                              ? params.threadPool
+                              : std::make_shared<ThreadPool>(params.numThreads)),
               crossover_(rng(), inputType(), formatVersion_),
               mutate_(rng(), inputType(), formatVersion_)
     {
@@ -137,6 +145,12 @@ class AutomatedCompressorExplorer : public GeneticAlgorithm<ACECompressor> {
     int compressionLevel() const
     {
         return compressionLevel_;
+    }
+
+    /// The pool that runs this explorer's benchmarks.
+    ThreadPool& threadPool() const
+    {
+        return *threadPool_;
     }
 
     /**
@@ -194,6 +208,10 @@ class AutomatedCompressorExplorer : public GeneticAlgorithm<ACECompressor> {
 
     std::unordered_set<uint64_t> polished_;
 
+    static std::vector<float> fitnessOf(
+            const ACECompressor& gene,
+            const poly::optional<ACECompressionResult>& result);
+
     static std::vector<float> computeFitness(
             const ACECompressor& compressor,
             poly::span<const Input> inputs,
@@ -203,7 +221,7 @@ class AutomatedCompressorExplorer : public GeneticAlgorithm<ACECompressor> {
     poly::span<const Input> inputs_;
     uint32_t formatVersion_;
     int compressionLevel_;
-    ThreadPool threadPool_;
+    std::shared_ptr<ThreadPool> threadPool_;
     ACECrossover crossover_;
     ACEMutate mutate_;
     std::unordered_map<uint64_t, std::pair<size_t, std::vector<float>>>
