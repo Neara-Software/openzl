@@ -99,6 +99,8 @@ CmdTrainResult cmdTrainWithResult(const TrainArgs& args)
     }
     benchmarkArgs.inputs = training::inputSetToMultiInputs(*filteredInputsPtr);
     benchmarkArgs.dictBundleData = args.dictBundleData;
+    benchmarkArgs.threads        = args.trainParams.threads.value_or(
+            std::thread::hardware_concurrency());
     Logger::log(INFO, "Benchmarking untrained compressor...");
     auto untrainedBenchmark = runCompressionBenchmarks(benchmarkArgs);
 
