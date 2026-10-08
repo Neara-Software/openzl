@@ -224,7 +224,16 @@ std::vector<SerializedCompressorInternal> MergedParetoFrontier::paretoFrontier()
     std::vector<SerializedCompressorInternal> compressors;
     compressors.reserve(paretoFrontier_.size());
     for (size_t i = 0; i < paretoFrontier_.size(); ++i) {
-        compressors.push_back(serializedAt(i));
+        // A candidate whose input types do not fit its backend graph cannot be
+        // built; drop it instead of losing the whole frontier.
+        try {
+            compressors.push_back(serializedAt(i));
+        } catch (const Exception& e) {
+            Logger::log(
+                    WARNINGS,
+                    "Skipping unbuildable Pareto candidate: ",
+                    e.what());
+        }
     }
     return compressors;
 }
