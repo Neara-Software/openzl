@@ -13,6 +13,11 @@
 #include "openzl/common/assertion.h"
 #include "openzl/shared/bits.h"
 #include "openzl/shared/mem.h"
+#include "openzl/shared/portability.h"
+
+#if ZL_ARCH_X86_64
+#    include <emmintrin.h>
+#endif
 
 #include <math.h>
 #include <string.h> /* memset */
@@ -1120,17 +1125,16 @@ typedef struct {
     int64_t delta_first_max_s;
 } Num8DeltaStats;
 
-/* Branch-free statistics of data[i] - data[i - 1] for 1 <= i < n. */
-static Num8DeltaStats num8_delta_stats(const uint8_t* data, size_t n)
+/* Branch-free statistics of data[i] - data[i - 1] for start <= i < n. */
+static void num8_delta_stats_scalar(
+        const uint8_t* data,
+        size_t start,
+        size_t n,
+        Num8DeltaStats* st)
 {
-    Num8DeltaStats st = { 0, 0, 0, 0, 0, 0, 0, 0 };
-    if (n <= 1)
-        return st;
-    int64_t dfmin = INT64_MAX;
-    int64_t dfmax = INT64_MIN;
     /* 32-bit block sums cannot overflow: 255 * 2^16 < 2^32. */
     size_t const block = (size_t)1 << 16;
-    for (size_t start = 1; start < n; start += block) {
+    for (; start < n; start += block) {
         size_t const end = (n - start > block) ? start + block : n;
         uint32_t sum_abs = 0, max_abs = 0, up = 0, down = 0;
         int32_t dmin = INT32_MAX, dmax = INT32_MIN;
@@ -1148,20 +1152,106 @@ static Num8DeltaStats num8_delta_stats(const uint8_t* data, size_t n)
             dmin = ds < dmin ? ds : dmin;
             dmax = ds > dmax ? ds : dmax;
         }
-        st.sum_abs_delta_u += sum_abs;
-        if (max_abs > st.max_abs_delta_u)
-            st.max_abs_delta_u = max_abs;
-        st.delta_up_count += up;
-        st.delta_down_count += down;
-        if (dmin < dfmin)
-            dfmin = dmin;
-        if (dmax > dfmax)
-            dfmax = dmax;
+        st->sum_abs_delta_u += sum_abs;
+        if (max_abs > st->max_abs_delta_u)
+            st->max_abs_delta_u = max_abs;
+        st->delta_up_count += up;
+        st->delta_down_count += down;
+        if (dmin < st->delta_first_min_s)
+            st->delta_first_min_s = dmin;
+        if (dmax > st->delta_first_max_s)
+            st->delta_first_max_s = dmax;
+        if (dmin < st->delta_min_s)
+            st->delta_min_s = dmin;
+        if (dmax > st->delta_max_s)
+            st->delta_max_s = dmax;
     }
-    st.delta_first_min_s = dfmin;
-    st.delta_first_max_s = dfmax;
-    st.delta_min_s       = dfmin < 0 ? dfmin : 0;
-    st.delta_max_s       = dfmax > 0 ? dfmax : 0;
+}
+
+#if ZL_ARCH_X86_64
+static uint8_t num8_hmax_u8(__m128i v)
+{
+    v = _mm_max_epu8(v, _mm_srli_si128(v, 8));
+    v = _mm_max_epu8(v, _mm_srli_si128(v, 4));
+    v = _mm_max_epu8(v, _mm_srli_si128(v, 2));
+    v = _mm_max_epu8(v, _mm_srli_si128(v, 1));
+    return (uint8_t)_mm_cvtsi128_si32(v);
+}
+
+static uint8_t num8_hmin_u8(__m128i v)
+{
+    v = _mm_min_epu8(v, _mm_srli_si128(v, 8));
+    v = _mm_min_epu8(v, _mm_srli_si128(v, 4));
+    v = _mm_min_epu8(v, _mm_srli_si128(v, 2));
+    v = _mm_min_epu8(v, _mm_srli_si128(v, 1));
+    return (uint8_t)_mm_cvtsi128_si32(v);
+}
+#endif
+
+/*
+ * Delta statistics 16 bytes at a time. With u' = u ^ 0x80 the signed delta
+ * is u' - p', so its positive and negative parts are saturating u8
+ * differences, as is |u - p|. delta_max_s and delta_min_s start at zero, so
+ * they are the largest positive part and minus the largest negative part;
+ * delta_first_min_s and delta_first_max_s also track non-zero-anchored min/max
+ * via min_pos and min_neg when all deltas share one sign.
+ */
+static Num8DeltaStats num8_delta_stats(const uint8_t* data, size_t n)
+{
+    Num8DeltaStats st = { 0, 0, 0, 0, 0, 0, 0, 0 };
+    if (n <= 1)
+        return st;
+    st.delta_first_min_s = INT64_MAX;
+    st.delta_first_max_s = INT64_MIN;
+    size_t i = 1;
+#if ZL_ARCH_X86_64
+    if (n > 16) {
+        __m128i const bias = _mm_set1_epi8((char)0x80);
+        __m128i const zero = _mm_setzero_si128();
+        __m128i sum        = zero;
+        __m128i max_abs    = zero;
+        __m128i max_pos    = zero;
+        __m128i max_neg    = zero;
+        __m128i min_pos    = _mm_set1_epi8((char)0xFF);
+        __m128i min_neg    = _mm_set1_epi8((char)0xFF);
+        uint64_t up = 0, down = 0;
+        for (; i + 16 <= n; i += 16) {
+            __m128i const u   = _mm_loadu_si128((const __m128i*)(data + i));
+            __m128i const p   = _mm_loadu_si128((const __m128i*)(data + i - 1));
+            __m128i const gt  = _mm_subs_epu8(u, p);
+            __m128i const lt  = _mm_subs_epu8(p, u);
+            __m128i const ad  = _mm_or_si128(gt, lt);
+            __m128i const us  = _mm_xor_si128(u, bias);
+            __m128i const ps  = _mm_xor_si128(p, bias);
+            __m128i const pos = _mm_subs_epu8(us, ps);
+            __m128i const neg = _mm_subs_epu8(ps, us);
+            sum     = _mm_add_epi64(sum, _mm_sad_epu8(ad, zero));
+            max_abs = _mm_max_epu8(max_abs, ad);
+            max_pos = _mm_max_epu8(max_pos, pos);
+            max_neg = _mm_max_epu8(max_neg, neg);
+            min_pos = _mm_min_epu8(min_pos, pos);
+            min_neg = _mm_min_epu8(min_neg, neg);
+            up += 16
+                    - (uint64_t)ZL_popcount64((uint64_t)_mm_movemask_epi8(
+                            _mm_cmpeq_epi8(gt, zero)));
+            down += 16
+                    - (uint64_t)ZL_popcount64((uint64_t)_mm_movemask_epi8(
+                            _mm_cmpeq_epi8(lt, zero)));
+        }
+        st.sum_abs_delta_u = (uint64_t)_mm_cvtsi128_si64(sum)
+                + (uint64_t)_mm_cvtsi128_si64(_mm_unpackhi_epi64(sum, sum));
+        st.max_abs_delta_u  = num8_hmax_u8(max_abs);
+        st.delta_up_count   = (size_t)up;
+        st.delta_down_count = (size_t)down;
+        int64_t const hmax_pos = (int64_t)num8_hmax_u8(max_pos);
+        int64_t const hmax_neg = (int64_t)num8_hmax_u8(max_neg);
+        st.delta_max_s         = hmax_pos;
+        st.delta_min_s         = -hmax_neg;
+        st.delta_first_min_s   = hmax_neg > 0 ? -hmax_neg : (int64_t)num8_hmin_u8(min_pos);
+        st.delta_first_max_s   = hmax_pos > 0 ? hmax_pos : -(int64_t)num8_hmin_u8(min_neg);
+    }
+#endif
+    num8_delta_stats_scalar(data, i, n, &st);
     return st;
 }
 
@@ -1197,10 +1287,43 @@ static void num8_transition_gaps_double(
     }
 }
 
+/* Bit k is set when data[base + k] != data[base + k - 1]; base >= 1. */
+static uint64_t num8_transition_mask64(const uint8_t* data, size_t base)
+{
+#if ZL_ARCH_X86_64
+    uint64_t equal = 0;
+    for (size_t k = 0; k < 64; k += 16) {
+        __m128i const u = _mm_loadu_si128((const __m128i*)(data + base + k));
+        __m128i const p =
+                _mm_loadu_si128((const __m128i*)(data + base + k - 1));
+        equal |= (uint64_t)(uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(u, p))
+                << k;
+    }
+    return ~equal;
+#else
+    uint64_t mask = 0;
+    for (size_t k = 0; k < 64; k++) {
+        mask |= (uint64_t)(data[base + k] != data[base + k - 1]) << k;
+    }
+    return mask;
+#endif
+}
+
+/* Number of consecutive set bits of mask starting at bit k. */
+static size_t num8_streak_length(uint64_t mask, unsigned k)
+{
+    uint64_t const rest = ~(mask >> k);
+    return rest == 0 ? 64 - k : (size_t)ZL_ctz64(rest);
+}
+
 /*
- * Run and transition statistics, and the adjacent-pair bitmap, in one
- * branch-free pass. A transition is a position i with data[i] != data[i - 1];
- * the runs between transitions give max_run_length and the transition gaps.
+ * Run and transition statistics, and the adjacent-pair bitmap. A transition
+ * is a position i with data[i] != data[i - 1]; the runs between transitions
+ * give max_run_length and the transition gaps.
+ *
+ * Transitions are handled 64 positions at a time as a bit mask. A transition
+ * right after another one has gap 1, so those are only counted. Only the
+ * first transition of each streak needs its gap computed.
  *
  * Gaps are integers, so the reference double sums are exact while every
  * partial sum stays below 2^53. The square sum bounds every partial sum and
@@ -1211,28 +1334,52 @@ static void num8_transition_gaps_double(
 static Num8RunStats
 num8_run_stats(const uint8_t* data, size_t n, uint64_t* seen_pairs)
 {
-    size_t run_start         = 0;
-    size_t first_run         = 0;
-    size_t max_run           = 0;
-    size_t transitions       = 0;
-    uint64_t gap_sum         = 0;
-    uint64_t gap_square_sum  = 0;
     for (size_t i = 1; i < n; i++) {
-        uint32_t const prev = data[i - 1];
-        uint32_t const cur  = data[i];
         seen_bitmap_set(
                 seen_pairs,
                 TRS_CARDINALITY_U8_PAIR_BITMAP_WORDS,
-                (prev << 8) | cur);
-        uint64_t const changed = (uint64_t)(prev != cur);
-        uint64_t const mask    = (uint64_t)0 - changed;
-        uint64_t const gap     = (uint64_t)(i - run_start) & mask;
-        max_run = gap > max_run ? (size_t)gap : max_run;
-        first_run = transitions == 0 ? (size_t)gap : first_run;
-        gap_sum += gap;
-        gap_square_sum += gap * gap;
-        transitions += (size_t)changed;
-        run_start = changed ? i : run_start;
+                ((uint32_t)data[i - 1] << 8) | data[i]);
+    }
+
+    size_t run_start        = 0; /* last transition, or 0 */
+    size_t first_run        = 0;
+    size_t max_run          = 0;
+    size_t transitions      = 0;
+    uint64_t gap_sum        = 0;
+    uint64_t gap_square_sum = 0;
+    uint64_t carry          = 0; /* is base - 1 a transition */
+    for (size_t base = 1; base < n; base += 64) {
+        uint64_t mask;
+        if (n - base >= 64) {
+            mask = num8_transition_mask64(data, base);
+        } else {
+            mask = 0;
+            for (size_t k = 0; base + k < n; k++) {
+                mask |= (uint64_t)(data[base + k] != data[base + k - 1]) << k;
+            }
+        }
+        uint64_t const follows = (mask << 1) | carry;
+        uint64_t const units   = (uint64_t)ZL_popcount64(mask & follows);
+        gap_sum += units;
+        gap_square_sum += units;
+        if (transitions == 0 && mask != 0) {
+            first_run = base + (size_t)ZL_ctz64(mask);
+        }
+        transitions += (size_t)ZL_popcount64(mask);
+        if (mask & carry) {
+            /* A streak continues from the previous block. */
+            run_start = base + num8_streak_length(mask, 0) - 1;
+        }
+        for (uint64_t heads = mask & ~follows; heads != 0;
+             heads &= heads - 1) {
+            unsigned const k   = (unsigned)ZL_ctz64(heads);
+            uint64_t const gap = (uint64_t)(base + k - run_start);
+            max_run = gap > max_run ? (size_t)gap : max_run;
+            gap_sum += gap;
+            gap_square_sum += gap * gap;
+            run_start = base + k + num8_streak_length(mask, k) - 1;
+        }
+        carry = mask >> 63;
     }
     size_t const last_run = n - run_start;
 
