@@ -137,6 +137,44 @@ uint64_t ZL_estimateCardinality_hashed(
         ZL_CardinalityHashFn linearCountHash,
         ZL_CardinalityHashFn hyperLogLogHash);
 
+#define ZL_HASHED_CARDINALITY_LINEAR_BUCKETS (1u << 13)
+#define ZL_HASHED_CARDINALITY_HLL_BUCKETS (1u << 10)
+
+/**
+ * Incremental form of `ZL_estimateCardinality_hashed()` for callers that
+ * compute hashes inline. Initialize with the same `cardinalityUpperBound`,
+ * bump every hash (`useHll` selects which hash function the caller must use:
+ * the LinearCount hash when zero, the HyperLogLog hash otherwise), then call
+ * `ZL_HashedCardinality_estimate()` with the same bound. Both sketches only
+ * record which hashes occurred, so the estimate depends on the set of bumped
+ * hashes and not on their order or repetition. Returns 0 when nothing was
+ * bumped.
+ */
+typedef struct {
+    int useHll;
+    uint8_t linear[ZL_HASHED_CARDINALITY_LINEAR_BUCKETS];
+    uint32_t hll[ZL_HASHED_CARDINALITY_HLL_BUCKETS];
+} ZL_HashedCardinality;
+
+void ZL_HashedCardinality_init(
+        ZL_HashedCardinality* sketch,
+        size_t cardinalityUpperBound);
+
+ZL_INLINE void ZL_HashedCardinality_bump(
+        ZL_HashedCardinality* sketch,
+        uint64_t hash)
+{
+    if (!sketch->useHll) {
+        sketch->linear[hash >> 51] = 1;
+    } else {
+        sketch->hll[hash >> 54] |= (uint32_t)(hash & ~(hash - 1));
+    }
+}
+
+uint64_t ZL_HashedCardinality_estimate(
+        const ZL_HashedCardinality* sketch,
+        size_t cardinalityUpperBound);
+
 /// A summary of what we estimate the dimensionality is.
 typedef enum {
     /// No dimensionality detected.

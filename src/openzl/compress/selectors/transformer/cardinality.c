@@ -3,7 +3,6 @@
 #include "cardinality.h"
 #include "numeric_stats.h"
 
-#include "openzl/shared/bits.h"
 #include "openzl/shared/estimate.h"
 #include "openzl/shared/mem.h"
 
@@ -12,28 +11,16 @@
  * the Transformer models were trained. They are frozen model feature
  * definitions, not aliases: later shared-estimator changes must not propagate
  * here without regenerating features, retraining, and evaluation.
+ *
+ * Each estimate feeds hashes into `ZL_HashedCardinality`, whose result
+ * depends only on the set of hashes. Loops therefore skip an element whose
+ * hashed bytes equal the previous element's; this never changes the set.
  */
 #define XXH_INLINE_ALL
 #define XXH_STATIC_LINKING_ONLY
 #include "openzl/shared/xxhash.h"
 
 #include "openzl/common/assertion.h"
-
-typedef struct {
-    const void* data;
-} ArrayHashState;
-
-typedef struct {
-    const uint8_t* data;
-    size_t elt_width;
-} NumericByteHashState;
-
-typedef struct {
-    const uint64_t* words;
-    size_t word_count;
-    size_t word;
-    uint64_t remaining;
-} BitmapHashState;
 
 static uint64_t linear_hash_u64(uint64_t value)
 {
@@ -48,177 +35,105 @@ static uint64_t xxh3_hash_u64(uint64_t value)
     return XXH3_64bits(little_endian, sizeof(little_endian));
 }
 
-static uint64_t cardinality_u64_linear_hash(void* state, size_t index)
+static uint64_t xxh3_hash_pair_u64(uint64_t first, uint64_t second)
 {
-    const ArrayHashState* array = (const ArrayHashState*)state;
-    return linear_hash_u64(((uint64_t const*)array->data)[index]);
-}
-
-static uint64_t cardinality_u64_hll_hash(void* state, size_t index)
-{
-    const ArrayHashState* array = (const ArrayHashState*)state;
-    uint64_t const value        = ((uint64_t const*)array->data)[index];
-    return xxh3_hash_u64(value);
-}
-
-static uint64_t cardinality_u32_linear_hash(void* state, size_t index)
-{
-    const ArrayHashState* array = (const ArrayHashState*)state;
-    return linear_hash_u64((uint64_t)((uint32_t const*)array->data)[index]);
-}
-
-static uint64_t cardinality_u32_hll_hash(void* state, size_t index)
-{
-    const ArrayHashState* array = (const ArrayHashState*)state;
-    uint64_t const value = (uint64_t)((uint32_t const*)array->data)[index];
-    return xxh3_hash_u64(value);
-}
-
-/* Pair and window features use XXH3 for both estimator paths, matching the
- * trained feature contract. */
-static uint64_t pair_u64_hash(void* state, size_t index)
-{
-    const ArrayHashState* array = (const ArrayHashState*)state;
-    const uint64_t* const data  = (const uint64_t*)array->data;
     uint8_t pair[2 * sizeof(uint64_t)];
-    ZL_writeLE64(pair, data[index]);
-    ZL_writeLE64(pair + sizeof(uint64_t), data[index + 1]);
+    ZL_writeLE64(pair, first);
+    ZL_writeLE64(pair + sizeof(uint64_t), second);
     return XXH3_64bits(pair, sizeof(pair));
 }
 
-static uint64_t pair_u32_hash(void* state, size_t index)
+/* Bump the hash of every value whose bit is set, in increasing order. */
+static void bump_bitmap_values(
+        ZL_HashedCardinality* sketch,
+        const uint64_t* words,
+        size_t word_count)
 {
-    const ArrayHashState* array = (const ArrayHashState*)state;
-    uint32_t const* data        = (uint32_t const*)array->data;
-    uint8_t pair[2 * sizeof(uint64_t)];
-    ZL_writeLE64(pair, (uint64_t)data[index]);
-    ZL_writeLE64(pair + sizeof(uint64_t), (uint64_t)data[index + 1]);
-    return XXH3_64bits(pair, sizeof(pair));
-}
-
-static uint64_t d8_hash(void* state, size_t index)
-{
-    const NumericByteHashState* array = (const NumericByteHashState*)state;
-    return XXH3_64bits(array->data + index, 8);
-}
-
-static uint64_t d8_hash_big_endian(void* state, size_t index)
-{
-    const NumericByteHashState* array = (const NumericByteHashState*)state;
-    uint8_t window[8];
-    for (size_t i = 0; i < sizeof(window); ++i) {
-        window[i] = TRS_numeric_canonical_byte_from_big_endian(
-                array->data, index + i, array->elt_width);
-    }
-    return XXH3_64bits(window, sizeof(window));
-}
-
-static size_t bitmap_cardinality(const uint64_t* words, size_t word_count)
-{
-    size_t cardinality = 0;
     for (size_t word = 0; word < word_count; ++word) {
-        cardinality += (size_t)ZL_popcount64(words[word]);
-    }
-    return cardinality;
-}
-
-static uint64_t bitmap_next_value(BitmapHashState* state)
-{
-    while (state->remaining == 0) {
-        state->word++;
-        if (state->word >= state->word_count) {
-            ZL_ASSERT_FAIL(
-                    "bitmap iterator exhausted before expected cardinality");
-            return UINT64_MAX;
+        uint64_t bits = words[word];
+        while (bits != 0) {
+            uint64_t const value =
+                    (uint64_t)(word * 64 + (size_t)ZL_ctz64(bits));
+            bits &= bits - 1;
+            ZL_HashedCardinality_bump(
+                    sketch,
+                    sketch->useHll ? xxh3_hash_u64(value)
+                                   : linear_hash_u64(value));
         }
-        state->remaining = state->words[state->word];
     }
-
-    unsigned const bit = (unsigned)ZL_ctz64(state->remaining);
-    state->remaining &= state->remaining - 1;
-    return (uint64_t)(state->word * 64 + bit);
-}
-
-static uint64_t bitmap_linear_hash(void* state, size_t index)
-{
-    (void)index;
-    return linear_hash_u64(bitmap_next_value((BitmapHashState*)state));
-}
-
-static uint64_t bitmap_hll_hash(void* state, size_t index)
-{
-    (void)index;
-    uint64_t const value = bitmap_next_value((BitmapHashState*)state);
-    return xxh3_hash_u64(value);
-}
-
-static uint64_t bitmap_pair_u8_hash(void* state, size_t index)
-{
-    (void)index;
-    uint32_t const key = (uint32_t)bitmap_next_value((BitmapHashState*)state);
-    uint8_t pair[2 * sizeof(uint64_t)];
-    ZL_writeLE64(pair, (uint64_t)(key >> 8));
-    ZL_writeLE64(pair + sizeof(uint64_t), (uint64_t)(key & 0xFF));
-    return XXH3_64bits(pair, sizeof(pair));
 }
 
 static uint64_t estimate_bitmap_cardinality(
         const uint64_t* words,
         size_t word_count,
-        size_t cardinality_upper_bound,
-        ZL_CardinalityHashFn linear_hash,
-        ZL_CardinalityHashFn hll_hash)
+        size_t cardinality_upper_bound)
 {
-    size_t const distinct = bitmap_cardinality(words, word_count);
-    BitmapHashState state = {
-        .words      = words,
-        .word_count = word_count,
-        .word       = 0,
-        .remaining  = words[0],
-    };
-    /*
-     * The estimator invokes exactly `distinct` callbacks. Each callback
-     * consumes one set bit, so the iterator must end on the final set bit.
-     */
-    return ZL_estimateCardinality_hashed(
-            &state, distinct, cardinality_upper_bound, linear_hash, hll_hash);
+    if (cardinality_upper_bound == 0)
+        return 0;
+    ZL_HashedCardinality sketch;
+    ZL_HashedCardinality_init(&sketch, cardinality_upper_bound);
+    bump_bitmap_values(&sketch, words, word_count);
+    return ZL_HashedCardinality_estimate(&sketch, cardinality_upper_bound);
 }
 
 uint64_t TRS_estimate_cardinality_u64(const uint64_t* data, size_t n_elements)
 {
-    ArrayHashState state = { data };
-    return ZL_estimateCardinality_hashed(
-            &state,
-            n_elements,
-            n_elements,
-            cardinality_u64_linear_hash,
-            cardinality_u64_hll_hash);
+    if (n_elements == 0)
+        return 0;
+    ZL_HashedCardinality sketch;
+    ZL_HashedCardinality_init(&sketch, n_elements);
+    uint64_t prev = ~data[0];
+    for (size_t i = 0; i < n_elements; ++i) {
+        uint64_t const value = data[i];
+        if (value == prev)
+            continue;
+        prev = value;
+        ZL_HashedCardinality_bump(
+                &sketch,
+                sketch.useHll ? xxh3_hash_u64(value) : linear_hash_u64(value));
+    }
+    return ZL_HashedCardinality_estimate(&sketch, n_elements);
 }
 
 uint64_t TRS_estimate_cardinality_u32(const uint32_t* data, size_t n_elements)
 {
-    ArrayHashState state = { data };
-    return ZL_estimateCardinality_hashed(
-            &state,
-            n_elements,
-            n_elements,
-            cardinality_u32_linear_hash,
-            cardinality_u32_hll_hash);
+    if (n_elements == 0)
+        return 0;
+    ZL_HashedCardinality sketch;
+    ZL_HashedCardinality_init(&sketch, n_elements);
+    uint32_t prev = ~data[0];
+    for (size_t i = 0; i < n_elements; ++i) {
+        uint32_t const value = data[i];
+        if (value == prev)
+            continue;
+        prev = value;
+        ZL_HashedCardinality_bump(
+                &sketch,
+                sketch.useHll ? xxh3_hash_u64(value) : linear_hash_u64(value));
+    }
+    return ZL_HashedCardinality_estimate(&sketch, n_elements);
 }
 
+/* Pair and window features use XXH3 for both estimator paths, matching the
+ * trained feature contract. */
 uint64_t TRS_estimate_pair_cardinality_u64(
         const uint64_t* data,
         size_t n_elements)
 {
     if (n_elements < 2)
         return 0;
-    ArrayHashState state = { data };
-    return ZL_estimateCardinality_hashed(
-            &state,
-            n_elements - 1,
-            n_elements - 1,
-            pair_u64_hash,
-            pair_u64_hash);
+    size_t const n_pairs = n_elements - 1;
+    ZL_HashedCardinality sketch;
+    ZL_HashedCardinality_init(&sketch, n_pairs);
+    ZL_HashedCardinality_bump(&sketch, xxh3_hash_pair_u64(data[0], data[1]));
+    for (size_t i = 1; i < n_pairs; ++i) {
+        /* Pair i equals pair i - 1 inside a run of three equal values. */
+        if (data[i + 1] == data[i] && data[i] == data[i - 1])
+            continue;
+        ZL_HashedCardinality_bump(
+                &sketch, xxh3_hash_pair_u64(data[i], data[i + 1]));
+    }
+    return ZL_HashedCardinality_estimate(&sketch, n_pairs);
 }
 
 uint64_t TRS_estimate_pair_cardinality_u32(
@@ -227,13 +142,17 @@ uint64_t TRS_estimate_pair_cardinality_u32(
 {
     if (n_elements < 2)
         return 0;
-    ArrayHashState state = { data };
-    return ZL_estimateCardinality_hashed(
-            &state,
-            n_elements - 1,
-            n_elements - 1,
-            pair_u32_hash,
-            pair_u32_hash);
+    size_t const n_pairs = n_elements - 1;
+    ZL_HashedCardinality sketch;
+    ZL_HashedCardinality_init(&sketch, n_pairs);
+    ZL_HashedCardinality_bump(&sketch, xxh3_hash_pair_u64(data[0], data[1]));
+    for (size_t i = 1; i < n_pairs; ++i) {
+        if (data[i + 1] == data[i] && data[i] == data[i - 1])
+            continue;
+        ZL_HashedCardinality_bump(
+                &sketch, xxh3_hash_pair_u64(data[i], data[i + 1]));
+    }
+    return ZL_HashedCardinality_estimate(&sketch, n_pairs);
 }
 
 uint64_t TRS_estimate_cardinality_u8_bitmap(
@@ -241,11 +160,7 @@ uint64_t TRS_estimate_cardinality_u8_bitmap(
         size_t n_elements)
 {
     return estimate_bitmap_cardinality(
-            seen_values,
-            TRS_CARDINALITY_U8_BITMAP_WORDS,
-            n_elements,
-            bitmap_linear_hash,
-            bitmap_hll_hash);
+            seen_values, TRS_CARDINALITY_U8_BITMAP_WORDS, n_elements);
 }
 
 uint64_t TRS_estimate_cardinality_u16_bitmap(
@@ -253,11 +168,7 @@ uint64_t TRS_estimate_cardinality_u16_bitmap(
         size_t n_elements)
 {
     return estimate_bitmap_cardinality(
-            seen_values,
-            TRS_CARDINALITY_U16_BITMAP_WORDS,
-            n_elements,
-            bitmap_linear_hash,
-            bitmap_hll_hash);
+            seen_values, TRS_CARDINALITY_U16_BITMAP_WORDS, n_elements);
 }
 
 uint64_t TRS_estimate_pair_cardinality_u8_bitmap(
@@ -266,12 +177,20 @@ uint64_t TRS_estimate_pair_cardinality_u8_bitmap(
 {
     if (n_elements < 2)
         return 0;
-    return estimate_bitmap_cardinality(
-            seen_pairs,
-            TRS_CARDINALITY_U8_PAIR_BITMAP_WORDS,
-            n_elements - 1,
-            bitmap_pair_u8_hash,
-            bitmap_pair_u8_hash);
+    size_t const n_pairs = n_elements - 1;
+    ZL_HashedCardinality sketch;
+    ZL_HashedCardinality_init(&sketch, n_pairs);
+    for (size_t word = 0; word < TRS_CARDINALITY_U8_PAIR_BITMAP_WORDS;
+         ++word) {
+        uint64_t bits = seen_pairs[word];
+        while (bits != 0) {
+            uint32_t const key = (uint32_t)(word * 64 + (size_t)ZL_ctz64(bits));
+            bits &= bits - 1;
+            ZL_HashedCardinality_bump(
+                    &sketch, xxh3_hash_pair_u64(key >> 8, key & 0xFF));
+        }
+    }
+    return ZL_HashedCardinality_estimate(&sketch, n_pairs);
 }
 
 uint64_t TRS_estimate_d8_cardinality(
@@ -289,9 +208,28 @@ uint64_t TRS_estimate_d8_cardinality(
         return 0;
     if (n_bytes < 8)
         return 0;
-    NumericByteHashState state = { data, elt_width };
-    ZL_CardinalityHashFn const hash =
-            ZL_isLittleEndian() ? d8_hash : d8_hash_big_endian;
-    return ZL_estimateCardinality_hashed(
-            &state, n_bytes - 7, n_bytes - 7, hash, hash);
+    size_t const n_windows = n_bytes - 7;
+    ZL_HashedCardinality sketch;
+    ZL_HashedCardinality_init(&sketch, n_windows);
+    if (ZL_isLittleEndian()) {
+        uint64_t prev = ~ZL_read64(data);
+        for (size_t i = 0; i < n_windows; ++i) {
+            uint64_t const window = ZL_read64(data + i);
+            if (window == prev)
+                continue;
+            prev = window;
+            ZL_HashedCardinality_bump(&sketch, XXH3_64bits(data + i, 8));
+        }
+    } else {
+        for (size_t i = 0; i < n_windows; ++i) {
+            uint8_t window[8];
+            for (size_t b = 0; b < sizeof(window); ++b) {
+                window[b] = TRS_numeric_canonical_byte_from_big_endian(
+                        data, i + b, elt_width);
+            }
+            ZL_HashedCardinality_bump(
+                    &sketch, XXH3_64bits(window, sizeof(window)));
+        }
+    }
+    return ZL_HashedCardinality_estimate(&sketch, n_windows);
 }

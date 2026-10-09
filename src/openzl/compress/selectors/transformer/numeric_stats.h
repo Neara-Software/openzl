@@ -81,6 +81,13 @@ uint64_t TRS_numeric_kmv_compute_gap_nmad_fp(
         size_t kmv_size);
 
 /**
+ * Return the gap NMAD in Q32 of `distinct` strictly increasing values, as
+ * computed by `TRS_numeric_kmv_compute_gap_nmad_fp()` after it sorts and
+ * compacts its sample. `distinct` must not exceed `TRS_NUMERIC_KMV_K`.
+ */
+uint64_t TRS_numeric_sorted_gap_nmad_fp(const uint64_t* values, size_t distinct);
+
+/**
  * Return the fraction of retained adjacent gaps equal to the most common gap.
  * Retains at most the 512 smallest distinct values, then measures adjacent
  * gaps over the largest 384 values in that retained band. These limits are

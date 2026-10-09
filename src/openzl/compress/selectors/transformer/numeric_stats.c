@@ -100,13 +100,20 @@ uint64_t TRS_numeric_kmv_compute_gap_nmad_fp(
 
     qsort(heap, kmv_size, sizeof(TRS_NumericKmvEntry), kmv_entry_cmp);
 
-    size_t unique = 0;
+    uint64_t values[TRS_NUMERIC_KMV_K];
+    size_t distinct = 1;
+    values[0]       = heap[0].value;
     for (size_t i = 1; i < kmv_size; i++) {
-        if (heap[i].value != heap[unique].value) {
-            heap[++unique] = heap[i];
+        if (heap[i].value != values[distinct - 1]) {
+            values[distinct++] = heap[i].value;
         }
     }
-    size_t const distinct = unique + 1;
+    return TRS_numeric_sorted_gap_nmad_fp(values, distinct);
+}
+
+uint64_t TRS_numeric_sorted_gap_nmad_fp(const uint64_t* values, size_t distinct)
+{
+    ZL_ASSERT_LE(distinct, TRS_NUMERIC_KMV_K);
     if (distinct < 2)
         return 0;
 
@@ -114,7 +121,7 @@ uint64_t TRS_numeric_kmv_compute_gap_nmad_fp(
     uint64_t gaps[TRS_NUMERIC_KMV_K - 1];
     TRS_WideU128 sum_gaps = TRS_wide_u128_from_u64(0);
     for (size_t i = 0; i < n_gaps; i++) {
-        gaps[i]  = heap[i + 1].value - heap[i].value;
+        gaps[i]  = values[i + 1] - values[i];
         sum_gaps = TRS_wide_u128_add_u64(sum_gaps, gaps[i]);
     }
 

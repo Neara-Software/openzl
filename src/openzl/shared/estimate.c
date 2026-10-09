@@ -470,11 +470,6 @@ ZL_CardinalityEstimate ZL_estimateCardinality_fixed(
     return ZS_CardinalityEstimate_fixup(estimate, upperBound);
 }
 
-enum {
-    HASHED_LINEAR_COUNT_SIZE_LOG = 13,
-    HASHED_LINEAR_COUNT_BUCKETS  = 1 << HASHED_LINEAR_COUNT_SIZE_LOG,
-};
-
 /*
  * The hashed estimator's trained feature contract rounds LinearCount to the
  * nearest integer. The general structured estimator intentionally truncates.
@@ -492,39 +487,50 @@ static uint64_t LinearCount_estimateRounded(size_t nbZeros, size_t nbBuckets)
     return (uint64_t)(LinearCount_estimateValue(nbZeros, nbBuckets) + 0.5);
 }
 
-uint64_t ZL_estimateCardinality_hashed(
-        void* state,
-        size_t nbHashes,
-        size_t cardinalityUpperBound,
-        ZL_CardinalityHashFn linearCountHash,
-        ZL_CardinalityHashFn hyperLogLogHash)
+ZL_STATIC_ASSERT(
+        HLL_NB_BUCKETS == ZL_HASHED_CARDINALITY_HLL_BUCKETS,
+        "hashed sketch must match the HyperLogLog layout");
+
+void ZL_HashedCardinality_init(
+        ZL_HashedCardinality* sketch,
+        size_t cardinalityUpperBound)
 {
-    if (nbHashes == 0 || cardinalityUpperBound == 0)
-        return 0;
+    /*
+     * Keep a fixed 8192-bucket LinearCount sketch. Unlike the fixed and
+     * variable APIs, the hashed estimate must not vary its sketch size with
+     * the bound.
+     */
+    sketch->useHll = cardinalityUpperBound > ZL_ESTIMATE_CARDINALITY_16BITS;
+    if (sketch->useHll) {
+        memset(sketch->hll, 0, sizeof(sketch->hll));
+    } else {
+        memset(sketch->linear, 0, sizeof(sketch->linear));
+    }
+}
 
-    ZL_ASSERT(linearCountHash != NULL);
-    ZL_ASSERT(hyperLogLogHash != NULL);
+static size_t HashedCardinality_linearZeros(const uint8_t* bits)
+{
+    /* Buckets hold 0 or 1, so a word's byte sum cannot carry. */
+    size_t nbSet = 0;
+    for (size_t i = 0; i < ZL_HASHED_CARDINALITY_LINEAR_BUCKETS; i += 8) {
+        nbSet += (size_t)((ZL_readLE64(bits + i) * 0x0101010101010101ULL)
+                          >> 56);
+    }
+    return ZL_HASHED_CARDINALITY_LINEAR_BUCKETS - nbSet;
+}
 
+uint64_t ZL_HashedCardinality_estimate(
+        const ZL_HashedCardinality* sketch,
+        size_t cardinalityUpperBound)
+{
     uint64_t estimate;
-    if (cardinalityUpperBound <= ZL_ESTIMATE_CARDINALITY_16BITS) {
-        /*
-         * Keep a fixed 8192-bucket sketch. Unlike the fixed and variable APIs,
-         * the hashed estimate must not vary its sketch size with the bound.
-         */
-        uint8_t bits[HASHED_LINEAR_COUNT_BUCKETS];
-        LinearCount count;
-        LinearCount_init(&count, bits, HASHED_LINEAR_COUNT_SIZE_LOG);
-        for (size_t i = 0; i < nbHashes; ++i) {
-            LinearCount_bump(&count, linearCountHash(state, i));
-        }
+    if (!sketch->useHll) {
         estimate = LinearCount_estimateRounded(
-                LinearCount_nbZeros(&count), HASHED_LINEAR_COUNT_BUCKETS);
+                HashedCardinality_linearZeros(sketch->linear),
+                ZL_HASHED_CARDINALITY_LINEAR_BUCKETS);
     } else {
         HyperLogLog hll;
-        HyperLogLog_init(&hll);
-        for (size_t i = 0; i < nbHashes; ++i) {
-            HyperLogLog_bump(&hll, hyperLogLogHash(state, i));
-        }
+        memcpy(hll.buckets, sketch->hll, sizeof(hll.buckets));
         size_t const nbZeros = HyperLogLog_nbZeros(&hll);
         /*
          * Preserve the trained conversion policy: the LinearCount correction
@@ -538,8 +544,30 @@ uint64_t ZL_estimateCardinality_hashed(
                           HLL_ALPHA)
                           .estimate;
     }
-
     return ZL_MIN(estimate, cardinalityUpperBound);
+}
+
+uint64_t ZL_estimateCardinality_hashed(
+        void* state,
+        size_t nbHashes,
+        size_t cardinalityUpperBound,
+        ZL_CardinalityHashFn linearCountHash,
+        ZL_CardinalityHashFn hyperLogLogHash)
+{
+    if (nbHashes == 0 || cardinalityUpperBound == 0)
+        return 0;
+
+    ZL_ASSERT(linearCountHash != NULL);
+    ZL_ASSERT(hyperLogLogHash != NULL);
+
+    ZL_HashedCardinality sketch;
+    ZL_HashedCardinality_init(&sketch, cardinalityUpperBound);
+    ZL_CardinalityHashFn const hash =
+            sketch.useHll ? hyperLogLogHash : linearCountHash;
+    for (size_t i = 0; i < nbHashes; ++i) {
+        ZL_HashedCardinality_bump(&sketch, hash(state, i));
+    }
+    return ZL_HashedCardinality_estimate(&sketch, cardinalityUpperBound);
 }
 
 static ZL_CardinalityEstimate ZS_estimateLinear_variable_internal(
