@@ -13,6 +13,7 @@
 #include "openzl/compress/cctx.h"
 #include "openzl/compress/codec_output_cache.h"
 #include "openzl/compress/private_nodes.h"
+#include "openzl/compress/selectors/selector_brute_force.h"
 #include "openzl/zl_codec_output_cache.h"
 #include "openzl/zl_compress.h"
 #include "openzl/zl_segmenter.h"
@@ -231,6 +232,49 @@ TEST_F(BruteForceSelectorTest, testNumeric)
             cgraph_, succs, sizeof(succs) / sizeof(succs[0]));
 
     roundTripWithGid(data, gid, CacheHitCheck::Required);
+    ZL_TypedRef_free(data);
+}
+
+TEST_F(BruteForceSelectorTest, testProbeMatchesFullTryOnUniformData)
+{
+    // Uniform data: a slice ranks the successors like the whole input does, so
+    // probing then fully trying the best one must give the same frame size.
+    auto dataVec = generateNumeric(0);
+    auto* data   = ZL_TypedRef_createNumeric(
+            dataVec.data(), sizeof(dataVec[0]), dataVec.size());
+    ZL_GraphID succs[] = { ZL_GRAPH_STORE,
+                           ZL_GRAPH_HUFFMAN,
+                           ZL_GRAPH_FIELD_LZ,
+                           ZL_GRAPH_BITPACK };
+    const ZL_IntParam probe[] = { { ZL_BRUTE_FORCE_PROBE_PARAM, 2048 },
+                                  { ZL_BRUTE_FORCE_PROBE_TOPK_PARAM, 1 } };
+    const ZL_LocalParams lp   = { .intParams = { probe, 2 } };
+    const ZL_GraphParameters params = {
+        .customGraphs   = succs,
+        .nbCustomGraphs = sizeof(succs) / sizeof(succs[0]),
+        .localParams    = &lp,
+    };
+    const auto probed = ZL_Compressor_parameterizeGraph(
+            cgraph_, ZL_GRAPH_BRUTE_FORCE, &params);
+    ASSERT_FALSE(ZL_RES_isError(probed));
+    const auto full = buildBruteForceGraph(
+            cgraph_, succs, sizeof(succs) / sizeof(succs[0]));
+
+    auto compressedSize = [&](ZL_GraphID gid) {
+        std::string out(ZL_compressBound(ZL_Input_contentSize(data)), '\0');
+        ZL_REQUIRE_SUCCESS(ZL_CCtx_setParameter(
+                cctx_, ZL_CParam_formatVersion, ZL_MAX_FORMAT_VERSION));
+        ZL_REQUIRE_SUCCESS(ZL_Compressor_selectStartingGraphID(cgraph_, gid));
+        ZL_REQUIRE_SUCCESS(ZL_CCtx_refCompressor(cctx_, cgraph_));
+        const auto r = ZL_CCtx_compressTypedRef(
+                cctx_, out.data(), out.size(), data);
+        ZL_REQUIRE_SUCCESS(r);
+        return ZL_validResult(r);
+    };
+    EXPECT_EQ(compressedSize(ZL_RES_value(probed)), compressedSize(full));
+    ZL_REQUIRE_SUCCESS(ZL_CCtx_setParameter(
+            cctx_, ZL_CParam_formatVersion, ZL_MAX_FORMAT_VERSION));
+    roundTripWithGid(data, ZL_RES_value(probed), CacheHitCheck::Skipped);
     ZL_TypedRef_free(data);
 }
 

@@ -14,6 +14,7 @@
 #include "openzl/cpp/DCtx.hpp"
 #include "openzl/cpp/Exception.hpp"
 #include "openzl/cpp/FatBundleDictLoader.hpp"
+#include "openzl/zl_codec_output_cache.h"
 #include "openzl/zl_compress.h"
 
 #include "cli/utils/util.h"
@@ -115,6 +116,7 @@ CCtx createCompressionContext(
     if (level.has_value()) {
         cctx.setParameter(CParam::CompressionLevel, level.value());
     }
+    ZL_CCtx_setTryGraphCacheBudget(cctx.get(), 256 << 20);
     cctx.refCompressor(compressor);
 
     return cctx;
