@@ -671,7 +671,72 @@ static TRS_NumericFeatures NumericFeatures_extract_sub64(
     return f;
 }
 
-static TRS_NumericFeatures NumericFeatures_extract_sub64_decision(
+typedef struct {
+    uint64_t min_u;
+    uint64_t max_u;
+    int64_t min_s;
+    int64_t max_s;
+    uint64_t or_all;
+    uint64_t sum_abs_delta_u;
+    size_t zero_count;
+    size_t delta_up_count;
+    size_t delta_down_count;
+    int64_t delta_min_s; /* zero-anchored */
+    int64_t delta_max_s; /* zero-anchored */
+    int64_t delta_first_min_s;
+    int64_t delta_first_max_s;
+} Sub64DecisionStats;
+
+/*
+ * Branch-free value and delta statistics of widened u16/u32 elements.
+ *
+ * sum_abs_delta_u fits in u64: each |delta| < 2^32 and there are fewer than
+ * 2^32 deltas. min_lb0 follows from or_all: the smallest trailing-zero count
+ * over nonzero values is the trailing-zero count of their OR.
+ */
+ZL_FORCE_INLINE Sub64DecisionStats sub64_decision_stats(
+        const uint32_t* data,
+        size_t n_elements,
+        size_t elt_width)
+{
+    Sub64DecisionStats st;
+    st.min_u           = data[0];
+    st.max_u           = data[0];
+    st.min_s           = to_signed(data[0], elt_width);
+    st.max_s           = st.min_s;
+    st.or_all          = data[0];
+    st.sum_abs_delta_u = 0;
+    st.zero_count      = (data[0] == 0);
+    uint64_t up = 0, down = 0;
+    int64_t dfmin = INT64_MAX, dfmax = INT64_MIN;
+    for (size_t i = 1; i < n_elements; i++) {
+        uint64_t const u  = data[i];
+        uint64_t const pu = data[i - 1];
+        int64_t const s   = to_signed(u, elt_width);
+        int64_t const ps  = to_signed(pu, elt_width);
+        int64_t const ds  = s - ps;
+        st.min_u = u < st.min_u ? u : st.min_u;
+        st.max_u = u > st.max_u ? u : st.max_u;
+        st.min_s = s < st.min_s ? s : st.min_s;
+        st.max_s = s > st.max_s ? s : st.max_s;
+        st.or_all |= u;
+        st.zero_count += (u == 0);
+        up += (u > pu);
+        down += (u < pu);
+        dfmin = ds < dfmin ? ds : dfmin;
+        dfmax = ds > dfmax ? ds : dfmax;
+        st.sum_abs_delta_u += u > pu ? u - pu : pu - u;
+    }
+    st.delta_up_count    = (size_t)up;
+    st.delta_down_count  = (size_t)down;
+    st.delta_first_min_s = n_elements > 1 ? dfmin : 0;
+    st.delta_first_max_s = n_elements > 1 ? dfmax : 0;
+    st.delta_min_s       = (n_elements > 1 && dfmin < 0) ? dfmin : 0;
+    st.delta_max_s       = (n_elements > 1 && dfmax > 0) ? dfmax : 0;
+    return st;
+}
+
+ZL_FORCE_INLINE TRS_NumericFeatures sub64_decision_extract(
         const uint32_t* data,
         size_t n_elements,
         size_t elt_width,
@@ -682,139 +747,80 @@ static TRS_NumericFeatures NumericFeatures_extract_sub64_decision(
     if (n_elements == 0)
         return f;
     ZL_ASSERT_NN(data);
-
-    uint64_t min_u               = (uint64_t)data[0];
-    uint64_t max_u               = min_u;
-    int64_t min_s                = to_signed((uint64_t)data[0], elt_width);
-    int64_t max_s                = min_s;
-    TRS_WideU128 sum_abs_delta_u = TRS_wide_u128_from_u64(0);
-    size_t zero_count            = (data[0] == 0) ? 1 : 0;
-    size_t delta_up_count        = 0;
-    size_t delta_down_count      = 0;
-    int64_t delta_min_s          = 0;
-    int64_t delta_max_s          = 0;
-    int64_t delta_first_min_s    = INT64_MAX;
-    int64_t delta_first_max_s    = INT64_MIN;
-    uint64_t min_lb0             = 64;
-    size_t nonzero_count         = (data[0] != 0) ? 1 : 0;
-    uint64_t prev_u              = (uint64_t)data[0];
-    int64_t prev_s               = min_s;
     ZL_ASSERT(has_kmv_workspace(workspace));
     ZL_ASSERT(
             elt_width != 2
             || has_cardinality_workspace(
                     workspace, TRS_CARDINALITY_U16_BITMAP_WORDS));
-    TRS_NumericKmvEntry* const kmv_heap = workspace->kmv_entries;
-    size_t kmv_n                        = 0;
-    uint64_t* const seen_u16            = workspace->cardinality_bitmap;
-    int use_seen_u16 = (elt_width == 2 && data[0] <= UINT16_MAX);
 
-    if (data[0] != 0) {
-        min_lb0 = (uint64_t)ZL_ctz32((uint32_t)data[0]);
-    }
-    if (use_seen_u16) {
-        memset(seen_u16,
-               0,
-               sizeof(*seen_u16) * TRS_CARDINALITY_U16_BITMAP_WORDS);
-        seen_bitmap_set(seen_u16, TRS_CARDINALITY_U16_BITMAP_WORDS, data[0]);
-    }
-    TRS_numeric_kmv_track_value(kmv_heap, &kmv_n, (uint64_t)data[0]);
+    Sub64DecisionStats const st =
+            sub64_decision_stats(data, n_elements, elt_width);
+    size_t const kmv_n = TRS_numeric_kmv_track_u32_values(
+            workspace->kmv_entries, data, n_elements);
 
-    for (size_t i = 1; i < n_elements; i++) {
-        uint64_t val_u  = (uint64_t)data[i];
-        int64_t val_s   = to_signed(data[i], elt_width);
-        int64_t delta_s = val_s - prev_s;
+    f.min_u            = st.min_u;
+    f.max_u            = st.max_u;
+    f.min_s            = st.min_s;
+    f.max_s            = st.max_s;
+    f.zero_count       = st.zero_count;
+    f.delta_up_count   = st.delta_up_count;
+    f.delta_down_count = st.delta_down_count;
+    f.delta_min_s      = st.delta_min_s;
+    f.delta_max_s      = st.delta_max_s;
+    f.min_lb0 = st.or_all == 0 ? 0 : (uint64_t)ZL_ctz32((uint32_t)st.or_all);
 
-        if (use_seen_u16) {
-            if (val_u <= UINT16_MAX) {
-                seen_bitmap_set(
-                        seen_u16, TRS_CARDINALITY_U16_BITMAP_WORDS, data[i]);
-            } else {
-                use_seen_u16 = 0;
-            }
-        }
-
-        if (val_u < min_u)
-            min_u = val_u;
-        if (val_u > max_u)
-            max_u = val_u;
-        if (val_s < min_s)
-            min_s = val_s;
-        if (val_s > max_s)
-            max_s = val_s;
-
-        if (val_u == 0) {
-            zero_count++;
-        } else {
-            nonzero_count++;
-            {
-                uint64_t ctz = (uint64_t)ZL_ctz32(data[i]);
-                if (ctz < min_lb0)
-                    min_lb0 = ctz;
-            }
-        }
-
-        if (delta_s < delta_min_s)
-            delta_min_s = delta_s;
-        if (delta_s > delta_max_s)
-            delta_max_s = delta_s;
-        if (delta_s < delta_first_min_s)
-            delta_first_min_s = delta_s;
-        if (delta_s > delta_first_max_s)
-            delta_first_max_s = delta_s;
-
-        if (val_u != prev_u) {
-            if (val_u > prev_u) {
-                delta_up_count++;
-            } else {
-                delta_down_count++;
-            }
-        }
-
-        uint64_t abs_delta_u = TRS_numeric_abs_diff_u64(val_u, prev_u);
-        sum_abs_delta_u = TRS_wide_u128_add_u64(sum_abs_delta_u, abs_delta_u);
-        TRS_numeric_kmv_track_value(kmv_heap, &kmv_n, val_u);
-        prev_u = val_u;
-        prev_s = val_s;
-    }
-
-    f.min_u            = min_u;
-    f.max_u            = max_u;
-    f.min_s            = min_s;
-    f.max_s            = max_s;
-    f.zero_count       = zero_count;
-    f.delta_up_count   = delta_up_count;
-    f.delta_down_count = delta_down_count;
-    f.delta_min_s      = delta_min_s;
-    f.delta_max_s      = delta_max_s;
-    /* Fewer than two elements have no delta; report 0 like delta_min_s. */
-    f.delta_first_min_s = n_elements > 1 ? delta_first_min_s : 0;
-    f.delta_first_max_s = n_elements > 1 ? delta_first_max_s : 0;
-    f.min_lb0           = (nonzero_count == 0) ? 0 : min_lb0;
-
-    f.range_u       = max_u - min_u;
-    f.range_s       = TRS_wide_i64_abs_diff_to_u64(max_s, min_s);
-    f.zero_ratio_fp = (zero_count * TRS_NUMERIC_Q32_SCALE) / n_elements;
+    f.delta_first_min_s = st.delta_first_min_s;
+    f.delta_first_max_s = st.delta_first_max_s;
+    f.range_u           = st.max_u - st.min_u;
+    f.range_s           = TRS_wide_i64_abs_diff_to_u64(st.max_s, st.min_s);
+    f.zero_ratio_fp     = (st.zero_count * TRS_NUMERIC_Q32_SCALE) / n_elements;
 
     {
         size_t n_transitions = n_elements - 1;
         if (n_transitions > 0) {
-            f.delta_up_ratio_fp =
-                    (delta_up_count * TRS_NUMERIC_Q32_SCALE) / n_transitions;
+            f.delta_up_ratio_fp = (st.delta_up_count * TRS_NUMERIC_Q32_SCALE)
+                    / n_transitions;
             f.delta_down_ratio_fp =
-                    (delta_down_count * TRS_NUMERIC_Q32_SCALE) / n_transitions;
+                    (st.delta_down_count * TRS_NUMERIC_Q32_SCALE)
+                    / n_transitions;
             f.mean_abs_delta_u_fp = TRS_wide_u128_scaled_div_to_u64(
-                    sum_abs_delta_u, n_transitions);
+                    TRS_wide_u128_from_u64(st.sum_abs_delta_u),
+                    n_transitions);
         }
     }
 
-    f.cardinality_est = use_seen_u16
-            ? TRS_estimate_cardinality_u16_bitmap(seen_u16, n_elements)
-            : TRS_estimate_cardinality_u32(data, n_elements);
+    if (elt_width == 2) {
+        /* Widened u16 values always fit the 16-bit presence bitmap. */
+        uint64_t* const seen_u16 = workspace->cardinality_bitmap;
+        memset(seen_u16,
+               0,
+               sizeof(*seen_u16) * TRS_CARDINALITY_U16_BITMAP_WORDS);
+        for (size_t i = 0; i < n_elements; i++) {
+            seen_bitmap_set(seen_u16, TRS_CARDINALITY_U16_BITMAP_WORDS, data[i]);
+        }
+        f.cardinality_est =
+                TRS_estimate_cardinality_u16_bitmap(seen_u16, n_elements);
+    } else {
+        f.cardinality_est = TRS_estimate_cardinality_u32(data, n_elements);
+    }
     f.pair_cardinality_est =
             TRS_estimate_pair_cardinality_u32(data, n_elements);
-    f.sorted_gap_cv_fp = TRS_numeric_kmv_compute_gap_nmad_fp(kmv_heap, kmv_n);
+    f.sorted_gap_cv_fp =
+            TRS_numeric_kmv_compute_gap_nmad_fp(workspace->kmv_entries, kmv_n);
     return f;
+}
+
+static TRS_NumericFeatures NumericFeatures_extract_sub64_decision(
+        const uint32_t* data,
+        size_t n_elements,
+        size_t elt_width,
+        const TRS_NumericExtractWorkspace* workspace)
+{
+    if (elt_width == 2) {
+        return sub64_decision_extract(data, n_elements, 2, workspace);
+    }
+    ZL_ASSERT_EQ(elt_width, 4);
+    return sub64_decision_extract(data, n_elements, 4, workspace);
 }
 
 static TRS_NumericFeatures NumericFeatures_extract_num64(
@@ -1166,68 +1172,87 @@ typedef struct {
     double transition_gap_square_sum;
 } Num8RunStats;
 
+/* The per-element reference accumulation of transition gaps in doubles. */
+static void num8_transition_gaps_double(
+        const uint8_t* data,
+        size_t n,
+        Num8RunStats* st)
+{
+    int have_transition_pos    = 0;
+    size_t last_transition_pos = 0;
+    st->transition_gap_count      = 0;
+    st->transition_gap_sum        = 0.0;
+    st->transition_gap_square_sum = 0.0;
+    for (size_t i = 1; i < n; i++) {
+        if (data[i] != data[i - 1]) {
+            if (have_transition_pos) {
+                double gap = (double)(i - last_transition_pos);
+                st->transition_gap_sum += gap;
+                st->transition_gap_square_sum += gap * gap;
+                st->transition_gap_count++;
+            }
+            last_transition_pos = i;
+            have_transition_pos = 1;
+        }
+    }
+}
+
 /*
- * Walk value changes (transitions) in order. A run ends at each transition;
- * the gaps between transitions feed the transition-gap CV with the same
- * double accumulation order as a per-element scan. Marks every adjacent pair
- * in `seen_pairs`: a changing pair at each transition, and (v, v) for each
- * run of v longer than one element.
+ * Run and transition statistics, and the adjacent-pair bitmap, in one
+ * branch-free pass. A transition is a position i with data[i] != data[i - 1];
+ * the runs between transitions give max_run_length and the transition gaps.
+ *
+ * Gaps are integers, so the reference double sums are exact while every
+ * partial sum stays below 2^53. The square sum bounds every partial sum and
+ * every term, so when it is at most 2^53 the integer sums convert to the
+ * same doubles. Larger sums (only possible beyond 2^26 elements) rerun the
+ * reference double accumulation.
  */
 static Num8RunStats
 num8_run_stats(const uint8_t* data, size_t n, uint64_t* seen_pairs)
 {
-    Num8RunStats st = { 1, 0, 0.0, 0.0 };
-    size_t run_start      = 0;
-    int have_transition   = 0;
-
-#define NUM8_TRANSITION(pos)                                                  \
-    do {                                                                      \
-        size_t const pos_       = (pos);                                      \
-        size_t const run_length = pos_ - run_start;                           \
-        uint32_t const prev_v   = data[pos_ - 1];                             \
-        uint32_t const key      = (prev_v << 8) | data[pos_];                 \
-        if (run_length > st.max_run_length)                                   \
-            st.max_run_length = run_length;                                   \
-        if (run_length >= 2)                                                  \
-            seen_bitmap_set(                                                  \
-                    seen_pairs,                                               \
-                    TRS_CARDINALITY_U8_PAIR_BITMAP_WORDS,                     \
-                    (prev_v << 8) | prev_v);                                  \
-        seen_bitmap_set(                                                      \
-                seen_pairs, TRS_CARDINALITY_U8_PAIR_BITMAP_WORDS, key);       \
-        if (have_transition) {                                                \
-            double const gap = (double)run_length;                            \
-            st.transition_gap_sum += gap;                                     \
-            st.transition_gap_square_sum += gap * gap;                        \
-            st.transition_gap_count++;                                        \
-        }                                                                     \
-        run_start       = pos_;                                               \
-        have_transition = 1;                                                  \
-    } while (0)
-
-    size_t i = 1;
-    for (; i + 8 <= n; i += 8) {
-        /* Byte b of `changed` is nonzero iff data[i + b] != data[i + b - 1]. */
-        uint64_t changed = ZL_readLE64(data + i) ^ ZL_readLE64(data + i - 1);
-        while (changed != 0) {
-            unsigned const b = (unsigned)ZL_ctz64(changed) >> 3;
-            NUM8_TRANSITION(i + b);
-            changed &= ~(UINT64_C(0xFF) << (8 * b));
-        }
-    }
-    for (; i < n; i++) {
-        if (data[i] != data[i - 1])
-            NUM8_TRANSITION(i);
-    }
-#undef NUM8_TRANSITION
-
-    size_t const last_run = n - run_start;
-    if (last_run > st.max_run_length)
-        st.max_run_length = last_run;
-    if (last_run >= 2) {
-        uint32_t const v = data[n - 1];
+    size_t run_start         = 0;
+    size_t first_run         = 0;
+    size_t max_run           = 0;
+    size_t transitions       = 0;
+    uint64_t gap_sum         = 0;
+    uint64_t gap_square_sum  = 0;
+    for (size_t i = 1; i < n; i++) {
+        uint32_t const prev = data[i - 1];
+        uint32_t const cur  = data[i];
         seen_bitmap_set(
-                seen_pairs, TRS_CARDINALITY_U8_PAIR_BITMAP_WORDS, (v << 8) | v);
+                seen_pairs,
+                TRS_CARDINALITY_U8_PAIR_BITMAP_WORDS,
+                (prev << 8) | cur);
+        uint64_t const changed = (uint64_t)(prev != cur);
+        uint64_t const mask    = (uint64_t)0 - changed;
+        uint64_t const gap     = (uint64_t)(i - run_start) & mask;
+        max_run = gap > max_run ? (size_t)gap : max_run;
+        first_run = transitions == 0 ? (size_t)gap : first_run;
+        gap_sum += gap;
+        gap_square_sum += gap * gap;
+        transitions += (size_t)changed;
+        run_start = changed ? i : run_start;
+    }
+    size_t const last_run = n - run_start;
+
+    Num8RunStats st;
+    st.max_run_length = last_run > max_run ? last_run : max_run;
+    if (transitions == 0) {
+        st.transition_gap_count      = 0;
+        st.transition_gap_sum        = 0.0;
+        st.transition_gap_square_sum = 0.0;
+        return st;
+    }
+    /* The first run precedes the first transition and is not a gap. */
+    gap_sum -= first_run;
+    gap_square_sum -= (uint64_t)first_run * first_run;
+    if (gap_square_sum <= ((uint64_t)1 << 53)) {
+        st.transition_gap_count      = transitions - 1;
+        st.transition_gap_sum        = (double)gap_sum;
+        st.transition_gap_square_sum = (double)gap_square_sum;
+    } else {
+        num8_transition_gaps_double(data, n, &st);
     }
     return st;
 }

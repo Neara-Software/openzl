@@ -69,12 +69,19 @@ void TRS_numeric_kmv_track_value(
         uint64_t value);
 
 /**
+ * Track every value of `values` in a fresh KMV sample, as repeated calls to
+ * `TRS_numeric_kmv_track_value()` starting from an empty sample would.
+ * Returns the sample size.
+ */
+size_t TRS_numeric_kmv_track_u32_values(
+        TRS_NumericKmvEntry* heap,
+        const uint32_t* values,
+        size_t n_values);
+
+/**
  * Return the sampled sorted-gap normalized mean absolute deviation in Q32.
  *
- * Sorts and compacts the first `kmv_size` entries of `heap` in place. The
- * array is no longer a valid KMV heap afterward and must not be passed back to
- * `TRS_numeric_kmv_track_value()` without rebuilding it. `kmv_size` must not
- * exceed `TRS_NUMERIC_KMV_K`.
+ * Leaves `heap` unchanged. `kmv_size` must not exceed `TRS_NUMERIC_KMV_K`.
  */
 uint64_t TRS_numeric_kmv_compute_gap_nmad_fp(
         TRS_NumericKmvEntry* heap,

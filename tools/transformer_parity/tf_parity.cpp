@@ -4,7 +4,7 @@
 // candidate, then compare the dumps:
 //   tf_parity dump <list> <out.bin>     feature + decision records per input
 //   tf_parity cmp <a.bin> <b.bin>       byte-compare records, report counts
-//   tf_parity time <list> <reps>        ns/byte of decide8/16_fast/32_fast
+//   tf_parity time <list> <reps> [w]    ns/byte of decide8/16_fast/32_fast
 // <list> holds one raw file path per line (u16 frames). Every file is cut
 // into 1..64 KiB slices and fed as 1-, 2- and 4-byte numeric streams, plus
 // derived byte planes, bit splits and deltas. Synthetic edge cases follow.
@@ -293,13 +293,15 @@ int cmp(const char* a, const char* b)
     return bad != 0;
 }
 
-int timeIt(const char* list, int reps)
+int timeIt(const char* list, int reps, int onlyWidth)
 {
     std::vector<Input> corpus = buildCorpus(list);
     Scratch sc;
     std::map<int, std::pair<double, size_t>> best;
     int sink = 0;
     for (int w : { 1, 2, 4 }) {
+        if (onlyWidth != 0 && w != onlyWidth)
+            continue;
         double bestNs = 1e300;
         size_t bytes  = 0;
         for (int r = 0; r < reps; ++r) {
@@ -346,7 +348,7 @@ int main(int argc, char** argv)
     if (argc >= 4 && !strcmp(argv[1], "cmp"))
         return cmp(argv[2], argv[3]);
     if (argc >= 4 && !strcmp(argv[1], "time"))
-        return timeIt(argv[2], atoi(argv[3]));
+        return timeIt(argv[2], atoi(argv[3]), argc >= 5 ? atoi(argv[4]) : 0);
     fprintf(stderr, "usage: tf_parity dump|cmp|time ...\n");
     return 2;
 }

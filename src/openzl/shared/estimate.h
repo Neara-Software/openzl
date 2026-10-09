@@ -152,7 +152,7 @@ uint64_t ZL_estimateCardinality_hashed(
  */
 typedef struct {
     int useHll;
-    uint8_t linear[ZL_HASHED_CARDINALITY_LINEAR_BUCKETS];
+    uint64_t linear[ZL_HASHED_CARDINALITY_LINEAR_BUCKETS / 64]; /* bitset */
     uint32_t hll[ZL_HASHED_CARDINALITY_HLL_BUCKETS];
 } ZL_HashedCardinality;
 
@@ -165,7 +165,7 @@ ZL_INLINE void ZL_HashedCardinality_bump(
         uint64_t hash)
 {
     if (!sketch->useHll) {
-        sketch->linear[hash >> 51] = 1;
+        sketch->linear[hash >> 57] |= (uint64_t)1 << ((hash >> 51) & 63);
     } else {
         sketch->hll[hash >> 54] |= (uint32_t)(hash & ~(hash - 1));
     }

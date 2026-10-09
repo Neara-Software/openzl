@@ -508,13 +508,11 @@ void ZL_HashedCardinality_init(
     }
 }
 
-static size_t HashedCardinality_linearZeros(const uint8_t* bits)
+static size_t HashedCardinality_linearZeros(const uint64_t* bits)
 {
-    /* Buckets hold 0 or 1, so a word's byte sum cannot carry. */
     size_t nbSet = 0;
-    for (size_t i = 0; i < ZL_HASHED_CARDINALITY_LINEAR_BUCKETS; i += 8) {
-        nbSet += (size_t)((ZL_readLE64(bits + i) * 0x0101010101010101ULL)
-                          >> 56);
+    for (size_t i = 0; i < ZL_HASHED_CARDINALITY_LINEAR_BUCKETS / 64; ++i) {
+        nbSet += (size_t)ZL_popcount64(bits[i]);
     }
     return ZL_HASHED_CARDINALITY_LINEAR_BUCKETS - nbSet;
 }
