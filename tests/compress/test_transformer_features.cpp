@@ -714,6 +714,40 @@ TEST(TransformerFeaturesTest, Num8ByteExtractorMatchesWidenedScan)
     }
 }
 
+TEST(TransformerFeaturesTest, NumericKmvBatchTrackingMatchesPerValueTracking)
+{
+    std::vector<uint32_t> values(5000);
+    uint64_t state = 0x9E3779B97F4A7C15ull;
+    for (size_t i = 0; i < values.size(); ++i) {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        /* Runs of repeats exercise the cached previous hash. */
+        values[i] = i % 7 < 3 && i > 0 ? values[i - 1] : (uint32_t)state;
+    }
+
+    std::array<TRS_NumericKmvEntry, TRS_NUMERIC_KMV_K> batch = {};
+    std::array<TRS_NumericKmvEntry, TRS_NUMERIC_KMV_K> single = {};
+    size_t singleSize = 0;
+    for (uint32_t value : values)
+        TRS_numeric_kmv_track_value(single.data(), &singleSize, value);
+    size_t const batchSize = TRS_numeric_kmv_track_u32_values(
+            batch.data(), values.data(), values.size());
+
+    ASSERT_EQ(batchSize, singleSize);
+    EXPECT_EQ(
+            TRS_numeric_kmv_compute_gap_nmad_fp(batch.data(), batchSize),
+            TRS_numeric_kmv_compute_gap_nmad_fp(single.data(), singleSize));
+    std::vector<uint64_t> batchHashes, singleHashes;
+    for (size_t i = 0; i < batchSize; ++i) {
+        batchHashes.push_back(batch[i].hash);
+        singleHashes.push_back(single[i].hash);
+    }
+    std::sort(batchHashes.begin(), batchHashes.end());
+    std::sort(singleHashes.begin(), singleHashes.end());
+    EXPECT_EQ(batchHashes, singleHashes);
+}
+
 TEST(TransformerFeaturesTest, NumericStatisticsRecognizeRegularSequences)
 {
     const std::array<uint64_t, 4> values                   = { 1, 3, 5, 7 };

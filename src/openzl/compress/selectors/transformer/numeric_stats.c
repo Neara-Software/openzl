@@ -82,13 +82,6 @@ static void kmv_heap_insert(
     }
 }
 
-static int kmv_entry_cmp(const void* a, const void* b)
-{
-    uint64_t va = ((const TRS_NumericKmvEntry*)a)->value;
-    uint64_t vb = ((const TRS_NumericKmvEntry*)b)->value;
-    return (va > vb) - (va < vb);
-}
-
 uint64_t TRS_numeric_kmv_compute_gap_nmad_fp(
         TRS_NumericKmvEntry* heap,
         size_t kmv_size)
@@ -98,14 +91,17 @@ uint64_t TRS_numeric_kmv_compute_gap_nmad_fp(
     if (kmv_size < 2)
         return 0;
 
-    qsort(heap, kmv_size, sizeof(TRS_NumericKmvEntry), kmv_entry_cmp);
-
+    /* Only the sorted distinct values matter; equal values share a hash. */
     uint64_t values[TRS_NUMERIC_KMV_K];
+    for (size_t i = 0; i < kmv_size; i++) {
+        values[i] = heap[i].value;
+    }
+    pdqsort8(values, kmv_size);
+
     size_t distinct = 1;
-    values[0]       = heap[0].value;
     for (size_t i = 1; i < kmv_size; i++) {
-        if (heap[i].value != values[distinct - 1]) {
-            values[distinct++] = heap[i].value;
+        if (values[i] != values[distinct - 1]) {
+            values[distinct++] = values[i];
         }
     }
     return TRS_numeric_sorted_gap_nmad_fp(values, distinct);
@@ -452,6 +448,36 @@ uint64_t TRS_numeric_encode_double_fp(double value)
     if (rounded >= 0x1p64)
         return UINT64_MAX;
     return (uint64_t)rounded;
+}
+
+static uint64_t kmv_hash(uint64_t value)
+{
+    uint8_t little_endian[sizeof(value)];
+    ZL_writeLE64(little_endian, value);
+    return XXH3_64bits(little_endian, sizeof(little_endian));
+}
+
+size_t TRS_numeric_kmv_track_u32_values(
+        TRS_NumericKmvEntry* heap,
+        const uint32_t* values,
+        size_t n_values)
+{
+    size_t size = 0;
+    if (n_values == 0)
+        return 0;
+    uint32_t prev      = values[0];
+    uint64_t prev_hash = kmv_hash(prev);
+    for (size_t i = 0; i < n_values; i++) {
+        uint32_t const value = values[i];
+        uint64_t const hash  = value == prev ? prev_hash : kmv_hash(value);
+        prev                 = value;
+        prev_hash            = hash;
+        /* kmv_heap_insert() ignores this hash once the sample is full. */
+        if (size == TRS_NUMERIC_KMV_K && hash >= heap[0].hash)
+            continue;
+        kmv_heap_insert(heap, &size, hash, value);
+    }
+    return size;
 }
 
 void TRS_numeric_kmv_track_value(
