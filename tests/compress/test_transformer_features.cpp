@@ -711,6 +711,80 @@ TEST(TransformerFeaturesTest, CardinalityCountsPresenceBitmaps)
     EXPECT_EQ(TRS_estimate_pair_cardinality_u8_bitmap(seenPairs.data(), 5), 2);
 }
 
+/*
+ * The num8 byte extractor derives most fields from a histogram, a delta pass
+ * and a transition walk. The widened extractor still scans element by
+ * element with a live KMV heap, so the fields both compute must agree.
+ */
+TEST(TransformerFeaturesTest, Num8ByteExtractorMatchesWidenedScan)
+{
+    constexpr size_t size = 70000; /* Crosses the 2^16 delta block. */
+    std::vector<uint8_t> data(size);
+    std::vector<uint64_t> widened(size);
+    std::vector<uint32_t> scratchValues(size);
+    std::array<uint32_t, TRS_NUMERIC_MATCH4_TABLE_ENTRIES> matchTable = {};
+    LegacyExtractScratch extractScratch;
+    TRS_NumericExtractWorkspace workspace = {
+        .values          = scratchValues.data(),
+        .capacity        = scratchValues.size(),
+        .match4_table    = matchTable.data(),
+        .match4_capacity = matchTable.size(),
+    };
+    extractScratch.attach(workspace);
+
+    uint64_t state = 0x243F6A8885A308D3ull;
+    for (int shape = 0; shape < 4; ++shape) {
+        SCOPED_TRACE(shape);
+        uint8_t value = 0;
+        for (size_t i = 0; i < size; ++i) {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            if (shape == 0)
+                value = (uint8_t)state;
+            else if (shape == 1 && state % 9 == 0)
+                value = (uint8_t)(state >> 32);
+            else if (shape == 2)
+                value = (uint8_t)(0x80 + (state & 3));
+            else if (shape == 3)
+                value = (uint8_t)(i / 300);
+            data[i]    = value;
+            widened[i] = value;
+        }
+
+        TRS_NumericFeatures fromBytes;
+        TRS_NumericFeatures fromWidened;
+        ASSERT_TRUE(TRS_numericFeatures_extract_from_bytes(
+                &fromBytes, data.data(), size, 1, &workspace));
+        ASSERT_TRUE(TRS_numericFeatures_extract(
+                &fromWidened, widened.data(), size, 1, &workspace));
+
+        EXPECT_EQ(fromBytes.min_u, fromWidened.min_u);
+        EXPECT_EQ(fromBytes.max_u, fromWidened.max_u);
+        EXPECT_EQ(fromBytes.sum_u, fromWidened.sum_u);
+        EXPECT_EQ(fromBytes.min_s, fromWidened.min_s);
+        EXPECT_EQ(fromBytes.max_s, fromWidened.max_s);
+        EXPECT_EQ(fromBytes.sum_s, fromWidened.sum_s);
+        EXPECT_EQ(fromBytes.max_run_length, fromWidened.max_run_length);
+        EXPECT_EQ(fromBytes.max_abs_delta_u, fromWidened.max_abs_delta_u);
+        EXPECT_EQ(fromBytes.max_abs_delta_s, fromWidened.max_abs_delta_s);
+        EXPECT_EQ(fromBytes.zero_count, fromWidened.zero_count);
+        EXPECT_EQ(fromBytes.delta_up_count, fromWidened.delta_up_count);
+        EXPECT_EQ(fromBytes.delta_down_count, fromWidened.delta_down_count);
+        EXPECT_EQ(fromBytes.delta_min_s, fromWidened.delta_min_s);
+        EXPECT_EQ(fromBytes.delta_max_s, fromWidened.delta_max_s);
+        EXPECT_EQ(fromBytes.mean_abs_dev_u_fp, fromWidened.mean_abs_dev_u_fp);
+        EXPECT_EQ(fromBytes.mean_abs_dev_s_fp, fromWidened.mean_abs_dev_s_fp);
+        EXPECT_EQ(
+                fromBytes.mean_abs_delta_u_fp, fromWidened.mean_abs_delta_u_fp);
+        EXPECT_EQ(fromBytes.sorted_gap_cv_fp, fromWidened.sorted_gap_cv_fp);
+        EXPECT_EQ(
+                fromBytes.transition_gap_cv_fp,
+                fromWidened.transition_gap_cv_fp);
+        EXPECT_EQ(fromBytes.min_lb0, fromWidened.min_lb0);
+    }
+}
+
 TEST(TransformerFeaturesTest, NumericStatisticsRecognizeRegularSequences)
 {
     const std::array<uint64_t, 4> values                   = { 1, 3, 5, 7 };
