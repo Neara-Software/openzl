@@ -13,6 +13,7 @@
 #include "openzl/common/assertion.h"
 #include "openzl/compress/private_nodes.h"
 #include "openzl/compress/selectors/selector_numeric.h"
+#include "openzl/shared/xxhash.h"
 #include "openzl/compress/selectors/transformer/generated/score_numeric16.h"
 #include "openzl/compress/selectors/transformer/generated/score_numeric32.h"
 #include "openzl/compress/selectors/transformer/generated/score_numeric64.h"
@@ -262,6 +263,39 @@ static int transformer_numeric_init_workspace(
             selCtx, TRS_CARDINALITY_U16_BITMAP_WORDS, workspace);
 }
 
+
+/* The decision is a pure function of (bytes, width, supported ops), and graphs
+ * built around this selector often feed it identical inputs several times per
+ * frame. Memoize the chosen standard graph per thread. Only the encoder's
+ * choice is cached; frames and decoding are unaffected. */
+#define TRANSFORMER_DECISION_CACHE_SIZE 256
+
+typedef struct {
+    uint64_t hash;
+    uint64_t size;
+    uint32_t key;
+    ZL_GraphID graph;
+} TransformerDecisionCacheEntry;
+
+static _Thread_local TransformerDecisionCacheEntry
+        transformerDecisionCache[TRANSFORMER_DECISION_CACHE_SIZE];
+
+static uint32_t transformer_cache_key(
+        size_t eltWidth,
+        SI_TransformerSupportedOperations ops)
+{
+    return 1u | ((uint32_t)eltWidth << 1) | ((uint32_t)ops.constant << 5)
+            | ((uint32_t)ops.divideByGcd << 6) | ((uint32_t)ops.sparseNum << 7);
+}
+
+static ZL_GraphID transformer_numeric_decide(
+        const ZL_Selector* selCtx,
+        const uint8_t* data,
+        size_t size,
+        size_t numElts,
+        size_t eltWidth,
+        SI_TransformerSupportedOperations supportedOperations);
+
 ZL_GraphID SI_transformer_numeric_select(
         const ZL_Selector* selCtx,
         const ZL_Input* inputStream,
@@ -292,6 +326,29 @@ ZL_GraphID SI_transformer_numeric_select(
     size_t const size         = ZL_Input_contentSize(inputStream);
     SI_TransformerSupportedOperations const supportedOperations =
             transformer_supported_operations(selCtx);
+    uint64_t const hash = XXH3_64bits(data, size);
+    uint32_t const key  = transformer_cache_key(eltWidth, supportedOperations);
+    TransformerDecisionCacheEntry* const slot =
+            &transformerDecisionCache[hash % TRANSFORMER_DECISION_CACHE_SIZE];
+    if (slot->key == key && slot->hash == hash && slot->size == size) {
+        return slot->graph;
+    }
+    ZL_GraphID const graph = transformer_numeric_decide(
+            selCtx, data, size, numElts, eltWidth, supportedOperations);
+    *slot = (TransformerDecisionCacheEntry){
+        .hash = hash, .size = size, .key = key, .graph = graph
+    };
+    return graph;
+}
+
+static ZL_GraphID transformer_numeric_decide(
+        const ZL_Selector* selCtx,
+        const uint8_t* data,
+        size_t size,
+        size_t numElts,
+        size_t eltWidth,
+        SI_TransformerSupportedOperations supportedOperations)
+{
     TRS_NumericExtractWorkspace workspace;
     /*
      * Feature extraction is optional: if scratch reservation fails, preserve
