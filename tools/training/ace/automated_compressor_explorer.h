@@ -50,6 +50,9 @@ namespace training {
  * integrate ML selectors into ACE so it can compress different inputs
  * separately.
  */
+/// ACE_TF_COST=c: 1 + c per Transformer graph in @p gene (1 when unset).
+double transformerSizePenalty(const ACECompressor& gene);
+
 class AutomatedCompressorExplorer : public GeneticAlgorithm<ACECompressor> {
    public:
     using Base = GeneticAlgorithm<ACECompressor>;

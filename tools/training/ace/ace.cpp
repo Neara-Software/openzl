@@ -444,7 +444,7 @@ std::vector<ACECompressor> pickComplementary(
             auto r = futures[c][i].get();
             ok     = ok && r.has_value();
             if (ok) {
-                s[i] = (double)r->compressedSize;
+                s[i] = (double)r->compressedSize * transformerSizePenalty(cand);
                 dns += (double)r->decompressionTime.count();
             }
         }
