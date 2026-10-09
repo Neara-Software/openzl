@@ -16,6 +16,12 @@ ZL_BEGIN_C_DECLS
 /// LAMBDA takes precedence over SLACK.
 #define ZL_BRUTE_FORCE_SLACK_PARAM 7311
 #define ZL_BRUTE_FORCE_LAMBDA_PARAM 7312
+/// PROBE (bytes): first try every successor on a contiguous slice of about
+/// this many bytes from the middle of the input, then fully try only the
+/// PROBE_TOPK (default 1) best of them. Inputs smaller than 4 * PROBE, and
+/// string inputs, are tried in full.
+#define ZL_BRUTE_FORCE_PROBE_PARAM 7313
+#define ZL_BRUTE_FORCE_PROBE_TOPK_PARAM 7314
 #define ZL_BRUTE_FORCE_RATE_PARAM_BASE 7320
 
 ZL_GraphID SI_selector_brute_force(

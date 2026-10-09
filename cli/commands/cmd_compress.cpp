@@ -7,6 +7,7 @@
 
 #include "openzl/cpp/CCtx.hpp"
 #include "openzl/cpp/CParam.hpp"
+#include "openzl/zl_codec_output_cache.h"
 #include "openzl/zl_compress.h"
 
 #include "tools/io/InputSetStatic.h"
@@ -162,6 +163,9 @@ int performCompression(const CompressArgs& args)
         cctx.setParameter(
                 CParam::CompressionLevel, args.compressionLevel.value());
     }
+    // Brute-force selectors re-run shared prefixes of their candidate graphs;
+    // the cache reuses those codec outputs. Frames are byte-identical.
+    ZL_CCtx_setTryGraphCacheBudget(cctx.get(), 256 << 20);
     cctx.refCompressor(*args.compressor());
     if (args.traceOutput) {
         args.traceOutput->open();
