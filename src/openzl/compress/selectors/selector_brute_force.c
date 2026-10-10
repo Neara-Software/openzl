@@ -2,10 +2,16 @@
 
 #include "openzl/compress/selectors/selector_brute_force.h"
 
+#include <string.h>
+
 #include "openzl/codecs/zl_brute_force_selector.h"
 #include "openzl/common/assertion.h"
 #include "openzl/common/errors_internal.h"
+#include "openzl/compress/cctx.h"
 #include "openzl/compress/implicit_conversion.h"
+#include "openzl/compress/selector.h"
+#include "openzl/compress/selectors/brute_force_narrow.h"
+#include "openzl/shared/xxhash.h"
 #include "openzl/zl_compress.h"
 #include "openzl/zl_compressor.h"
 #include "openzl/zl_selector.h"
@@ -79,6 +85,86 @@ static bool* probeSkipList(
     return skip;
 }
 
+/// Narrowing state of one brute force selector for the current input, or
+/// NULL when narrowing is off for it. Fills @p skip with the successors not to
+/// try.
+static BFNarrow_Entry* narrowSkipList(
+        const ZL_Selector* selCtx,
+        const ZL_Input* in,
+        const ZL_GraphID* graphs,
+        size_t nbGraphs,
+        uint64_t* inputHash,
+        bool** skip)
+{
+    if (ZL_Selector_getLocalIntParam(selCtx, ZL_BRUTE_FORCE_NARROW_PARAM_BASE)
+                        .paramId
+                == ZL_LP_INVALID_PARAMID
+        || ZL_Input_contentSize(in) < ZL_BRUTE_FORCE_NARROW_MIN_INPUT) {
+        return NULL;
+    }
+    BFNarrow* state = CCTX_getBFNarrow(selCtx->cctx);
+    BFNarrow_Entry* e =
+            state == NULL ? NULL : BFNarrow_get(state, graphs, nbGraphs);
+    bool* s = (bool*)ZL_Selector_getScratchSpace(selCtx, nbGraphs * sizeof(bool));
+    if (e == NULL || s == NULL) {
+        return NULL;
+    }
+    *inputHash = XXH3_64bits(ZL_Input_ptr(in), ZL_Input_contentSize(in));
+    // The selected successor is run again on the same input after the trial
+    // that ranked it; reuse the set that was tried then.
+    const bool* kept = e->nbInputs > 0 && *inputHash == e->lastInput
+            ? e->keptForLast
+            : e->kept;
+    for (size_t i = 0; i < nbGraphs; ++i) {
+        s[i] = !kept[i];
+    }
+    *skip = s;
+    return e;
+}
+
+/// Adds the sizes of a newly seen input to the ranking and keeps the best
+/// successors for the next input, following the NARROW schedule.
+static void narrowUpdate(
+        const ZL_Selector* selCtx,
+        BFNarrow_Entry* e,
+        uint64_t inputHash,
+        const size_t* sizes,
+        size_t srcSize)
+{
+    if (e->nbInputs > 0 && inputHash == e->lastInput) {
+        return;
+    }
+    memcpy(e->keptForLast, e->kept, e->nbGraphs * sizeof(bool));
+    e->lastInput = inputHash;
+    const ZL_IntParam keepParam = ZL_Selector_getLocalIntParam(
+            selCtx, ZL_BRUTE_FORCE_NARROW_PARAM_BASE + (int)e->nbInputs);
+    if (e->nbInputs >= ZL_BRUTE_FORCE_NARROW_MAX_STAGES
+        || keepParam.paramId == ZL_LP_INVALID_PARAMID) {
+        return; // schedule finished: the kept set is final
+    }
+    e->nbInputs++;
+    const bool* const tried = e->keptForLast;
+    for (size_t i = 0; i < e->nbGraphs; ++i) {
+        if (tried[i]) {
+            // A failed successor counts as storing the input raw.
+            e->totals[i] += sizes[i] == (size_t)-1 ? srcSize + 1 : sizes[i];
+        }
+    }
+    const size_t keep =
+            keepParam.paramValue > 0 ? (size_t)keepParam.paramValue : 1;
+    for (size_t i = 0; i < e->nbGraphs; ++i) {
+        size_t better = 0;
+        for (size_t j = 0; j < e->nbGraphs && tried[i]; ++j) {
+            if (tried[j]
+                && (e->totals[j] < e->totals[i]
+                    || (e->totals[j] == e->totals[i] && j < i))) {
+                ++better;
+            }
+        }
+        e->kept[i] = tried[i] && better < keep;
+    }
+}
+
 ZL_GraphID SI_selector_brute_force(
         const ZL_Selector* selCtx,
         const ZL_Input* inputStream,
@@ -109,8 +195,17 @@ ZL_GraphID SI_selector_brute_force(
     const int lambda = lambdaParam.paramId == ZL_LP_INVALID_PARAMID
             ? 0
             : lambdaParam.paramValue;
+    uint64_t inputHash     = 0;
+    bool* narrowSkip       = NULL;
+    BFNarrow_Entry* narrow = narrowSkipList(
+            selCtx,
+            inputStream,
+            customGraphs,
+            nbCustomGraphs,
+            &inputHash,
+            &narrowSkip);
     size_t* sizes = NULL;
-    if ((slack > 0 || lambda > 0) && nbCustomGraphs > 0) {
+    if ((slack > 0 || lambda > 0 || narrow != NULL) && nbCustomGraphs > 0) {
         sizes = (size_t*)ZL_Selector_getScratchSpace(
                 selCtx, nbCustomGraphs * sizeof(size_t));
     }
@@ -126,8 +221,8 @@ ZL_GraphID SI_selector_brute_force(
     const size_t topk = topkParam.paramId == ZL_LP_INVALID_PARAMID
             ? 1
             : (size_t)topkParam.paramValue;
-    bool* skip = NULL;
-    if (probe > 0 && nbCustomGraphs > topk && inputType != ZL_Type_string
+    bool* skip = narrowSkip;
+    if (skip == NULL && probe > 0 && nbCustomGraphs > topk && inputType != ZL_Type_string
         && ZL_Input_contentSize(inputStream) >= 4 * probe) {
         skip = probeSkipList(selCtx, inputStream, customGraphs, nbCustomGraphs, probe, topk);
     }
@@ -161,10 +256,18 @@ ZL_GraphID SI_selector_brute_force(
             bestIdx  = (int64_t)i;
         }
     }
+    if (narrow != NULL) {
+        narrowUpdate(
+                selCtx,
+                narrow,
+                inputHash,
+                sizes,
+                ZL_Input_contentSize(inputStream));
+    }
     if (bestIdx == -1) {
         return ZL_GRAPH_STORE;
     }
-    if (sizes == NULL) {
+    if (slack == 0 && lambda == 0) {
         return customGraphs[bestIdx];
     }
     if (lambda > 0) {

@@ -14,6 +14,7 @@
 #include "openzl/compress/codec_output_cache.h"
 #include "openzl/compress/private_nodes.h"
 #include "openzl/compress/selectors/selector_brute_force.h"
+#include "openzl/codecs/zl_brute_force_selector.h"
 #include "openzl/zl_codec_output_cache.h"
 #include "openzl/zl_compress.h"
 #include "openzl/zl_segmenter.h"
@@ -276,6 +277,87 @@ TEST_F(BruteForceSelectorTest, testProbeMatchesFullTryOnUniformData)
             cctx_, ZL_CParam_formatVersion, ZL_MAX_FORMAT_VERSION));
     roundTripWithGid(data, ZL_RES_value(probed), CacheHitCheck::Skipped);
     ZL_TypedRef_free(data);
+}
+
+TEST_F(BruteForceSelectorTest, testNarrowingKeepsWinnerOfFirstInput)
+{
+    // After the first input, keep 1 successor: the second input is compressed
+    // with the first input's winner only, and both inputs round trip.
+    ZL_GraphID succs[] = { ZL_GRAPH_STORE,
+                           ZL_GRAPH_HUFFMAN,
+                           ZL_GRAPH_FIELD_LZ,
+                           ZL_GRAPH_BITPACK };
+    const ZL_IntParam narrow[] = { { ZL_BRUTE_FORCE_NARROW_PARAM_BASE, 1 } };
+    const ZL_LocalParams lp    = { .intParams = { narrow, 1 } };
+    const ZL_GraphParameters params = {
+        .customGraphs   = succs,
+        .nbCustomGraphs = sizeof(succs) / sizeof(succs[0]),
+        .localParams    = &lp,
+    };
+    const auto narrowed = ZL_Compressor_parameterizeGraph(
+            cgraph_, ZL_GRAPH_BRUTE_FORCE, &params);
+    ASSERT_FALSE(ZL_RES_isError(narrowed));
+
+    auto compressedSize = [&](ZL_GraphID gid, ZL_TypedRef* data) {
+        std::string out(ZL_compressBound(ZL_Input_contentSize(data)), '\0');
+        ZL_REQUIRE_SUCCESS(ZL_CCtx_setParameter(
+                cctx_, ZL_CParam_formatVersion, ZL_MAX_FORMAT_VERSION));
+        ZL_REQUIRE_SUCCESS(ZL_Compressor_selectStartingGraphID(cgraph_, gid));
+        ZL_REQUIRE_SUCCESS(ZL_CCtx_refCompressor(cctx_, cgraph_));
+        const auto r = ZL_CCtx_compressTypedRef(
+                cctx_, out.data(), out.size(), data);
+        ZL_REQUIRE_SUCCESS(r);
+        ZL_TypedBuffer* regen = ZL_TypedBuffer_create();
+        ZL_REQUIRE_SUCCESS(ZL_DCtx_decompressTBuffer(
+                dctx_, regen, out.data(), ZL_validResult(r)));
+        EXPECT_EQ(ZL_Input_contentSize(data), ZL_TypedBuffer_byteSize(regen));
+        EXPECT_EQ(
+                0,
+                memcmp(ZL_Input_ptr(data),
+                       ZL_TypedBuffer_rPtr(regen),
+                       ZL_Input_contentSize(data)));
+        ZL_TypedBuffer_free(regen);
+        return ZL_validResult(r);
+    };
+
+    // Long runs favour FIELD_LZ; random 2-bit values favour BITPACK.
+    auto firstVec  = std::vector<uint16_t>(10000);
+    auto secondVec = std::vector<uint16_t>(10000);
+    std::mt19937 gen(0);
+    for (size_t i = 0; i < firstVec.size(); ++i) {
+        firstVec[i]  = (uint16_t)(i / 64);
+        secondVec[i] = (uint16_t)(gen() & 3);
+    }
+    auto* first = ZL_TypedRef_createNumeric(
+            firstVec.data(), sizeof(firstVec[0]), firstVec.size());
+    auto* second = ZL_TypedRef_createNumeric(
+            secondVec.data(), sizeof(secondVec[0]), secondVec.size());
+
+    const auto full = buildBruteForceGraph(
+            cgraph_, succs, sizeof(succs) / sizeof(succs[0]));
+    size_t firstBest  = compressedSize(full, first);
+    size_t secondBest = compressedSize(full, second);
+    size_t secondWithFirstWinner = SIZE_MAX;
+    for (auto succ : succs) {
+        if (compressedSize(succ, first) == firstBest) {
+            secondWithFirstWinner = compressedSize(succ, second);
+        }
+    }
+    ASSERT_NE(secondWithFirstWinner, SIZE_MAX);
+    ASSERT_GT(secondWithFirstWinner, secondBest);
+
+    ZL_REQUIRE_SUCCESS(ZL_CCtx_resetBruteForceNarrowing(cctx_));
+    EXPECT_EQ(compressedSize(ZL_RES_value(narrowed), first), firstBest);
+    EXPECT_EQ(
+            compressedSize(ZL_RES_value(narrowed), second),
+            secondWithFirstWinner);
+
+    // After a reset every successor is tried again.
+    ZL_REQUIRE_SUCCESS(ZL_CCtx_resetBruteForceNarrowing(cctx_));
+    EXPECT_EQ(compressedSize(ZL_RES_value(narrowed), second), secondBest);
+
+    ZL_TypedRef_free(first);
+    ZL_TypedRef_free(second);
 }
 
 TEST_F(BruteForceSelectorTest, testSelectedGraphReusesTrialResult)
