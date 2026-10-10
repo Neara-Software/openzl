@@ -23,6 +23,16 @@ ZL_BEGIN_C_DECLS
 #define ZL_BRUTE_FORCE_PROBE_PARAM 7313
 #define ZL_BRUTE_FORCE_PROBE_TOPK_PARAM 7314
 #define ZL_BRUTE_FORCE_RATE_PARAM_BASE 7320
+/// NARROW_PARAM_BASE + s (s < NARROW_MAX_STAGES): narrow the successors tried
+/// across the inputs this selector sees within one CCtx session (e.g. the
+/// frames of one file). After the (s+1)-th distinct input of at least
+/// NARROW_MIN_INPUT bytes, keep only the given number of successors with the
+/// smallest total size over the inputs seen so far; once the schedule ends the
+/// kept set is final. Smaller inputs try every successor and are not counted.
+/// Reset with ZL_CCtx_resetBruteForceNarrowing(). Encoder-only.
+#define ZL_BRUTE_FORCE_NARROW_PARAM_BASE 7300
+#define ZL_BRUTE_FORCE_NARROW_MAX_STAGES 10
+#define ZL_BRUTE_FORCE_NARROW_MIN_INPUT 1024
 
 ZL_GraphID SI_selector_brute_force(
         const ZL_Selector* selCtx,

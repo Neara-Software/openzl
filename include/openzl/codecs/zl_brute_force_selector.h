@@ -34,6 +34,13 @@ ZL_Compressor_buildBruteForceSelectorGraph(
         const ZL_GraphID* successors,
         size_t numSuccessors);
 
+/**
+ * Forgets what brute force selectors with narrowing params (see
+ * ZL_BRUTE_FORCE_NARROW_PARAM_BASE) learned on @p cctx. Call before starting a
+ * new file: the next compressions try every successor again.
+ */
+ZL_Report ZL_CCtx_resetBruteForceNarrowing(ZL_CCtx* cctx);
+
 #if defined(__cplusplus)
 }
 #endif

@@ -249,6 +249,10 @@ ZL_Report CCTX_sendTrHeader(ZL_CCtx* cctx, RTNodeID rtnodeid, ZL_RBuffer trh);
 /** Returns the transform header staged for @p rtnodeid, or an empty buffer. */
 ZL_RBuffer CCTX_getNodeHeader(const ZL_CCtx* cctx, RTNodeID rtnodeid);
 
+/** Returns the brute force narrowing state of @p cctx (shared with its
+ * tryGraph contexts); NULL on allocation failure. */
+struct BFNarrow_s* CCTX_getBFNarrow(ZL_CCtx* cctx);
+
 /** Returns the codec output cache active for @p cctx, if any. */
 ZL_CodecOutputCache* CCTX_getCodecOutputCache(const ZL_CCtx* cctx);
 

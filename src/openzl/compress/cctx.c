@@ -24,6 +24,7 @@
 #include "openzl/compress/private_nodes.h"       // ZL_GRAPH_SERIAL_STORE
 #include "openzl/compress/rtgraphs.h"            // RTGraph, RTStreamID
 #include "openzl/compress/segmenter.h"           // SEGM_*
+#include "openzl/compress/selectors/brute_force_narrow.h" // BFNarrow
 #include "openzl/compress/trStates.h"            // TrStates
 #include "openzl/dict/dict_constants.h"          // ZL_DICT_INDEX_NONE
 #include "openzl/zl_buffer.h"                    // ZL_RBuffer
@@ -142,6 +143,8 @@ struct ZL_CCtx_s {
     size_t tryGraphCodecOutputCacheMaxBytes; // 0 disables automatic caching
     bool tryGraphCodecOutputCacheActive;
     bool tryGraphCodecOutputCacheStatsEnabled;
+    BFNarrow* bfNarrow;         // owned; lazily allocated
+    BFNarrow* bfNarrowBorrowed; // set on tryGraph contexts: the parent's state
     bool introspectTrials; // derived (trial) contexts inherit the hooks
     GCParams requestedGCParams; // User selection, at CCtx level
     GCParams appliedGCParams;   // Employed at compression time;
@@ -236,6 +239,7 @@ void CCTX_free(ZL_CCtx* cctx)
         return;
     TRS_destroy(&cctx->cachedCodecStates);
     CodecCache_free(cctx->tryGraphCodecOutputCache);
+    BFNarrow_free(cctx->bfNarrow);
     ZL_Compressor_free(cctx->internal_cgraph);
     RTGM_destroy(&cctx->rtgraph);
     CCTX_TransformHeaders_destroy(&cctx->trHeaders);
@@ -501,6 +505,25 @@ ZL_Report ZL_CCtx_setTryGraphCacheBudget(ZL_CCtx* cctx, size_t maxBytes)
     cctx->tryGraphCodecOutputCache         = NULL;
     cctx->tryGraphCodecOutputCacheActive   = false;
     cctx->tryGraphCodecOutputCacheMaxBytes = maxBytes;
+    return ZL_returnSuccess();
+}
+
+BFNarrow* CCTX_getBFNarrow(ZL_CCtx* cctx)
+{
+    ZL_ASSERT_NN(cctx);
+    if (cctx->bfNarrowBorrowed != NULL) {
+        return cctx->bfNarrowBorrowed;
+    }
+    if (cctx->bfNarrow == NULL) {
+        cctx->bfNarrow = BFNarrow_create();
+    }
+    return cctx->bfNarrow;
+}
+
+ZL_Report ZL_CCtx_resetBruteForceNarrowing(ZL_CCtx* cctx)
+{
+    ZL_ASSERT_NN(cctx);
+    BFNarrow_reset(cctx->bfNarrow);
     return ZL_returnSuccess();
 }
 
@@ -2295,6 +2318,7 @@ CCTX_tryGraph(
         CCTX_disableTryGraphCodecOutputCacheInsertions(parentCCtx);
         ZL_ERR(allocation);
     }
+    cctx->bfNarrowBorrowed = CCTX_getBFNarrow(parentCCtx);
 
     ZL_RESULT_OF(ZL_GraphPerformance)
     result = CCTX_tryGraphInternal(
