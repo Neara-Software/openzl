@@ -30,14 +30,17 @@ static bool* probeSkipList(
         const ZL_GraphID* graphs,
         size_t nbGraphs,
         size_t probe,
-        size_t topk)
+        size_t topk,
+        int lambda)
 {
     const ZL_Type type   = ZL_Input_type(in);
     const size_t width   = type == ZL_Type_serial ? ZL_BRUTE_FORCE_SERIAL_ALIGN
                                                   : ZL_Input_eltWidth(in);
+    const size_t effProbe =
+            (type == ZL_Type_numeric && probe < 32768) ? 32768 : probe;
     const size_t nbUnits = ZL_Input_contentSize(in) / width;
-    const size_t unitsIn = (probe + width - 1) / width;
-    if (unitsIn == 0 || unitsIn * 2 > nbUnits) {
+    const size_t unitsIn = (effProbe + width - 1) / width;
+    if (unitsIn == 0 || unitsIn * 4 > nbUnits) {
         return NULL;
     }
     const char* start =
@@ -50,23 +53,33 @@ static bool* probeSkipList(
     } else {
         slice = ZL_TypedRef_createNumeric(start, width, unitsIn);
     }
-    size_t* probeSizes = (size_t*)ZL_Selector_getScratchSpace(
-            selCtx, nbGraphs * sizeof(size_t));
+    double* probeScores = (double*)ZL_Selector_getScratchSpace(
+            selCtx, nbGraphs * sizeof(double));
     bool* skip =
             (bool*)ZL_Selector_getScratchSpace(selCtx, nbGraphs * sizeof(bool));
-    if (slice == NULL || probeSizes == NULL || skip == NULL) {
+    if (slice == NULL || probeScores == NULL || skip == NULL) {
         ZL_TypedRef_free(slice);
         return NULL;
     }
+    const double probeKib = (double)(unitsIn * width) / 1024.0;
     for (size_t i = 0; i < nbGraphs; ++i) {
-        probeSizes[i] = (size_t)-1;
+        probeScores[i] = -1.0;
         if (!ICONV_isCompatible(
                     type, ZL_Selector_getInput0MaskForGraph(selCtx, graphs[i]))) {
             continue;
         }
         ZL_GraphReport gr = ZL_Selector_tryGraph(selCtx, slice, graphs[i]);
         if (!ZL_isError(gr.finalCompressedSize)) {
-            probeSizes[i] = ZL_validResult(gr.finalCompressedSize);
+            double score = (double)ZL_validResult(gr.finalCompressedSize);
+            if (lambda > 0) {
+                const ZL_IntParam rate = ZL_Selector_getLocalIntParam(
+                        selCtx, ZL_BRUTE_FORCE_RATE_PARAM_BASE + (int)i);
+                if (rate.paramId != ZL_LP_INVALID_PARAMID) {
+                    score += (double)lambda * (double)rate.paramValue * probeKib
+                            * 1e-6;
+                }
+            }
+            probeScores[i] = score;
         }
     }
     ZL_TypedRef_free(slice);
@@ -74,13 +87,14 @@ static bool* probeSkipList(
     // (ties broken by index).
     for (size_t i = 0; i < nbGraphs; ++i) {
         size_t better = 0;
-        for (size_t j = 0; j < nbGraphs; ++j) {
-            if (probeSizes[j] < probeSizes[i]
-                || (probeSizes[j] == probeSizes[i] && j < i)) {
+        for (size_t j = 0; j < nbGraphs && probeScores[i] >= 0.0; ++j) {
+            if (probeScores[j] >= 0.0
+                && (probeScores[j] < probeScores[i]
+                    || (probeScores[j] == probeScores[i] && j < i))) {
                 ++better;
             }
         }
-        skip[i] = probeSizes[i] == (size_t)-1 || better >= topk;
+        skip[i] = probeScores[i] < 0.0 || better >= topk;
     }
     return skip;
 }
@@ -224,7 +238,7 @@ ZL_GraphID SI_selector_brute_force(
     bool* skip = narrowSkip;
     if (skip == NULL && probe > 0 && nbCustomGraphs > topk && inputType != ZL_Type_string
         && ZL_Input_contentSize(inputStream) >= 4 * probe) {
-        skip = probeSkipList(selCtx, inputStream, customGraphs, nbCustomGraphs, probe, topk);
+        skip = probeSkipList(selCtx, inputStream, customGraphs, nbCustomGraphs, probe, topk, lambda);
     }
     int64_t bestIdx = -1;
     for (size_t i = 0; i < nbCustomGraphs; ++i) {
