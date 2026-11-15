@@ -760,10 +760,15 @@ void addSpecialists(
         }
         specs.push_back({ name, std::move(sub), nullptr });
     }
+    const std::string warmSeed =
+            ace.population().empty() ? std::string() : ace.savePopulation(15);
     std::vector<std::future<void>> runs;
     for (auto& spec : specs) {
         spec.explorer =
                 std::make_unique<AutomatedCompressorExplorer>(spec.inputs, params);
+        if (!warmSeed.empty()) {
+            spec.explorer->loadPopulation(warmSeed);
+        }
         runs.push_back(std::async(std::launch::async, [&spec] {
             spec.explorer->run();
         }));

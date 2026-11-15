@@ -225,9 +225,12 @@ std::vector<std::vector<float>> AutomatedCompressorExplorer::computeFitness(
         auto [cache, inserted] = cachedFitness_.emplace(
                 eval.gene.get().hash(), std::make_pair(1, result));
         if (!inserted) {
-            for (size_t j = 0; j < result.size(); ++j) {
-                cache->second.second[j] =
-                        std::min(cache->second.second[j], result[j]);
+            const float n = static_cast<float>(cache->second.first + 1);
+            cache->second.second[0] =
+                    std::min(cache->second.second[0], result[0]);
+            for (size_t j = 1; j < result.size(); ++j) {
+                cache->second.second[j] +=
+                        (result[j] - cache->second.second[j]) / n;
             }
             ++cache->second.first;
         }

@@ -281,6 +281,24 @@ std::vector<ACECompressor> makePrebuiltNumericCompressors()
                 { ACECompressor(
                         buildNode(nodes::Zigzag{}), { transposeZstd }) });
         ACECompressor dQo(buildNode(nodes::DeltaInt{}), { quantizeOffsets });
+        ACECompressor tokDZstdInner(
+                buildNode(nodes::TokenizeNumeric{ true }),
+                { ACECompressor(
+                          buildNode(nodes::DeltaInt{}), { transposeZstd }),
+                  entropy });
+        ACECompressor tokDZstdOuter(
+                buildNode(nodes::TokenizeNumeric{ true }),
+                { ACECompressor(
+                          buildNode(nodes::DeltaInt{}), { tokDZstdInner }),
+                  transposeZstd });
+        compressors.push_back(tokDZstdOuter);
+        compressors.emplace_back(
+                buildNode(nodes::RangePack{}),
+                std::vector{ ACECompressor(
+                        buildNode(nodes::DeltaInt{}),
+                        { ACECompressor(
+                                buildNode(nodes::Zigzag{}),
+                                { tokDZstdOuter }) }) });
         compressors.emplace_back(
                 buildNode(nodes::TokenizeNumeric{ true }),
                 std::vector{ dT, dZzTZstd });
@@ -350,11 +368,14 @@ std::vector<ACECompressor> makePrebuiltStructCompressors()
     compressors.push_back(lz4);
     compressors.push_back(lz);
 
+    const bool bigEndian = std::getenv("ACE_BIG_ENDIAN") != nullptr;
     for (const auto& compressor : makePrebuiltNumericCompressors()) {
         compressors.push_back(ACECompressor(
                 buildNode(nodes::ConvertStructToNumLE{}), { compressor }));
-        compressors.push_back(ACECompressor(
-                buildNode(nodes::ConvertStructToNumBE{}), { compressor }));
+        if (bigEndian) {
+            compressors.push_back(ACECompressor(
+                    buildNode(nodes::ConvertStructToNumBE{}), { compressor }));
+        }
     }
     return compressors;
 }
@@ -368,21 +389,67 @@ std::vector<ACECompressor> makePrebuiltSerialCompressors()
         compressors.emplace_back(graph);
     }
 
-    for (const auto& compressor : makePrebuiltNumericCompressors()) {
+    ACECompressor fieldLz(buildGraph(graphs::FieldLz{}));
+    ACECompressor zstd(buildGraph(graphs::Zstd{}));
+    ACECompressor lz4(buildGraph(graphs::Lz4{}));
+    ACECompressor entropy(buildGraph(graphs::Entropy{}));
+    ACECompressor fse(buildGraph(graphs::Fse{}));
+    ACECompressor store(buildGraph(graphs::Store{}));
+    ACECompressor deltaFieldLz(buildNode(nodes::DeltaInt{}), { fieldLz });
+    ACECompressor transpose(buildNode(nodes::TransposeSplit{}), { zstd });
+    ACECompressor deltaTranspose(buildNode(nodes::DeltaInt{}), { transpose });
+    ACECompressor tokenizeSortedFieldLz(
+            buildNode(nodes::TokenizeNumeric{ true }),
+            { deltaFieldLz, fieldLz });
+    ACECompressor zigzagFieldLz(buildNode(nodes::Zigzag{}), { fieldLz });
+    ACECompressor deltaZigzagFieldLz(
+            buildNode(nodes::DeltaInt{}), { zigzagFieldLz });
+    ACECompressor rangePackDeltaFieldLz(
+            buildNode(nodes::RangePack{}), { deltaFieldLz });
+    ACECompressor pcoBinUnsignedFse(
+            buildNode(nodes::PcoBinSplit{
+                    nodes::PcoBinSplit::LatentMode::Unsigned }),
+            { fse, store });
+    ACECompressor pcoBinSignedFse(
+            buildNode(nodes::PcoBinSplit{
+                    nodes::PcoBinSplit::LatentMode::Signed }),
+            { fse, store });
+    ACECompressor lookbackPcoBin2(
+            buildNode(nodes::LookbackDelta{}),
+            { pcoBinSignedFse, pcoBinUnsignedFse });
+    std::vector<ACECompressor> coreNumeric = {
+        zstd,
+        fieldLz,
+        lz4,
+        entropy,
+        deltaFieldLz,
+        deltaTranspose,
+        tokenizeSortedFieldLz,
+        zigzagFieldLz,
+        deltaZigzagFieldLz,
+        rangePackDeltaFieldLz,
+        pcoBinUnsignedFse,
+        pcoBinSignedFse,
+        lookbackPcoBin2,
+    };
+    const bool bigEndian = std::getenv("ACE_BIG_ENDIAN") != nullptr;
+    for (const auto& compressor : coreNumeric) {
         compressors.push_back(ACECompressor(
                 buildNode(nodes::ConvertSerialToNum8{}), { compressor }));
         compressors.push_back(ACECompressor(
                 buildNode(nodes::ConvertSerialToNumLE16{}), { compressor }));
         compressors.push_back(ACECompressor(
-                buildNode(nodes::ConvertSerialToNumBE16{}), { compressor }));
-        compressors.push_back(ACECompressor(
                 buildNode(nodes::ConvertSerialToNumLE32{}), { compressor }));
         compressors.push_back(ACECompressor(
-                buildNode(nodes::ConvertSerialToNumBE32{}), { compressor }));
-        compressors.push_back(ACECompressor(
                 buildNode(nodes::ConvertSerialToNumLE64{}), { compressor }));
-        compressors.push_back(ACECompressor(
-                buildNode(nodes::ConvertSerialToNumBE64{}), { compressor }));
+        if (bigEndian) {
+            compressors.push_back(ACECompressor(
+                    buildNode(nodes::ConvertSerialToNumBE16{}), { compressor }));
+            compressors.push_back(ACECompressor(
+                    buildNode(nodes::ConvertSerialToNumBE32{}), { compressor }));
+            compressors.push_back(ACECompressor(
+                    buildNode(nodes::ConvertSerialToNumBE64{}), { compressor }));
+        }
     }
 
     return compressors;
@@ -624,6 +691,11 @@ ACECompressor buildRandomNodeCompressor(
                             formatVersion,
                             maxDepth - 1)));
         }
+    }
+    if ((node.name == "zl.zigzag" || node.name == "zl.range_pack")
+        && successors[0]->isNode()
+        && successors[0]->asNode().node.name == node.name) {
+        return *successors[0];
     }
     return ACENodeCompressor(std::move(node), std::move(successors));
 }
