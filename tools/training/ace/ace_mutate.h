@@ -31,12 +31,14 @@ class ACEMutate {
     ACECompressor operator()(const ACECompressor& parent)
     {
         ACEReservoirSampler<const ACECompressor> sampler(rng_);
-        parent.forEachComponent(inputType_, [&](const auto& component, auto) {
+        visitMutable(parent, inputType_, [&](const auto& component) {
             sampler.update(component);
         });
 
-        return parent.replace(
+        return replaceMutable(
+                parent,
                 inputType_,
+                0,
                 [&](const auto& component,
                     auto inputType,
                     size_t depth) -> poly::optional<ACECompressor> {
@@ -49,10 +51,64 @@ class ACEMutate {
     }
 
    private:
+    template <typename VisitorFn>
+    static void visitMutable(
+            const ACECompressor& comp,
+            Type inputType,
+            VisitorFn&& visit)
+    {
+        visit(comp);
+        if (comp.isNode()) {
+            const auto& node = comp.asNode();
+            for (size_t i = 0; i < node.successors.size(); ++i) {
+                if (node.node.name == "zl.pco_bin_split" && i == 1) {
+                    continue;
+                }
+                visitMutable(
+                        *node.successors[i], node.node.outputTypes[i], visit);
+            }
+        }
+    }
+
+    template <typename ReplaceFn>
+    static ACECompressor replaceMutable(
+            const ACECompressor& comp,
+            Type inputType,
+            size_t depth,
+            ReplaceFn&& replaceFn)
+    {
+        auto replacement = replaceFn(comp, inputType, depth);
+        if (replacement.has_value()) {
+            return std::move(*replacement);
+        }
+        if (comp.isNode()) {
+            const auto& node = comp.asNode();
+            std::vector<std::unique_ptr<ACECompressor>> successors;
+            successors.reserve(node.successors.size());
+            for (size_t i = 0; i < node.successors.size(); ++i) {
+                if (node.node.name == "zl.pco_bin_split" && i == 1) {
+                    successors.push_back(
+                            std::make_unique<ACECompressor>(*node.successors[i]));
+                } else {
+                    auto s = replaceMutable(
+                            *node.successors[i],
+                            node.node.outputTypes[i],
+                            depth + 1,
+                            replaceFn);
+                    successors.push_back(
+                            std::make_unique<ACECompressor>(std::move(s)));
+                }
+            }
+            return ACENodeCompressor(node.node, std::move(successors));
+        } else {
+            return comp;
+        }
+    }
+
     ACECompressor
     replace(const ACECompressor& component, Type inputType, size_t depth)
     {
-        std::uniform_int_distribution<int> dist(0, 3);
+        std::uniform_int_distribution<int> dist(0, 4);
         auto choice = dist(rng_);
         if (choice == 0) {
             return randomSimpleCompressor(inputType);
@@ -60,8 +116,10 @@ class ACEMutate {
             return randomCompressor(inputType, depth);
         } else if (choice == 2) {
             return deleteRandomPipelinePrefix(component, inputType, depth);
-        } else {
+        } else if (choice == 3) {
             return addRandomPipeline(component, inputType, depth);
+        } else {
+            return mutateParameters(component, inputType, depth);
         }
     }
 
@@ -72,12 +130,97 @@ class ACEMutate {
 
     ACECompressor randomCompressor(Type inputType, size_t depth)
     {
-        if (depth > maxDepth_) {
+        if (depth >= maxDepth_) {
             return buildRandomGraphCompressor(rng_, inputType);
         } else {
             return buildRandomCompressor(
                     rng_, inputType, formatVersion_, maxDepth_ - depth);
         }
+    }
+
+    ACECompressor mutateParameters(
+            const ACECompressor& component,
+            Type inputType,
+            size_t depth)
+    {
+        if (component.isGraph()) {
+            const auto& g = component.asGraph().graph;
+            const auto compatible = getGraphsComptabileWith(inputType);
+            std::vector<ACEGraph> variants;
+            for (const auto& cand : compatible) {
+                if (cand.name == g.name) {
+                    variants.push_back(cand);
+                }
+            }
+            if (variants.size() > 1) {
+                return ACECompressor(randomChoice(
+                        rng_,
+                        poly::span<const ACEGraph>(
+                                variants.data(), variants.size())));
+            }
+            return addRandomPipeline(component, inputType, depth);
+        }
+
+        const auto& nc = component.asNode();
+        if (nc.node.name == "zl.pco_bin_split") {
+            std::bernoulli_distribution flipOffsets(0.25);
+            if (flipOffsets(rng_)) {
+                std::vector<std::unique_ptr<ACECompressor>> succs;
+                succs.push_back(
+                        std::make_unique<ACECompressor>(*nc.successors[0]));
+                const bool currentlyStore =
+                        nc.successors[1]->isGraph()
+                        && nc.successors[1]->asGraph().graph.name == "zl.store";
+                succs.push_back(
+                        std::make_unique<ACECompressor>(
+                                currentlyStore ? ACECompressor(ACEGraph(
+                                                         graphs::Entropy{}))
+                                               : buildStoreCompressor()));
+                return ACENodeCompressor(nc.node, std::move(succs));
+            }
+            const auto compatible =
+                    getNodesComptabileWith(inputType, formatVersion_);
+            std::vector<ACENode> variants;
+            for (const auto& cand : compatible) {
+                if (cand.name == nc.node.name) {
+                    variants.push_back(cand);
+                }
+            }
+            if (variants.size() > 1) {
+                auto nextNode = randomChoice(
+                        rng_,
+                        poly::span<const ACENode>(
+                                variants.data(), variants.size()));
+                std::vector<std::unique_ptr<ACECompressor>> succs;
+                for (const auto& s : nc.successors) {
+                    succs.push_back(std::make_unique<ACECompressor>(*s));
+                }
+                return ACENodeCompressor(std::move(nextNode), std::move(succs));
+            }
+        } else if (
+                nc.node.name == "zl.tokenize_numeric"
+                || nc.node.name == "zl.lookback_delta") {
+            const auto compatible =
+                    getNodesComptabileWith(inputType, formatVersion_);
+            std::vector<ACENode> variants;
+            for (const auto& cand : compatible) {
+                if (cand.name == nc.node.name) {
+                    variants.push_back(cand);
+                }
+            }
+            if (variants.size() > 1) {
+                auto nextNode = randomChoice(
+                        rng_,
+                        poly::span<const ACENode>(
+                                variants.data(), variants.size()));
+                std::vector<std::unique_ptr<ACECompressor>> succs;
+                for (const auto& s : nc.successors) {
+                    succs.push_back(std::make_unique<ACECompressor>(*s));
+                }
+                return ACENodeCompressor(std::move(nextNode), std::move(succs));
+            }
+        }
+        return addRandomPipeline(component, inputType, depth);
     }
 
     ACECompressor deleteRandomPipelinePrefix(
@@ -86,15 +229,18 @@ class ACEMutate {
             size_t depth)
     {
         const ACECompressor* pipeline = &compressor;
-        // Choose the last node to delete
+        // Choose the last node to delete (unwrapping port 0 when valid)
         ACEReservoirSampler<const ACECompressor> sampler(rng_);
         while (pipeline->isNode()) {
             const auto& node = pipeline->asNode();
-            if (node.successors.size() != 1) {
+            if (node.successors.empty()) {
                 break;
             }
             if (node.successors[0]->acceptsInputType(inputType)) {
                 sampler.update(*pipeline);
+            }
+            if (node.successors.size() != 1) {
+                break;
             }
             pipeline = node.successors[0].get();
         }
@@ -114,40 +260,54 @@ class ACEMutate {
         if (depth >= maxDepth_) {
             return randomSimpleCompressor(inputType);
         }
-        // Bind to a named local: getNodesComptabileWith returns a vector by
-        // value, and the sampler stores pointers into it that are dereferenced
-        // after the loop.
         const auto compatibleNodes =
                 getNodesComptabileWith(inputType, formatVersion_);
-        static const bool byFamily = std::getenv("ACE_FAMILY") != nullptr;
-        if (byFamily) {
-            std::vector<ACENode> accepted;
-            for (const auto& node : compatibleNodes) {
+        const std::string childNodeName =
+                compressor.isNode() ? compressor.asNode().node.name : "";
+        std::vector<ACENode> accepted;
+        for (const auto& node : compatibleNodes) {
+            if ((node.name == "zl.zigzag" && childNodeName == "zl.zigzag")
+                || (node.name == "zl.range_pack"
+                    && childNodeName == "zl.range_pack")) {
+                continue;
+            }
+            if (!node.outputTypes.empty()
+                && compressor.acceptsInputType(node.outputTypes[0])) {
                 if (node.outputTypes.size() == 1
-                    && compressor.acceptsInputType(node.outputTypes[0])) {
+                    || (inputType == Type::Numeric
+                        && node.outputTypes[0] == Type::Numeric)) {
                     accepted.push_back(node);
                 }
             }
-            if (accepted.empty()) {
-                return randomSimpleCompressor(inputType);
-            }
-            auto node = pickRandomNode(
-                    rng_,
-                    poly::span<const ACENode>(accepted.data(), accepted.size()));
-            return ACECompressor(std::move(node), { compressor });
         }
-        ACEReservoirSampler<const ACENode> sampler(rng_);
-        for (const auto& node : compatibleNodes) {
-            if (node.outputTypes.size() == 1
-                && compressor.acceptsInputType(node.outputTypes[0])) {
-                sampler.update(node);
-            }
-        }
-        if (sampler.get() == nullptr) {
+        if (accepted.empty()) {
             return randomSimpleCompressor(inputType);
         }
-        auto node = *sampler.get();
-        return ACECompressor(std::move(node), { compressor });
+        auto node = pickRandomNodeForType(
+                rng_,
+                inputType,
+                poly::span<const ACENode>(accepted.data(), accepted.size()));
+        std::vector<ACECompressor> successors;
+        successors.reserve(node.outputTypes.size());
+        successors.push_back(compressor);
+        const size_t childBudget =
+                maxDepth_ > depth + 1 ? maxDepth_ - depth - 1 : 0;
+        for (size_t i = 1; i < node.outputTypes.size(); ++i) {
+            if (node.name == "zl.pco_bin_split" && i == 1) {
+                std::bernoulli_distribution useStore(0.85);
+                successors.push_back(
+                        useStore(rng_)
+                                ? buildStoreCompressor()
+                                : ACECompressor(ACEGraph(graphs::Entropy{})));
+            } else {
+                successors.push_back(buildRandomCompressor(
+                        rng_,
+                        node.outputTypes[i],
+                        formatVersion_,
+                        childBudget));
+            }
+        }
+        return ACECompressor(std::move(node), std::move(successors));
     }
 
     std::mt19937_64& rng_;

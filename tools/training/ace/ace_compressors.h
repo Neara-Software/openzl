@@ -38,6 +38,15 @@ const ACENode& pickRandomNode(
         std::mt19937_64& rng,
         poly::span<const ACENode> nodes);
 
+/// Like pickRandomNode, but when inputType == Type::Numeric, biases selection
+/// toward native Numeric nodes (85%) over implicit Serial/Struct conversions
+/// (15%) so bitunpack/convert_serial_to_struct variants do not drown out
+/// Numeric transforms.
+const ACENode& pickRandomNodeForType(
+        std::mt19937_64& rng,
+        Type inputType,
+        poly::span<const ACENode> nodes);
+
 /// @returns The small fixed set of leaf graphs that ACE_POLISH tries at each
 /// leaf of a candidate.
 poly::span<const ACEGraph> getPolishBackends();

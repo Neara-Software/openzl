@@ -75,7 +75,8 @@ std::vector<float> fitnessFromResult(
     }
     auto fitness = result->asFloatVector();
     adjustResults(gene, fitness);
-    fitness[0] *= (float)transformerSizePenalty(gene);
+    fitness[0] *= (float)transformerSizePenalty(gene)
+            * (1.0f + 1e-5f * static_cast<float>(gene.numComponents()));
     // ACE_SIZE_ONLY: time axes stay constant so dominance and crowding use
     // size alone. ACE_NO_CTIME: drop only the compression-time objective, so
     // the front trades size against decompression time.

@@ -169,7 +169,7 @@ std::vector<ACECompressor> makePrebuiltNumericCompressors()
     ACECompressor quantizeOffsets(
             buildNode(nodes::QuantizeOffsets{}), { fse, store });
     ACECompressor quantizeLengths(
-            buildNode(nodes::QuantizeOffsets{}), { fse, store });
+            buildNode(nodes::QuantizeLengths{}), { fse, store });
     ACECompressor pcoBinUnsigned(
             buildNode(nodes::PcoBinSplit{
                     nodes::PcoBinSplit::LatentMode::Unsigned }),
@@ -182,24 +182,34 @@ std::vector<ACECompressor> makePrebuiltNumericCompressors()
             buildNode(nodes::PcoBinSplit{
                     nodes::PcoBinSplit::LatentMode::Float }),
             { entropy, store });
+    ACECompressor pcoBinUnsignedFse(
+            buildNode(nodes::PcoBinSplit{
+                    nodes::PcoBinSplit::LatentMode::Unsigned }),
+            { fse, store });
+    ACECompressor pcoBinSignedFse(
+            buildNode(nodes::PcoBinSplit{
+                    nodes::PcoBinSplit::LatentMode::Signed }),
+            { fse, store });
     ACECompressor deltaPcoBinSigned(
-            buildNode(nodes::DeltaInt{}), { pcoBinSigned });
+            buildNode(nodes::DeltaInt{}), { pcoBinSignedFse });
     ACECompressor delta2PcoBinSigned(
             buildNode(nodes::DeltaInt{}), { deltaPcoBinSigned });
     ACECompressor rangePackPcoBinUnsigned(
-            buildNode(nodes::RangePack{}), { pcoBinUnsigned });
+            buildNode(nodes::RangePack{}), { pcoBinUnsignedFse });
     ACECompressor tokenizeSortedPcoBinUnsigned(
             buildNode(nodes::TokenizeNumeric{ true }),
-            { pcoBinUnsigned, entropy });
+            { pcoBinUnsignedFse, entropy });
     ACECompressor lookbackPcoBinSigned(
-            buildNode(nodes::LookbackDelta{}), { pcoBinSigned, entropy });
+            buildNode(nodes::LookbackDelta{}), { pcoBinSignedFse, entropy });
     ACECompressor lookbackPcoBin2(
             buildNode(nodes::LookbackDelta{}),
-            { pcoBinSigned, pcoBinUnsigned });
+            { pcoBinSignedFse, pcoBinUnsignedFse });
     ACECompressor lookbackPcoBinFieldLz(
-            buildNode(nodes::LookbackDelta{}), { pcoBinSigned, fieldLz });
+            buildNode(nodes::LookbackDelta{}), { pcoBinSignedFse, fieldLz });
     ACECompressor rangePackLookbackPcoBin(
             buildNode(nodes::RangePack{}), { lookbackPcoBin2 });
+    ACECompressor divideByRangePackLookbackPcoBin(
+            buildNode(nodes::DivideBy{}), { rangePackLookbackPcoBin });
     std::vector<ACECompressor> prebuilt = {
         fieldLz,
         zstd,
@@ -225,6 +235,8 @@ std::vector<ACECompressor> makePrebuiltNumericCompressors()
         pcoBinUnsigned,
         pcoBinSigned,
         pcoBinFloat,
+        pcoBinUnsignedFse,
+        pcoBinSignedFse,
         deltaPcoBinSigned,
         delta2PcoBinSigned,
         rangePackPcoBinUnsigned,
@@ -233,6 +245,7 @@ std::vector<ACECompressor> makePrebuiltNumericCompressors()
         lookbackPcoBin2,
         lookbackPcoBinFieldLz,
         rangePackLookbackPcoBin,
+        divideByRangePackLookbackPcoBin,
     };
     if (transformerAllowed()) {
         prebuilt.insert(prebuilt.begin(), transformer);
@@ -263,7 +276,27 @@ std::vector<ACECompressor> makePrebuiltNumericCompressors()
                 buildNode(nodes::RangePack{}),
                 { ACECompressor(
                         buildNode(nodes::DeltaInt{}), { transposeZstd }) });
+        ACECompressor dZzTZstd(
+                buildNode(nodes::DeltaInt{}),
+                { ACECompressor(
+                        buildNode(nodes::Zigzag{}), { transposeZstd }) });
         ACECompressor dQo(buildNode(nodes::DeltaInt{}), { quantizeOffsets });
+        compressors.emplace_back(
+                buildNode(nodes::TokenizeNumeric{ true }),
+                std::vector{ dT, dZzTZstd });
+        compressors.emplace_back(
+                buildNode(nodes::DeltaInt{}),
+                std::vector{ ACECompressor(
+                        buildNode(nodes::Zigzag{}),
+                        { ACECompressor(
+                                buildNode(nodes::TokenizeNumeric{ true }),
+                                { rpDTZstd, transposeZstd }) }) });
+        compressors.emplace_back(
+                buildNode(nodes::LookbackDelta{}),
+                std::vector{ ACECompressor(
+                                     buildNode(nodes::TokenizeNumeric{ true }),
+                                     { deltaPcoBinSigned, pcoBinUnsignedFse }),
+                             pcoBinUnsignedFse });
         for (bool sorted : { true, false }) {
             compressors.emplace_back(
                     buildNode(nodes::TokenizeNumeric{ sorted }),
@@ -476,6 +509,39 @@ poly::span<const ACECompressor> getPrebuiltCompressors(Type inputType)
     return compressors->at(inputType);
 }
 
+const ACENode& pickRandomNodeForType(
+        std::mt19937_64& rng,
+        Type inputType,
+        poly::span<const ACENode> nodes)
+{
+    assert(!nodes.empty());
+    if (inputType == Type::Numeric) {
+        std::vector<const ACENode*> native;
+        std::vector<const ACENode*> converted;
+        for (const auto& n : nodes) {
+            if (n.inputType == Type::Numeric) {
+                native.push_back(&n);
+            } else {
+                converted.push_back(&n);
+            }
+        }
+        if (!native.empty() && !converted.empty()) {
+            std::bernoulli_distribution useNative(0.85);
+            const auto& bucket = useNative(rng) ? native : converted;
+            std::vector<ACENode> tmp;
+            tmp.reserve(bucket.size());
+            for (const auto* ptr : bucket) {
+                tmp.push_back(*ptr);
+            }
+            const ACENode& chosen = pickRandomNode(
+                    rng, poly::span<const ACENode>(tmp.data(), tmp.size()));
+            const size_t idx = static_cast<size_t>(&chosen - tmp.data());
+            return *bucket[idx];
+        }
+    }
+    return pickRandomNode(rng, nodes);
+}
+
 const ACENode& pickRandomNode(
         std::mt19937_64& rng,
         poly::span<const ACENode> nodes)
@@ -537,19 +603,27 @@ ACECompressor buildRandomNodeCompressor(
         // single graph.
         return buildRandomGraphCompressor(rng, inputType);
     }
-    auto node = pickRandomNode(
+    auto node = pickRandomNodeForType(
             rng,
+            inputType,
             poly::span<const ACENode>(compatible.data(), compatible.size()));
     assert(isCompatible(node.inputType, inputType));
     std::vector<std::unique_ptr<ACECompressor>> successors;
     successors.reserve(node.outputTypes.size());
     for (size_t i = 0; i < node.outputTypes.size(); ++i) {
-        successors.push_back(
-                std::make_unique<ACECompressor>(buildRandomCompressor(
-                        rng,
-                        node.outputTypes[i],
-                        formatVersion,
-                        maxDepth - 1)));
+        if (node.name == "zl.pco_bin_split" && i == 1) {
+            std::bernoulli_distribution useStore(0.85);
+            successors.push_back(std::make_unique<ACECompressor>(
+                    useStore(rng) ? ACEGraphCompressor(buildGraph(graphs::Store{}))
+                                  : ACEGraphCompressor(buildGraph(graphs::Entropy{}))));
+        } else {
+            successors.push_back(
+                    std::make_unique<ACECompressor>(buildRandomCompressor(
+                            rng,
+                            node.outputTypes[i],
+                            formatVersion,
+                            maxDepth - 1)));
+        }
     }
     return ACENodeCompressor(std::move(node), std::move(successors));
 }
@@ -560,6 +634,9 @@ ACECompressor buildRandomCompressor(
         uint32_t formatVersion,
         size_t maxDepth)
 {
+    if (maxDepth == 0) {
+        return buildRandomGraphCompressor(rng, inputType);
+    }
     std::bernoulli_distribution dist(0.5);
     if (dist(rng)) {
         auto compressor = buildRandomGraphCompressor(rng, inputType);
@@ -567,7 +644,7 @@ ACECompressor buildRandomCompressor(
         return compressor;
     } else {
         auto compressor = buildRandomNodeCompressor(
-                rng, inputType, formatVersion, maxDepth - 1);
+                rng, inputType, formatVersion, maxDepth);
         assert(compressor.acceptsInputType(inputType));
         return compressor;
     }
