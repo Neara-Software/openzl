@@ -16,6 +16,27 @@
 namespace openzl {
 namespace training {
 
+/// ACE_TF_COST=c: each Transformer graph in @p gene scales its size by
+/// (1 + c), so the search keeps a Transformer only where it saves more than
+/// c. Its compression cost is otherwise invisible under ACE_NO_CTIME.
+double transformerSizePenalty(const ACECompressor& gene)
+{
+    static const double cost = [] {
+        const char* c = std::getenv("ACE_TF_COST");
+        return c ? std::strtod(c, nullptr) : 0.0;
+    }();
+    if (cost <= 0) {
+        return 1;
+    }
+    size_t n = 0;
+    gene.forEachComponent(Type::Serial, [&n](const ACECompressor& c, auto) {
+        if (c.isGraph() && c.asGraph().graph.name == "zl.transformer_numeric") {
+            ++n;
+        }
+    });
+    return 1 + cost * (double)n;
+}
+
 std::vector<ACECompressor> AutomatedCompressorExplorer::initialPopulation()
 {
     // Use all prebuilt compressors
@@ -43,27 +64,6 @@ void adjustResults(const ACECompressor& gene, std::vector<float>& results)
         const auto delta = results[i] * scale[i] * numComponents;
         results[i] += std::max<float>(numComponents, delta);
     }
-}
-
-/// ACE_TF_COST=c: each Transformer graph in @p gene scales its size by
-/// (1 + c), so the search keeps a Transformer only where it saves more than
-/// c. Its compression cost is otherwise invisible under ACE_NO_CTIME.
-double transformerSizePenalty(const ACECompressor& gene)
-{
-    static const double cost = [] {
-        const char* c = std::getenv("ACE_TF_COST");
-        return c ? std::strtod(c, nullptr) : 0.0;
-    }();
-    if (cost <= 0) {
-        return 1;
-    }
-    size_t n = 0;
-    gene.forEachComponent(Type::Serial, [&n](const ACECompressor& c, auto) {
-        if (c.isGraph() && c.asGraph().graph.name == "zl.transformer_numeric") {
-            ++n;
-        }
-    });
-    return 1 + cost * (double)n;
 }
 
 std::vector<float> fitnessFromResult(
