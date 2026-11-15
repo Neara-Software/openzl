@@ -94,6 +94,9 @@ enum class OpenZLComponentID {
     PivCoHuffmanGraph,
     TransformerNumeric,
     BruteForce,
+    LookbackDelta,
+    PcoBinSplit,
+    PcoBinSplitFloat,
     // Must be last enum value
     NumComponents,
 };
@@ -174,6 +177,9 @@ std::unique_ptr<OpenZLComponent> makePivCoHuffmanComponent();
 std::unique_ptr<OpenZLComponent> makePivCoHuffmanGraphComponent();
 std::unique_ptr<OpenZLComponent> makeTransformerNumericComponent();
 std::unique_ptr<OpenZLComponent> makeBruteForceComponent();
+std::unique_ptr<OpenZLComponent> makeLookbackDeltaComponent();
+std::unique_ptr<OpenZLComponent> makePcoBinSplitComponent();
+std::unique_ptr<OpenZLComponent> makePcoBinSplitFloatComponent();
 
 } // namespace components
 
@@ -319,6 +325,12 @@ inline std::unique_ptr<OpenZLComponent> makeOpenZLComponent(
             return components::makeTransformerNumericComponent();
         case OpenZLComponentID::BruteForce:
             return components::makeBruteForceComponent();
+        case OpenZLComponentID::LookbackDelta:
+            return components::makeLookbackDeltaComponent();
+        case OpenZLComponentID::PcoBinSplit:
+            return components::makePcoBinSplitComponent();
+        case OpenZLComponentID::PcoBinSplitFloat:
+            return components::makePcoBinSplitFloatComponent();
         case OpenZLComponentID::NumComponents:
         default:
             throw std::runtime_error("Invalid component");
