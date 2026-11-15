@@ -17,6 +17,8 @@
 #include "openzl/codecs/flatpack/decode_flatpack_binding.h"
 #include "openzl/codecs/float_deconstruct/decode_float_deconstruct_binding.h"
 #include "openzl/codecs/hilbert3/decode_hilbert3_binding.h"
+#include "openzl/codecs/lookback_delta/decode_lookback_delta_binding.h"
+#include "openzl/codecs/pco_bin_split/decode_pco_bin_split_binding.h"
 #include "openzl/codecs/interleave/decode_interleave_binding.h"
 #include "openzl/codecs/lz/decode_lz_binding.h"
 #include "openzl/codecs/morton3/decode_morton3_binding.h"
@@ -146,6 +148,8 @@ const StandardDTransform SDecoders_array[ZL_StandardTransformID_end] = {
     REGISTER_TTRANSFORM_G(ZL_StandardTransformID_hilbert3_i32, 27, DI_HILBERT3_I32, HILBERT3_I32_GRAPH),
     REGISTER_TTRANSFORM_G(ZL_StandardTransformID_morton3_u16, 27, DI_MORTON3_U16, MORTON3_U16_GRAPH),
     REGISTER_TTRANSFORM_G(ZL_StandardTransformID_morton3_i32, 27, DI_MORTON3_I32, MORTON3_I32_GRAPH),
+    REGISTER_TTRANSFORM_G(ZL_StandardTransformID_lookback_delta, 27, DI_LOOKBACK_DELTA, LOOKBACK_DELTA_GRAPH),
+    REGISTER_TTRANSFORM_G(ZL_StandardTransformID_pco_bin_split, 27, DI_PCO_BIN_SPLIT, PCO_BIN_SPLIT_GRAPH),
 
     REGISTER_VOTRANSFORM_G(ZL_StandardTransformID_splitn, 9, DI_SPLITN, GRAPH_VO_SERIAL),
     REGISTER_VOTRANSFORM_G(ZL_StandardTransformID_splitn_struct, 14, DI_SPLITN_STRUCT, GRAPH_VO_STRUCT),

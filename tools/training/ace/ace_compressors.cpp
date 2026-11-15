@@ -52,6 +52,13 @@ std::vector<ACENode> makeAllNodes()
     n.push_back(buildNode(nodes::Prefix{}));
     n.push_back(buildNode(nodes::QuantizeOffsets{}));
     n.push_back(buildNode(nodes::QuantizeLengths{}));
+    n.push_back(buildNode(nodes::LookbackDelta{}));
+    n.push_back(buildNode(
+            nodes::PcoBinSplit{ nodes::PcoBinSplit::LatentMode::Unsigned }));
+    n.push_back(buildNode(
+            nodes::PcoBinSplit{ nodes::PcoBinSplit::LatentMode::Signed }));
+    n.push_back(buildNode(
+            nodes::PcoBinSplit{ nodes::PcoBinSplit::LatentMode::Float }));
     n.push_back(buildNode(nodes::TransposeSplit{}));
     n.push_back(buildNode(nodes::BitsplitFP{}));
     n.push_back(buildNode(nodes::BitsplitBF16{}));
@@ -163,6 +170,36 @@ std::vector<ACECompressor> makePrebuiltNumericCompressors()
             buildNode(nodes::QuantizeOffsets{}), { fse, store });
     ACECompressor quantizeLengths(
             buildNode(nodes::QuantizeOffsets{}), { fse, store });
+    ACECompressor pcoBinUnsigned(
+            buildNode(nodes::PcoBinSplit{
+                    nodes::PcoBinSplit::LatentMode::Unsigned }),
+            { entropy, store });
+    ACECompressor pcoBinSigned(
+            buildNode(nodes::PcoBinSplit{
+                    nodes::PcoBinSplit::LatentMode::Signed }),
+            { entropy, store });
+    ACECompressor pcoBinFloat(
+            buildNode(nodes::PcoBinSplit{
+                    nodes::PcoBinSplit::LatentMode::Float }),
+            { entropy, store });
+    ACECompressor deltaPcoBinSigned(
+            buildNode(nodes::DeltaInt{}), { pcoBinSigned });
+    ACECompressor delta2PcoBinSigned(
+            buildNode(nodes::DeltaInt{}), { deltaPcoBinSigned });
+    ACECompressor rangePackPcoBinUnsigned(
+            buildNode(nodes::RangePack{}), { pcoBinUnsigned });
+    ACECompressor tokenizeSortedPcoBinUnsigned(
+            buildNode(nodes::TokenizeNumeric{ true }),
+            { pcoBinUnsigned, entropy });
+    ACECompressor lookbackPcoBinSigned(
+            buildNode(nodes::LookbackDelta{}), { pcoBinSigned, entropy });
+    ACECompressor lookbackPcoBin2(
+            buildNode(nodes::LookbackDelta{}),
+            { pcoBinSigned, pcoBinUnsigned });
+    ACECompressor lookbackPcoBinFieldLz(
+            buildNode(nodes::LookbackDelta{}), { pcoBinSigned, fieldLz });
+    ACECompressor rangePackLookbackPcoBin(
+            buildNode(nodes::RangePack{}), { lookbackPcoBin2 });
     std::vector<ACECompressor> prebuilt = {
         fieldLz,
         zstd,
@@ -185,6 +222,17 @@ std::vector<ACECompressor> makePrebuiltNumericCompressors()
         bf16Decon,
         quantizeOffsets,
         quantizeLengths,
+        pcoBinUnsigned,
+        pcoBinSigned,
+        pcoBinFloat,
+        deltaPcoBinSigned,
+        delta2PcoBinSigned,
+        rangePackPcoBinUnsigned,
+        tokenizeSortedPcoBinUnsigned,
+        lookbackPcoBinSigned,
+        lookbackPcoBin2,
+        lookbackPcoBinFieldLz,
+        rangePackLookbackPcoBin,
     };
     if (transformerAllowed()) {
         prebuilt.insert(prebuilt.begin(), transformer);

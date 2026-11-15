@@ -29,6 +29,8 @@
 #include "openzl/codecs/zl_float_deconstruct.h"    // IWYU pragma: export
 #include "openzl/codecs/zl_generic.h"              // IWYU pragma: export
 #include "openzl/codecs/zl_hilbert3.h"             // IWYU pragma: export
+#include "openzl/codecs/zl_lookback_delta.h"       // IWYU pragma: export
+#include "openzl/codecs/zl_pco_bin_split.h"        // IWYU pragma: export
 #include "openzl/codecs/zl_illegal.h"              // IWYU pragma: export
 #include "openzl/codecs/zl_interleave.h"           // IWYU pragma: export
 #include "openzl/codecs/zl_lz.h"                   // IWYU pragma: export
