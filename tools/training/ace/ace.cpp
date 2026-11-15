@@ -459,25 +459,6 @@ std::vector<ACECompressor> pickComplementary(
     if (cands.empty()) {
         return picked;
     }
-    // Align greedy selection with SI_selector_brute_force's runtime
-    // objective (sizes[i] + lambda * rate * kib * 1e-6) when ACE_BRUTE_LAMBDA
-    // is set so K slots are not spent on slow candidates the selector skips.
-    if (const char* lambdaEnv = std::getenv("ACE_BRUTE_LAMBDA")) {
-        const double lambda = std::strtod(lambdaEnv, nullptr);
-        double totalBytes   = 0;
-        for (size_t i = 0; i < n; ++i) {
-            totalBytes += (double)inputs[i].contentSize();
-        }
-        if (lambda > 0 && totalBytes > 0) {
-            for (size_t c = 0; c < cands.size(); ++c) {
-                const double estRate = dtime[c] / totalBytes * 1024.0;
-                for (size_t i = 0; i < n; ++i) {
-                    const double kib = (double)inputs[i].contentSize() / 1024.0;
-                    sizes[c][i] += lambda * estRate * kib * 1e-6;
-                }
-            }
-        }
-    }
     // ACE_BRUTE_BALANCE=1: weight each input by 1 / (bytes of its training
     // file under the smallest single candidate), so every file counts the
     // same in the greedy objective instead of in proportion to its bytes.
