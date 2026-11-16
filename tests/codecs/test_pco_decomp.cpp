@@ -141,7 +141,7 @@ TEST_F(PcoDecompTest, PcoBinSplitCompressesBimodalAndPreservesFloatBits)
 TEST_F(PcoDecompTest, PcoBinSplitWidthsModesAndBatchBoundaries)
 {
     const std::vector<size_t> lengths = {
-        0, 1, 7, 8, 9, 255, 256, 257, 511, 512, 513, 1000
+        0, 1, 7, 8, 9, 255, 256, 257, 511, 512, 513, 1000, 5000
     };
     auto testType = [&](auto tag, nodes::PcoBinSplit::LatentMode mode) {
         using T = decltype(tag);
