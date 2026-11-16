@@ -528,6 +528,31 @@ TEST_F(PcoDecompTest, FloatMultSplitDetectsMultipliersAndPreservesAllBits)
     EXPECT_EQ(adjCount, 0u);
 }
 
+TEST_F(PcoDecompTest, PcoBinSplitSampledNearUint64MaxTightGap)
+{
+    compressor_.setParameter(CParam::FormatVersion, ZL_MAX_FORMAT_VERSION);
+    auto graph = nodes::PcoBinSplit{ nodes::PcoBinSplit::LatentMode::Unsigned }(
+            compressor_, graphs::Store{}(), graphs::Store{}());
+    compressor_.selectStartingGraph(graph);
+
+    // n > PBS_SAMPLE_MAX (8192) with values near UINT64_MAX so unsaturating
+    // (lower + mask64(ob)) wraps and shrinks offsetBits during anyTightGap.
+    constexpr size_t kN     = 10000;
+    constexpr uint64_t kLo  = UINT64_MAX - 4194239ULL; // kLo + mask64(22) wraps to 63
+    std::vector<uint64_t> data(kN);
+    for (size_t i = 0; i < kN; ++i) {
+        if (i < 9920) {
+            data[i] = UINT64_MAX - 100000000ULL + (i / 80u) * 100000ULL;
+        } else {
+            data[i] = kLo + (i & 7u);
+        }
+    }
+    data[9990] = kLo + 4194200ULL; // sampled in top bin -> forces ob=22
+    data[9999] = kLo + 16000ULL;   // unsampled tail -> shrinks ob if maxSafe wraps
+
+    testRoundTrip(Input::refNumeric(poly::span<const uint64_t>{ data }));
+}
+
 } // namespace
 } // namespace tests
 } // namespace openzl

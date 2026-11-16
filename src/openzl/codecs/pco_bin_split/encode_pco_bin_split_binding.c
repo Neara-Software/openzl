@@ -36,6 +36,11 @@ static inline uint64_t pbs_mask64(unsigned bits)
     return bits >= 64u ? UINT64_MAX : ((1ULL << bits) - 1ULL);
 }
 
+static inline uint64_t pbs_sat_add_u64(uint64_t lo, uint64_t delta)
+{
+    return (delta >= UINT64_MAX - lo) ? UINT64_MAX : (lo + delta);
+}
+
 static inline float pbs_log2_approx(float x)
 {
     uint32_t bits = 0;
@@ -1421,7 +1426,7 @@ ZL_Report EI_pco_bin_split(
         lowers4[b]        = (uint32_t)lo;
         unsigned const ob = pbs_offset_bits(bins[b].upper - lo);
         offsetBits[b]     = (uint8_t)ob;
-        uint64_t const ms = (ob >= eltBits) ? UINT64_MAX : (lo + pbs_mask64(ob));
+        uint64_t const ms = (ob >= eltBits) ? UINT64_MAX : pbs_sat_add_u64(lo, pbs_mask64(ob));
         maxSafe[b]        = ms;
         if (sampled && b + 1u < numBins && ms < bins[b + 1u].lower - 1ULL) {
             anyTightGap = 1;
@@ -1524,7 +1529,7 @@ ZL_Report EI_pco_bin_split(
                             offsetBits[b]     = (uint8_t)ob;
                             maxSafe[b]        = (ob >= 16u)
                                            ? UINT64_MAX
-                                           : (lowers[b] + pbs_mask64(ob));
+                                           : pbs_sat_add_u64(lowers[b], pbs_mask64(ob));
                             if (ob > maxOb) maxOb = ob;
                             allZeroOffsets = 0;
                             widened        = 1;
@@ -1540,7 +1545,7 @@ ZL_Report EI_pco_bin_split(
                             offsetBits[b]     = (uint8_t)ob;
                             maxSafe[b]        = (ob >= 32u)
                                            ? UINT64_MAX
-                                           : (lowers[b] + pbs_mask64(ob));
+                                           : pbs_sat_add_u64(lowers[b], pbs_mask64(ob));
                             if (ob > maxOb) maxOb = ob;
                             allZeroOffsets = 0;
                             widened        = 1;
@@ -1556,7 +1561,7 @@ ZL_Report EI_pco_bin_split(
                             offsetBits[b]     = (uint8_t)ob;
                             maxSafe[b]        = (ob >= 64u)
                                            ? UINT64_MAX
-                                           : (lowers[b] + pbs_mask64(ob));
+                                           : pbs_sat_add_u64(lowers[b], pbs_mask64(ob));
                             if (ob > maxOb) maxOb = ob;
                             allZeroOffsets = 0;
                             widened        = 1;
