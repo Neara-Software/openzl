@@ -54,6 +54,27 @@ class CaptureResidualsGraph : public FunctionGraph {
 class LookbackDeltaTest : public CodecTest {
    protected:
     template <typename T>
+    void testForcedLookbackRoundTrip(const std::vector<T>& data, int windowLog)
+    {
+        compressor_.setParameter(
+                CParam::FormatVersion, ZL_MAX_FORMAT_VERSION);
+        auto node = nodes::LookbackDelta{ windowLog, true }.parameterize(compressor_);
+        auto graph = compressor_.buildStaticGraph(
+                node, { graphs::Store{}(), graphs::Store{}() });
+        compressor_.selectStartingGraph(graph);
+        cctx_.refCompressor(compressor_);
+
+        auto input = Input::refNumeric(poly::span<const T>{ data });
+        size_t const cap = ZL_COMPRESSBOUND_UNGUARDED(
+                data.size() * (sizeof(T) + sizeof(uint16_t)) + 4096u);
+        std::string compressed(cap, '\0');
+        compressed.resize(cctx_.compress(compressed, { &input, 1 }));
+        auto roundTripped = dctx_.decompress(compressed);
+        ASSERT_EQ(roundTripped.size(), 1u);
+        EXPECT_EQ(roundTripped[0], input);
+    }
+
+    template <typename T>
     void testPeriodicAndMixed(size_t period, size_t count)
     {
         std::vector<T> data(count);
@@ -279,6 +300,145 @@ TEST_F(LookbackDeltaTest, ClusteredConsecutiveAndUncorrelatedRawAvoidLookback)
         compressor_.selectStartingGraph(graph);
         testRoundTrip(Input::refNumeric(poly::span<const int16_t>{ zeros }));
         EXPECT_EQ(lbCount, 0u);
+    }
+}
+
+
+TEST_F(LookbackDeltaTest, SimdBoundaryLengthsAndCapAcrossWidths)
+{
+    auto runMixedLookback = [this](auto tag, size_t n, int windowLog) {
+        using T = decltype(tag);
+        std::vector<T> data(n);
+        for (size_t i = 0; i < n; ++i) {
+            // Repeats values from varying distances (1..64 and 65536) plus drift
+            if (i >= 65536 && (i % 4 == 0)) {
+                data[i] = data[i - 65536];
+            } else if (i >= 37 && (i % 7 == 0)) {
+                data[i] = static_cast<T>(data[i - 37] + 1u);
+            } else if (i >= 16 && ((i / 32) % 3 == 0)) {
+                data[i] = static_cast<T>(data[i - 16] + 3u);
+            } else if (i >= 1 && ((i / 32) % 3 == 1)) {
+                data[i] = static_cast<T>(data[i - 1] + 5u);
+            } else {
+                size_t const back = (i > 0) ? ((i * 5u) % std::min<size_t>(i, 15u)) + 1u : 0u;
+                data[i] = back ? static_cast<T>(data[i - back] + static_cast<T>(i * 13u + 7u))
+                               : static_cast<T>(0x9e3779b97f4a7c15ULL);
+            }
+        }
+        testForcedLookbackRoundTrip(data, windowLog);
+    };
+
+    const std::vector<size_t> boundaryLengths = {
+        0,  1,  2,  3,  4,  7,  8,  9,  15, 16, 17, 31,
+        32, 33, 47, 48, 49, 63, 64, 65, 127, 128, 129, 135,
+    };
+    for (size_t n : boundaryLengths) {
+        runMixedLookback(uint8_t{}, n, 8);
+        runMixedLookback(uint16_t{}, n, 8);
+        runMixedLookback(uint32_t{}, n, 8);
+        runMixedLookback(uint64_t{}, n, 8);
+    }
+
+    for (size_t n : { size_t(65534), size_t(65535), size_t(65536), size_t(65537), size_t(65545) }) {
+        runMixedLookback(uint8_t{}, n, 16);
+        runMixedLookback(uint16_t{}, n, 16);
+        runMixedLookback(uint32_t{}, n, 16);
+        runMixedLookback(uint64_t{}, n, 16);
+    }
+}
+
+TEST_F(LookbackDeltaTest, Mode2RegimeTransitionsAllWidths)
+{
+    auto testTransitions = [this](auto tag) {
+        using T = decltype(tag);
+        constexpr size_t kN = 2048;
+        std::vector<T> data(kN);
+        uint32_t rng = 0x13579bdfU;
+        auto nextRng = [&rng]() {
+            rng ^= rng << 13;
+            rng ^= rng >> 17;
+            rng ^= rng << 5;
+            return rng;
+        };
+        for (size_t i = 0; i < kN; ++i) {
+            size_t const phase = (i / 43u) % 5u;
+            if (i < 64) {
+                data[i] = static_cast<T>(nextRng());
+            } else if (phase == 0) {
+                // Uniform d = 1
+                data[i] = data[i - 1];
+            } else if (phase == 1) {
+                // Uniform d = 8 (128-bit half-vector stride on u8)
+                data[i] = data[i - 8];
+            } else if (phase == 2) {
+                // Uniform d = 16
+                data[i] = data[i - 16];
+            } else if (phase == 3) {
+                // Long non-uniform lookbacks (d in 20..63), exercising scalar fallback
+                size_t const d = 20u + (nextRng() % 44u);
+                data[i]        = data[i - d];
+            } else {
+                // Short causal DAG lookbacks (d in 1..8), exercising prev reload after scalar
+                size_t const d = 1u + (nextRng() % 8u);
+                data[i]        = static_cast<T>(data[i - d] + static_cast<T>(nextRng() & 3u));
+            }
+        }
+        testForcedLookbackRoundTrip(data, 8);
+    };
+
+    testTransitions(uint8_t{});
+    testTransitions(uint16_t{});
+    testTransitions(uint32_t{});
+    testTransitions(uint64_t{});
+}
+
+TEST_F(LookbackDeltaTest, RejectsOutOfBoundsLookbacksAtSimdBoundaries)
+{
+    constexpr size_t kN = 65545;
+    std::vector<uint16_t> data(kN);
+    for (size_t i = 0; i < kN; ++i) {
+        data[i] = static_cast<uint16_t>((i * 257u) ^ (i >> 3));
+    }
+
+    std::vector<uint8_t> lbBytes;
+    compressor_.setParameter(CParam::FormatVersion, ZL_MAX_FORMAT_VERSION);
+    compressor_.setParameter(
+            CParam::CompressedChecksum, ZL_TernaryParam_disable);
+    compressor_.setParameter(CParam::ContentChecksum, ZL_TernaryParam_disable);
+    auto lbCap = compressor_.registerFunctionGraph(
+            std::make_shared<CaptureResidualsGraph>(&lbBytes, nullptr));
+    auto node = nodes::LookbackDelta{ 8, true }.parameterize(compressor_);
+    auto graph = compressor_.buildStaticGraph(
+            node, { graphs::Store{}(), lbCap });
+    compressor_.selectStartingGraph(graph);
+
+    std::string const frame =
+            testRoundTrip(Input::refNumeric(poly::span<const uint16_t>{ data }));
+    ASSERT_EQ(lbBytes.size(), (kN - 1u) * sizeof(uint16_t));
+
+    std::string const needle(
+            reinterpret_cast<const char*>(lbBytes.data()), lbBytes.size());
+    size_t const lbOffset = frame.find(needle);
+    ASSERT_NE(lbOffset, std::string::npos);
+
+    // Mutate lb[k] = k + 1 (distance k + 2 > i = k + 1) across SIMD vector boundaries
+    // and at the k = 65534 max-validation boundary.
+    for (size_t k : { size_t(0),
+                      size_t(1),
+                      size_t(7),
+                      size_t(8),
+                      size_t(15),
+                      size_t(16),
+                      size_t(31),
+                      size_t(32),
+                      size_t(63),
+                      size_t(64),
+                      size_t(65533),
+                      size_t(65534) }) {
+        std::string corrupted   = frame;
+        uint16_t const invalidLb = static_cast<uint16_t>(k + 1u);
+        std::memcpy(&corrupted[lbOffset + k * sizeof(uint16_t)], &invalidLb, sizeof(uint16_t));
+        EXPECT_THROW(dctx_.decompress(corrupted), Exception) << "k=" << k;
     }
 }
 
