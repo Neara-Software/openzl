@@ -8,24 +8,40 @@
 #include "openzl/common/assertion.h"
 #include "openzl/common/errors_internal.h"
 #include "openzl/shared/mem.h"
+#include "openzl/shared/portability.h"
 
-static void writeXYZ(uint8_t* dst, uint32_t m, uint64_t A)
+/* Gather 5 3-bit groups at bit positions 0, 9, 18, 27, 36 into bits 0..14. */
+static inline uint16_t hilbert3_gather15(uint64_t v)
 {
-    uint32_t x = (m & 1) << 15, y = ((m >> 1) & 1) << 15, z = (m >> 2) << 15;
-    for (int L = 0; L < 5; L++) {
-        uint32_t const e = (uint32_t)(A >> (9 * L)) & 511;
-        x |= (e & 7) << (3 * L);
-        y |= ((e >> 3) & 7) << (3 * L);
-        z |= ((e >> 6) & 7) << (3 * L);
-    }
-    ZL_writeLE16(dst, (uint16_t)x);
-    ZL_writeLE16(dst + 2, (uint16_t)y);
-    ZL_writeLE16(dst + 4, (uint16_t)z);
+    uint64_t const even = v & 0x0070001C0007ULL;
+    uint64_t const odd  = v & 0x000038000E00ULL;
+    uint32_t const eg   = (uint32_t)((even * 0x01001001ULL) >> 24) & 0x71C7u;
+    uint32_t const og   = (uint32_t)((odd >> 6) | (odd >> 18)) & 0x0E38u;
+    return (uint16_t)(eg | og);
+}
+
+/* Gather 4 3-bit groups at bit positions 0, 9, 18, 27 into bits 0..11. */
+static inline uint32_t hilbert3_gather12(uint64_t v)
+{
+    return ((uint32_t)v & 7u) | ((uint32_t)(v >> 6) & 0x38u)
+            | ((uint32_t)(v >> 12) & 0x1C0u) | ((uint32_t)(v >> 18) & 0xE00u);
+}
+
+static inline void writeXYZ(uint8_t* dst, uint32_t m, uint64_t A)
+{
+    uint16_t const x = (uint16_t)(((m & 1u) << 15) | hilbert3_gather15(A));
+    uint16_t const y =
+            (uint16_t)((((m >> 1) & 1u) << 15) | hilbert3_gather15(A >> 3));
+    uint16_t const z =
+            (uint16_t)(((m >> 2) << 15) | hilbert3_gather15(A >> 6));
+    ZL_writeLE16(dst, x);
+    ZL_writeLE16(dst + 2, y);
+    ZL_writeLE16(dst + 4, z);
 }
 
 /* Decode the 15 low key bits of h below the top digit into 5 packed 9-bit
  * groups (x|y<<3|z<<6 per group, group L = levels 3L..3L+2). */
-static uint64_t decodeLow(uint64_t h, uint32_t s)
+static inline uint64_t decodeLow(uint64_t h, uint32_t s)
 {
     uint64_t A = 0;
     for (int L = 4; L >= 0; L--) {
@@ -38,20 +54,82 @@ static uint64_t decodeLow(uint64_t h, uint32_t s)
 
 static void hilbert3Decode(uint8_t* dst, const uint64_t* gaps, size_t n)
 {
-    uint64_t k = 0;
-    size_t i   = 0;
+    uint64_t k         = 0;
+    uint64_t topPrefix = UINT64_MAX;
+    uint32_t topS      = 0;
+    uint32_t topM      = 0;
+    uint64_t topA      = 0;
+    size_t i           = 0;
+
     for (; i + 4 <= n; i += 4) {
         uint64_t const h0 = k += gaps[i];
         uint64_t const h1 = k += gaps[i + 1];
         uint64_t const h2 = k += gaps[i + 2];
         uint64_t const h3 = k += gaps[i + 3];
-        uint32_t const d0 = (h0 >> 45) & 7, d1 = (h1 >> 45) & 7,
-                       d2 = (h2 >> 45) & 7, d3 = (h3 >> 45) & 7;
-        uint32_t s0 = ZL_hilbert3_topS[d0], s1 = ZL_hilbert3_topS[d1],
-                 s2 = ZL_hilbert3_topS[d2], s3 = ZL_hilbert3_topS[d3];
-        uint64_t A0 = 0, A1 = 0, A2 = 0, A3 = 0;
-        for (int L = 4; L >= 0; L--) {
-            uint32_t const sh = 9 * (uint32_t)L;
+
+        uint32_t s0, s1, s2, s3;
+        uint32_t m0, m1, m2, m3;
+        uint64_t A0, A1, A2, A3;
+
+        if (ZL_LIKELY(
+                    ((((h0 ^ h1) | (h1 ^ h2) | (h2 ^ h3)) >> 27) == 0ULL)
+                    && ((h0 >> 27) == topPrefix))) {
+            s0 = topS;
+            s1 = topS;
+            s2 = topS;
+            s3 = topS;
+            m0 = topM;
+            m1 = topM;
+            m2 = topM;
+            m3 = topM;
+            A0 = topA;
+            A1 = topA;
+            A2 = topA;
+            A3 = topA;
+        } else {
+            uint32_t const d0 = (uint32_t)(h0 >> 45) & 7u;
+            uint32_t const d1 = (uint32_t)(h1 >> 45) & 7u;
+            uint32_t const d2 = (uint32_t)(h2 >> 45) & 7u;
+            uint32_t const d3 = (uint32_t)(h3 >> 45) & 7u;
+            m0                = ZL_hilbert3_topM[d0];
+            m1                = ZL_hilbert3_topM[d1];
+            m2                = ZL_hilbert3_topM[d2];
+            m3                = ZL_hilbert3_topM[d3];
+            s0                = ZL_hilbert3_topS[d0];
+            s1                = ZL_hilbert3_topS[d1];
+            s2                = ZL_hilbert3_topS[d2];
+            s3                = ZL_hilbert3_topS[d3];
+            A0                = 0;
+            A1                = 0;
+            A2                = 0;
+            A3                = 0;
+            for (int L = 4; L >= 3; L--) {
+                uint32_t const sh = 9u * (uint32_t)L;
+                uint32_t const e0 =
+                        ZL_hilbert3_T3[s0 * 512 + ((h0 >> sh) & 511)];
+                uint32_t const e1 =
+                        ZL_hilbert3_T3[s1 * 512 + ((h1 >> sh) & 511)];
+                uint32_t const e2 =
+                        ZL_hilbert3_T3[s2 * 512 + ((h2 >> sh) & 511)];
+                uint32_t const e3 =
+                        ZL_hilbert3_T3[s3 * 512 + ((h3 >> sh) & 511)];
+                A0 |= (uint64_t)(e0 & 511) << sh;
+                A1 |= (uint64_t)(e1 & 511) << sh;
+                A2 |= (uint64_t)(e2 & 511) << sh;
+                A3 |= (uint64_t)(e3 & 511) << sh;
+                s0 = e0 >> 9;
+                s1 = e1 >> 9;
+                s2 = e2 >> 9;
+                s3 = e3 >> 9;
+            }
+            topPrefix = h3 >> 27;
+            topS      = s3;
+            topM      = m3;
+            topA      = A3;
+        }
+
+        for (int L = 2; L >= 0; L--) {
+            uint32_t const sh = 9u * (uint32_t)L;
             uint32_t const e0 = ZL_hilbert3_T3[s0 * 512 + ((h0 >> sh) & 511)];
             uint32_t const e1 = ZL_hilbert3_T3[s1 * 512 + ((h1 >> sh) & 511)];
             uint32_t const e2 = ZL_hilbert3_T3[s2 * 512 + ((h2 >> sh) & 511)];
@@ -65,14 +143,14 @@ static void hilbert3Decode(uint8_t* dst, const uint64_t* gaps, size_t n)
             s2 = e2 >> 9;
             s3 = e3 >> 9;
         }
-        writeXYZ(dst + 6 * i, ZL_hilbert3_topM[d0], A0);
-        writeXYZ(dst + 6 * (i + 1), ZL_hilbert3_topM[d1], A1);
-        writeXYZ(dst + 6 * (i + 2), ZL_hilbert3_topM[d2], A2);
-        writeXYZ(dst + 6 * (i + 3), ZL_hilbert3_topM[d3], A3);
+        writeXYZ(dst + 6 * i, m0, A0);
+        writeXYZ(dst + 6 * (i + 1), m1, A1);
+        writeXYZ(dst + 6 * (i + 2), m2, A2);
+        writeXYZ(dst + 6 * (i + 3), m3, A3);
     }
     for (; i < n; i++) {
         uint64_t const h = k += gaps[i];
-        uint32_t const d = (h >> 45) & 7;
+        uint32_t const d = (uint32_t)(h >> 45) & 7u;
         writeXYZ(dst + 6 * i,
                  ZL_hilbert3_topM[d],
                  decodeLow(h, ZL_hilbert3_topS[d]));
@@ -172,21 +250,19 @@ ZL_FORCE_INLINE size_t nextKey(Hilbert3State* st, const uint64_t* g, size_t i)
     return i;
 }
 
-static void writeXYZ32(uint8_t* dst, uint32_t x, uint32_t y, uint32_t z)
+static inline void writeXYZ32(uint8_t* dst, uint32_t x, uint32_t y, uint32_t z)
 {
     ZL_writeLE32(dst, x ^ 0x80000000u);
     ZL_writeLE32(dst + 4, y ^ 0x80000000u);
     ZL_writeLE32(dst + 8, z ^ 0x80000000u);
 }
 
-#define H3_LOW(s, x, y, z, lo, L)                                           \
+#define H3_LOW_A(s, A, lo, L)                                               \
     do {                                                                    \
         uint32_t const e_ =                                                 \
                 ZL_hilbert3_T3[s * 512 + ((uint32_t)((lo) >> (9 * L)) & 511)]; \
         s = e_ >> 9;                                                        \
-        x |= (e_ & 7) << (3 * L);                                           \
-        y |= ((e_ >> 3) & 7) << (3 * L);                                    \
-        z |= ((e_ >> 6) & 7) << (3 * L);                                    \
+        A |= (uint64_t)(e_ & 511) << (9 * L);                               \
     } while (0)
 
 /* Returns the number of points written, or SIZE_MAX if the last escape is
@@ -198,23 +274,28 @@ static size_t hilbert3DecodeI32(uint8_t* dst, const uint64_t* g, size_t n)
     Hilbert3State st = { .topLo = UINT64_MAX }; /* topLo never matches */
     size_t np = 0, i = 0;
     while (i + 12 <= n) {
-        uint32_t s[4], x[4], y[4], z[4];
+        uint32_t s[4], tx[4], ty[4], tz[4];
         uint64_t lo[4];
+        uint64_t A[4] = { 0, 0, 0, 0 };
         for (int j = 0; j < 4; j++) {
             i     = nextKey(&st, g, i);
             s[j]  = st.top.s;
-            x[j]  = st.top.x;
-            y[j]  = st.top.y;
-            z[j]  = st.top.z;
+            tx[j] = st.top.x;
+            ty[j] = st.top.y;
+            tz[j] = st.top.z;
             lo[j] = st.lo;
         }
         for (int L = 3; L >= 0; L--) {
             for (int j = 0; j < 4; j++) {
-                H3_LOW(s[j], x[j], y[j], z[j], lo[j], L);
+                H3_LOW_A(s[j], A[j], lo[j], L);
             }
         }
         for (int j = 0; j < 4; j++) {
-            writeXYZ32(dst + 12 * (np + (size_t)j), x[j], y[j], z[j]);
+            writeXYZ32(
+                    dst + 12 * (np + (size_t)j),
+                    tx[j] | hilbert3_gather12(A[j]),
+                    ty[j] | hilbert3_gather12(A[j] >> 3),
+                    tz[j] | hilbert3_gather12(A[j] >> 6));
         }
         np += 4;
     }
@@ -223,12 +304,17 @@ static size_t hilbert3DecodeI32(uint8_t* dst, const uint64_t* g, size_t n)
             return SIZE_MAX;
         }
         i          = nextKey(&st, g, i);
-        uint32_t s = st.top.s, x = st.top.x, y = st.top.y, z = st.top.z;
-        H3_LOW(s, x, y, z, st.lo, 3);
-        H3_LOW(s, x, y, z, st.lo, 2);
-        H3_LOW(s, x, y, z, st.lo, 1);
-        H3_LOW(s, x, y, z, st.lo, 0);
-        writeXYZ32(dst + 12 * np, x, y, z);
+        uint32_t s = st.top.s;
+        uint64_t A = 0;
+        H3_LOW_A(s, A, st.lo, 3);
+        H3_LOW_A(s, A, st.lo, 2);
+        H3_LOW_A(s, A, st.lo, 1);
+        H3_LOW_A(s, A, st.lo, 0);
+        writeXYZ32(
+                dst + 12 * np,
+                st.top.x | hilbert3_gather12(A),
+                st.top.y | hilbert3_gather12(A >> 3),
+                st.top.z | hilbert3_gather12(A >> 6));
         np++;
     }
     return np;

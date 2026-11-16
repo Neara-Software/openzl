@@ -4,42 +4,47 @@
 
 #include <stdint.h>
 
+#define ZL_HILBERT3_ENCODE_ONLY
+#include "openzl/codecs/hilbert3/hilbert3_table.h"
 #include "openzl/common/assertion.h"
 #include "openzl/common/errors_internal.h"
 #include "openzl/shared/mem.h"
+#include "openzl/shared/portability.h"
 
-/* Spread the 16 bits of a to every third bit position. */
-static uint64_t split3(uint64_t a)
+/* Scatter 15 bits (5 groups of 3 bits) into bit positions 0..2, 9..11, 18..20,
+ * 27..29, 36..38. */
+static inline uint64_t hilbert3_scatter15(uint32_t v)
 {
-    a = (a | (a << 16)) & 0x0000FF0000FFull;
-    a = (a | (a << 8)) & 0x00F00F00F00Full;
-    a = (a | (a << 4)) & 0x0C30C30C30C3ull;
-    a = (a | (a << 2)) & 0x249249249249ull;
-    return a;
+    uint64_t const even = (uint64_t)(v & 0x71C7u);
+    uint64_t const odd  = (uint64_t)(v & 0x0E38u);
+    uint64_t const es   = (even * 0x01001001ULL) & 0x0070001C0007ULL;
+    uint64_t const os   = ((odd << 6) | (odd << 18)) & 0x000038000E00ULL;
+    return es | os;
 }
 
-/* Morton -> Hilbert, 3 dims, `bits` levels (reference: tools_hk/hk16.c). */
-static uint64_t mortonToHilbert3(uint64_t h, uint32_t bits)
+static inline uint64_t hilbert3_packA15(uint32_t x, uint32_t y, uint32_t z)
 {
-    uint32_t block = bits * 3 - 3;
-    uint32_t hcode = (uint32_t)((h >> block) & 7);
-    uint32_t shift = 0, signs = 0;
-    while (block > 0) {
-        block -= 3;
-        hcode <<= 2;
-        uint32_t mcode = (0x20212021u >> hcode) & 3;
-        shift          = (0x48u >> (7 - shift - mcode)) & 3;
-        signs          = (signs | (signs << 3)) >> mcode;
-        signs          = (signs ^ (0x53560300u >> hcode)) & 7;
-        mcode          = (uint32_t)((h >> block) & 7);
-        hcode          = mcode;
-        hcode          = ((hcode | (hcode << 3)) >> shift) & 7;
-        hcode ^= signs;
-        h ^= ((uint64_t)(mcode ^ hcode)) << block;
+    return hilbert3_scatter15(x & 0x7FFFu)
+            | (hilbert3_scatter15(y & 0x7FFFu) << 3)
+            | (hilbert3_scatter15(z & 0x7FFFu) << 6);
+}
+
+static inline uint64_t hilbert3_encode_u16_one(
+        uint32_t x,
+        uint32_t y,
+        uint32_t z)
+{
+    uint32_t const m = ((x >> 15) & 1u) | (((y >> 15) & 1u) << 1)
+            | (((z >> 15) & 1u) << 2);
+    uint32_t const d = ZL_hilbert3_topD[m];
+    uint32_t s       = ZL_hilbert3_topS[d];
+    uint64_t const A = hilbert3_packA15(x, y, z);
+    uint64_t h       = (uint64_t)d << 45;
+    for (int L = 4; L >= 0; L--) {
+        uint32_t const e = ZL_hilbert3_E3[s * 512u + ((A >> (9 * L)) & 511u)];
+        h |= (uint64_t)(e & 511u) << (9 * L);
+        s = e >> 9;
     }
-    uint64_t const mask = 0x492492492492ull;
-    h ^= (h >> 1) & mask;
-    h ^= (h & mask) >> 1;
     return h;
 }
 
@@ -63,75 +68,158 @@ EI_hilbert3_u16(ZL_Encoder* eictx, const ZL_Input* ins[], size_t nbIns)
     uint64_t* const dst = (uint64_t*)ZL_Output_ptr(out);
 
     uint64_t prev = 0;
-    for (size_t i = 0; i < n; i++) {
+    size_t i      = 0;
+    for (; i + 4u <= n; i += 4u) {
+        const uint8_t* const p0 = src + 6 * (i + 0u);
+        const uint8_t* const p1 = src + 6 * (i + 1u);
+        const uint8_t* const p2 = src + 6 * (i + 2u);
+        const uint8_t* const p3 = src + 6 * (i + 3u);
+        uint32_t const x0 = ZL_readLE16(p0), y0 = ZL_readLE16(p0 + 2),
+                       z0 = ZL_readLE16(p0 + 4);
+        uint32_t const x1 = ZL_readLE16(p1), y1 = ZL_readLE16(p1 + 2),
+                       z1 = ZL_readLE16(p1 + 4);
+        uint32_t const x2 = ZL_readLE16(p2), y2 = ZL_readLE16(p2 + 2),
+                       z2 = ZL_readLE16(p2 + 4);
+        uint32_t const x3 = ZL_readLE16(p3), y3 = ZL_readLE16(p3 + 2),
+                       z3 = ZL_readLE16(p3 + 4);
+
+        uint32_t const d0 = ZL_hilbert3_topD
+                [((x0 >> 15) & 1u) | (((y0 >> 15) & 1u) << 1)
+                 | (((z0 >> 15) & 1u) << 2)];
+        uint32_t const d1 = ZL_hilbert3_topD
+                [((x1 >> 15) & 1u) | (((y1 >> 15) & 1u) << 1)
+                 | (((z1 >> 15) & 1u) << 2)];
+        uint32_t const d2 = ZL_hilbert3_topD
+                [((x2 >> 15) & 1u) | (((y2 >> 15) & 1u) << 1)
+                 | (((z2 >> 15) & 1u) << 2)];
+        uint32_t const d3 = ZL_hilbert3_topD
+                [((x3 >> 15) & 1u) | (((y3 >> 15) & 1u) << 1)
+                 | (((z3 >> 15) & 1u) << 2)];
+
+        uint32_t s0 = ZL_hilbert3_topS[d0];
+        uint32_t s1 = ZL_hilbert3_topS[d1];
+        uint32_t s2 = ZL_hilbert3_topS[d2];
+        uint32_t s3 = ZL_hilbert3_topS[d3];
+
+        uint64_t const A0 = hilbert3_packA15(x0, y0, z0);
+        uint64_t const A1 = hilbert3_packA15(x1, y1, z1);
+        uint64_t const A2 = hilbert3_packA15(x2, y2, z2);
+        uint64_t const A3 = hilbert3_packA15(x3, y3, z3);
+
+        uint64_t k0 = (uint64_t)d0 << 45;
+        uint64_t k1 = (uint64_t)d1 << 45;
+        uint64_t k2 = (uint64_t)d2 << 45;
+        uint64_t k3 = (uint64_t)d3 << 45;
+
+        for (int L = 4; L >= 0; L--) {
+            uint32_t const sh = 9u * (uint32_t)L;
+            uint32_t const e0 =
+                    ZL_hilbert3_E3[s0 * 512u + ((A0 >> sh) & 511u)];
+            uint32_t const e1 =
+                    ZL_hilbert3_E3[s1 * 512u + ((A1 >> sh) & 511u)];
+            uint32_t const e2 =
+                    ZL_hilbert3_E3[s2 * 512u + ((A2 >> sh) & 511u)];
+            uint32_t const e3 =
+                    ZL_hilbert3_E3[s3 * 512u + ((A3 >> sh) & 511u)];
+            k0 |= (uint64_t)(e0 & 511u) << sh;
+            k1 |= (uint64_t)(e1 & 511u) << sh;
+            k2 |= (uint64_t)(e2 & 511u) << sh;
+            k3 |= (uint64_t)(e3 & 511u) << sh;
+            s0 = e0 >> 9;
+            s1 = e1 >> 9;
+            s2 = e2 >> 9;
+            s3 = e3 >> 9;
+        }
+        dst[i + 0u] = k0 - prev;
+        dst[i + 1u] = k1 - k0;
+        dst[i + 2u] = k2 - k1;
+        dst[i + 3u] = k3 - k2;
+        prev        = k3;
+    }
+    for (; i < n; i++) {
         const uint8_t* const p = src + 6 * i;
-        uint64_t const m       = split3(ZL_readLE16(p))
-                | (split3(ZL_readLE16(p + 2)) << 1)
-                | (split3(ZL_readLE16(p + 4)) << 2);
-        uint64_t const k = mortonToHilbert3(m, 16);
-        dst[i]           = k - prev;
-        prev             = k;
+        uint64_t const k       = hilbert3_encode_u16_one(
+                ZL_readLE16(p), ZL_readLE16(p + 2), ZL_readLE16(p + 4));
+        dst[i] = k - prev;
+        prev   = k;
     }
     ZL_ERR_IF_ERR(ZL_Output_commit(out, n));
     return ZL_returnSuccess();
 }
 
-/* 32-level 3D Hilbert key of (x, y, z) as 32 base-8 digits, most significant
- * last (reference: tools_hk/hk32.c, same math as mortonToHilbert3). Returns
- * the 96-bit key as hi (32 bits) and lo (64 bits). */
-static void hilbert3Key32(uint32_t x, uint32_t y, uint32_t z, uint32_t* hi, uint64_t* lo)
+/* 32-level 3D Hilbert key via 3-level LUT with top-15-bit prefix cache. */
+typedef struct {
+    uint64_t prevTopKey;
+    uint32_t topS;
+    uint32_t topHi;
+    uint64_t topLoHi;
+} Hilbert3EncTop32;
+
+ZL_FORCE_NOINLINE void hilbert3WalkEncTop32(
+        Hilbert3EncTop32* t,
+        uint32_t x,
+        uint32_t y,
+        uint32_t z)
 {
-    uint32_t d[32];
-    for (int i = 0; i < 32; i++) {
-        d[i] = ((x >> i) & 1) | (((y >> i) & 1) << 1) | (((z >> i) & 1) << 2);
-    }
-    uint32_t hcode = d[31];
-    uint32_t shift = 0, signs = 0;
-    for (int b = 30; b >= 0; b--) {
-        hcode <<= 2;
-        uint32_t const mcode = (0x20212021u >> hcode) & 3;
-        shift                = (0x48u >> (7 - shift - mcode)) & 3;
-        signs                = (signs | (signs << 3)) >> mcode;
-        signs                = (signs ^ (0x53560300u >> hcode)) & 7;
-        hcode                = (((d[b] | (d[b] << 3)) >> shift) & 7) ^ signs;
-        d[b]                 = hcode;
-    }
-    uint64_t l = 0;
-    uint32_t h = 0;
-    for (int i = 0; i < 32; i++) {
-        uint32_t v = d[i];
-        v ^= (v >> 1) & 2;
-        v ^= (v & 2) >> 1;
-        if (i < 21) {
-            l |= (uint64_t)v << (3 * i);
-        } else if (i == 21) {
-            l |= (uint64_t)(v & 1) << 63;
-            h |= v >> 1;
-        } else {
-            h |= v << (3 * i - 64);
-        }
-    }
-    *hi = h;
-    *lo = l;
+    uint32_t const m =
+            ((x >> 30) & 3u) | (((y >> 30) & 3u) << 2) | (((z >> 30) & 3u) << 4);
+    uint32_t const d = ZL_hilbert3_top2D[m];
+    uint32_t s       = ZL_hilbert3_top2S[d];
+    uint32_t hi      = d << 26;
+    uint64_t const A_hi =
+            hilbert3_packA15(x >> 15, y >> 15, z >> 15);
+    uint32_t const e9 = ZL_hilbert3_E3[s * 512u + ((A_hi >> 36) & 511u)];
+    s                 = e9 >> 9;
+    hi |= (e9 & 511u) << 17;
+    uint32_t const e8 = ZL_hilbert3_E3[s * 512u + ((A_hi >> 27) & 511u)];
+    s                 = e8 >> 9;
+    hi |= (e8 & 511u) << 8;
+    uint32_t const e7 = ZL_hilbert3_E3[s * 512u + ((A_hi >> 18) & 511u)];
+    s                 = e7 >> 9;
+    hi |= (e7 & 511u) >> 1;
+    uint64_t lo       = (uint64_t)(e7 & 1u) << 63;
+    uint32_t const e6 = ZL_hilbert3_E3[s * 512u + ((A_hi >> 9) & 511u)];
+    s                 = e6 >> 9;
+    lo |= (uint64_t)(e6 & 511u) << 54;
+    uint32_t const e5 = ZL_hilbert3_E3[s * 512u + (A_hi & 511u)];
+    s                 = e5 >> 9;
+    lo |= (uint64_t)(e5 & 511u) << 45;
+
+    t->topS    = s;
+    t->topHi   = hi;
+    t->topLoHi = lo;
 }
 
 /* Writes the gap stream for n records to dst (room for 3 * n words) and
  * returns the number of words written. */
 static size_t hilbert3EncodeI32(uint64_t* dst, const uint8_t* src, size_t n)
 {
-    size_t o     = 0;
-    uint32_t phi = 0;
-    uint64_t plo = 0;
+    size_t o               = 0;
+    uint32_t phi           = 0;
+    uint64_t plo           = 0;
+    Hilbert3EncTop32 cache = { .prevTopKey = UINT64_MAX };
     for (size_t i = 0; i < n; i++) {
         const uint8_t* const p = src + 12 * i;
-        uint32_t hi;
-        uint64_t lo;
-        hilbert3Key32(
-                ZL_readLE32(p) ^ 0x80000000u,
-                ZL_readLE32(p + 4) ^ 0x80000000u,
-                ZL_readLE32(p + 8) ^ 0x80000000u,
-                &hi,
-                &lo);
+        uint32_t const x       = ZL_readLE32(p) ^ 0x80000000u;
+        uint32_t const y       = ZL_readLE32(p + 4) ^ 0x80000000u;
+        uint32_t const z       = ZL_readLE32(p + 8) ^ 0x80000000u;
+        uint64_t const topKey  = ((uint64_t)(x >> 15))
+                | ((uint64_t)(y >> 15) << 17) | ((uint64_t)(z >> 15) << 34);
+        if (ZL_UNLIKELY(topKey != cache.prevTopKey)) {
+            cache.prevTopKey = topKey;
+            hilbert3WalkEncTop32(&cache, x, y, z);
+        }
+        uint32_t s          = cache.topS;
+        uint32_t const hi   = cache.topHi;
+        uint64_t lo         = cache.topLoHi;
+        uint64_t const A_lo = hilbert3_packA15(x, y, z);
+        for (int L = 4; L >= 0; L--) {
+            uint32_t const e =
+                    ZL_hilbert3_E3[s * 512u + ((A_lo >> (9 * L)) & 511u)];
+            lo |= (uint64_t)(e & 511u) << (9 * L);
+            s = e >> 9;
+        }
+
         uint64_t const dlo = lo - plo;
         uint32_t const dhi = hi - phi - (lo < plo);
         int const down     = hi < phi || (hi == phi && lo < plo);
