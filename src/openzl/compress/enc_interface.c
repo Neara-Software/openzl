@@ -306,8 +306,10 @@ static ZL_Report ENC_replayCodecOutputCacheResult(
                     cached->intMetadata[m].id,
                     cached->intMetadata[m].value));
         }
-        STREAM_setCodecCacheKeyHash(
-                ZL_codemodOutputAsData(output), cached->keyHash64);
+        if (cached->hasKeyHash64) {
+            STREAM_setCodecCacheKeyHash(
+                    ZL_codemodOutputAsData(output), cached->keyHash64);
+        }
     }
     if (result->headerSize != 0) {
         ZL_Encoder_sendCodecHeader(eictx, result->header, result->headerSize);
@@ -380,7 +382,21 @@ static void ENC_snapshotCodecOutputCacheResult(
             result.header     = header.start;
         }
     }
-    (void)CodecCache_store(lookup, &result);
+    const CodecCache_Result* storedResult = NULL;
+    (void)CodecCache_storeAndGetResult(lookup, &result, &storedResult);
+    if (storedResult != NULL) {
+        RTGraph* const wRtgraph = CCTX_getWRTGraph(eictx->cctx);
+        for (size_t i = 0; i < nbOutputs; ++i) {
+            if (!storedResult->outputs[i].hasKeyHash64) {
+                continue;
+            }
+            const RTStreamID streamID =
+                    RTGM_getOutStreamID(rtgraph, eictx->rtnodeid, (int)i);
+            ZL_Data* const wStream = RTGM_getWStream(wRtgraph, streamID);
+            STREAM_setCodecCacheKeyHash(
+                    wStream, storedResult->outputs[i].keyHash64);
+        }
+    }
 }
 
 static ZL_Report ENC_runTransform_internal(

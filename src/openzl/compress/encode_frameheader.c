@@ -95,6 +95,8 @@ typedef struct {
     uint8_t* scratch3;
     uint8_t* dst;
     size_t dstCapacity;
+    void* heapAlloc;
+    uint32_t inlineBuf[512];
 } EFH_Workspace;
 
 // Note(@Cyan): this whole "workspace" preallocation strategy should rather be
@@ -105,23 +107,33 @@ static ZL_Report EFH_Workspace_init(
         size_t nbTransforms,
         size_t nbRegens,
         size_t nbStoredBuffs,
+        size_t extraDstBound,
         void* dst,
         size_t dstCapacity)
 {
     ZL_RESULT_DECLARE_SCOPE_REPORT(NULL);
     ZL_TRY_LET(
             size_t,
-            dstBound,
+            baseBound,
             computeFHBound(numInputs, nbTransforms, nbStoredBuffs, nbRegens));
+    size_t const dstBound   = baseBound + extraDstBound;
     size_t const regenArr32 = sizeof(uint32_t) * nbRegens;
     size_t const trArrays =
             (2 * sizeof(uint32_t) + sizeof(uint8_t)) * nbTransforms;
     size_t const buffSize       = nbStoredBuffs * sizeof(*wksp->buffScratch0);
-    size_t const dstSize        = dstCapacity < dstBound ? dstBound : 0;
+    bool const canWriteDirect   = (dst != NULL) && (dstCapacity >= dstBound);
+    size_t const dstSize        = canWriteDirect ? 0 : dstBound;
     size_t const allocationSize = buffSize + regenArr32 + trArrays + dstSize;
 
-    uint32_t* const alloc = ZL_malloc(allocationSize);
-    ZL_ERR_IF_NULL(alloc, allocation);
+    uint32_t* alloc = NULL;
+    if (allocationSize <= sizeof(wksp->inlineBuf)) {
+        wksp->heapAlloc = NULL;
+        alloc           = wksp->inlineBuf;
+    } else {
+        wksp->heapAlloc = ZL_malloc(allocationSize);
+        ZL_ERR_IF_NULL(wksp->heapAlloc, allocation);
+        alloc = (uint32_t*)wksp->heapAlloc;
+    }
 
     wksp->buffScratch0 = alloc;
     wksp->scratch0     = wksp->buffScratch0 + nbStoredBuffs;
@@ -133,7 +145,7 @@ static ZL_Report EFH_Workspace_init(
 
     ZL_ASSERT_EQ(wksp->dst + dstSize, (uint8_t*)alloc + allocationSize);
 
-    if (dstCapacity >= dstBound) {
+    if (canWriteDirect) {
         // Write directly into the dst buffer
         wksp->dst         = dst;
         wksp->dstCapacity = dstCapacity;
@@ -143,7 +155,7 @@ static ZL_Report EFH_Workspace_init(
 }
 static void EFH_Workspace_destroy(EFH_Workspace* wksp)
 {
-    ZL_free(wksp->buffScratch0);
+    ZL_free(wksp->heapAlloc);
 }
 
 // Compress Transform Types
@@ -717,14 +729,21 @@ static ZL_Report writeFrameHeaderV3orMore(
         const EFH_FrameInfo* fip)
 {
     ZL_RESULT_DECLARE_SCOPE_REPORT(NULL);
-    EFH_Workspace wksp = { 0 };
+    size_t extraBound = fip->comment.size ? 4 + fip->comment.size : 0;
+    if (encoder->formatVersion >= ZL_MATERIALIZED_DICT_VERSION_MIN
+        && fip->fprop->hasBundleID) {
+        extraBound += 1 + ZL_UNIQUE_ID_SIZE;
+    }
+    EFH_Workspace wksp;
     ZL_ERR_IF_ERR(EFH_Workspace_init(
-            &wksp, fip->numInputs, 0, 0, 0, dst, dstCapacity));
+            &wksp, fip->numInputs, 0, 0, 0, extraBound, dst, dstCapacity));
     ZL_Report ret =
             writeFrameHeader_internal(encoder, wksp.dst, wksp.dstCapacity, fip);
     if (!ZL_isError(ret) && wksp.dst != dst) {
         if (dstCapacity >= ZL_validResult(ret)) {
-            memcpy(dst, wksp.dst, ZL_validResult(ret));
+            if (dst != NULL) {
+                memcpy(dst, wksp.dst, ZL_validResult(ret));
+            }
         } else {
             ret = ZL_REPORT_ERROR(
                     dstCapacity_tooSmall,
@@ -933,20 +952,23 @@ static ZL_Report writeChunkHeaderV8orMore(
 {
     ZL_RESULT_DECLARE_SCOPE_REPORT(NULL);
     ZL_DLOG(SEQ, "writeChunkHeaderV8orMore");
-    EFH_Workspace wksp = { 0 };
+    EFH_Workspace wksp;
     ZL_ERR_IF_ERR(EFH_Workspace_init(
             &wksp,
             gip->nbSessionInputs,
             gip->nbTransforms,
             gip->nbDistances,
             gip->nbStoredBuffs,
+            0,
             dst,
             dstCapacity));
     ZL_Report ret = writeChunkHeaderV8_internal(
             encoder, wksp.dst, wksp.dstCapacity, info, gip, &wksp);
     if (!ZL_isError(ret) && wksp.dst != dst) {
         if (dstCapacity >= ZL_validResult(ret)) {
-            memcpy(dst, wksp.dst, ZL_validResult(ret));
+            if (dst != NULL) {
+                memcpy(dst, wksp.dst, ZL_validResult(ret));
+            }
         } else {
             ret = ZL_REPORT_ERROR(
                     dstCapacity_tooSmall,

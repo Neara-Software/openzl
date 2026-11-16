@@ -137,7 +137,8 @@ struct ZL_CCtx_s {
     const ZL_Compressor* cgraph;
     ZL_Compressor* internal_cgraph;
     RTGraph rtgraph;
-    CachedStates cachedCodecStates; // @note valid for single-thread only
+    CachedStates cachedCodecStates;  // @note valid for single-thread only
+    CachedStates* borrowedCodecStates; // set on pooled trial contexts
     ZL_CodecOutputCache* attachedCodecOutputCache; // borrowed
     ZL_CodecOutputCache* tryGraphCodecOutputCache; // owned; lazily allocated
     size_t tryGraphCodecOutputCacheMaxBytes; // 0 disables automatic caching
@@ -145,6 +146,11 @@ struct ZL_CCtx_s {
     bool tryGraphCodecOutputCacheStatsEnabled;
     BFNarrow* bfNarrow;         // owned; lazily allocated
     BFNarrow* bfNarrowBorrowed; // set on tryGraph contexts: the parent's state
+    ZL_CCtx* bfNarrowOwner;     // lazy parent lookup on trial contexts
+    ZL_CCtx* cachedTrialCCtx;   // owned; pooled derived context for tryGraph
+    bool trialCCtxInUse;
+    bool isTrialCCtx;
+    bool measureSizeOnly;
     bool introspectTrials; // derived (trial) contexts inherit the hooks
     GCParams requestedGCParams; // User selection, at CCtx level
     GCParams appliedGCParams;   // Employed at compression time;
@@ -217,6 +223,9 @@ void CCTX_cleanChunk(ZL_CCtx* cctx)
         CodecCache_resetPreservingCompletedStats(
                 cctx->tryGraphCodecOutputCache);
     }
+    if (!cctx->isTrialCCtx && cctx->attachedCodecOutputCache != NULL) {
+        CodecCache_resetTryGraph(cctx->attachedCodecOutputCache);
+    }
     cctx->tryGraphCodecOutputCacheActive = false;
 }
 
@@ -237,6 +246,7 @@ void CCTX_free(ZL_CCtx* cctx)
 {
     if (cctx == NULL)
         return;
+    CCTX_free(cctx->cachedTrialCCtx);
     TRS_destroy(&cctx->cachedCodecStates);
     CodecCache_free(cctx->tryGraphCodecOutputCache);
     BFNarrow_free(cctx->bfNarrow);
@@ -422,7 +432,7 @@ void CCTX_setDst(
             dstCapacity,
             writtenSize);
     ZL_ASSERT_NN(cctx);
-    ZL_ASSERT_NN(dst);
+    ZL_ASSERT(dst != NULL || cctx->measureSizeOnly);
     ZL_ASSERT_LE(writtenSize, dstCapacity);
     cctx->dstBuffer        = dst;
     cctx->dstCapacity      = dstCapacity;
@@ -513,6 +523,9 @@ BFNarrow* CCTX_getBFNarrow(ZL_CCtx* cctx)
     ZL_ASSERT_NN(cctx);
     if (cctx->bfNarrowBorrowed != NULL) {
         return cctx->bfNarrowBorrowed;
+    }
+    if (cctx->bfNarrowOwner != NULL) {
+        return CCTX_getBFNarrow(cctx->bfNarrowOwner);
     }
     if (cctx->bfNarrow == NULL) {
         cctx->bfNarrow = BFNarrow_create();
@@ -645,6 +658,16 @@ static ZL_Report CCTX_runCNode_wParams(
         *rtnid = tmp;
     }
 
+    if (nbInputs == 1) {
+        ZL_CodecOutputCache* const cache = CCTX_getCodecOutputCache(cctx);
+        if (cache != NULL) {
+            CodecCache_ensureStreamKeyHash(
+                    cache,
+                    RTGM_getWStream(&cctx->rtgraph, irtsids[0]),
+                    cctx->codecArena);
+        }
+    }
+
     ZL_Report nbOuts;
     nbOuts = ENC_runTransform(
             &cnode->transformDesc,
@@ -656,7 +679,8 @@ static ZL_Report CCTX_runCNode_wParams(
             lparams,
             cctx,
             cctx->codecArena,
-            &cctx->cachedCodecStates);
+            cctx->borrowedCodecStates != NULL ? cctx->borrowedCodecStates
+                                              : &cctx->cachedCodecStates);
 
     ZL_ERR_IF_ERR(
             nbOuts,
@@ -982,15 +1006,20 @@ static ZL_Report CCTX_runGraph_internal(
     // but in this case, memory will only be reclaimed at end of
     // compression. That being said, it may not be such a big deal if memory
     // used is low.
-    SuccessorInfo* const successors =
-            ZL_malloc(nbSuccessors * sizeof(successors[0]));
-    ZL_ERR_IF_NULL(successors, allocation);
+    SuccessorInfo stackSuccessors[8];
+    SuccessorInfo* heapSuccessors = NULL;
+    SuccessorInfo* successors     = stackSuccessors;
+    if (nbSuccessors > 8) {
+        heapSuccessors = ZL_malloc(nbSuccessors * sizeof(successors[0]));
+        ZL_ERR_IF_NULL(heapSuccessors, allocation);
+        successors = heapSuccessors;
+    }
     GCTX_getSuccessors(gctx, successors, nbSuccessors);
 
     // Run successors
     ZL_Report const rsr =
             CCTX_runSuccessors(cctx, successors, nbSuccessors, depth);
-    ZL_free(successors);
+    ZL_free(heapSuccessors);
     return rsr;
 }
 
@@ -1130,9 +1159,21 @@ static ZL_Report CCTX_runGraphDesc(
     }
 
     // create context elements
-    ALLOC_ARENA_MALLOC_CHECKED(
-            ZL_Edge*, inputsPtrs, nbInputs, cctx->graphArena);
-    ALLOC_MALLOC_CHECKED(ZL_Edge, inputsArray, nbInputs);
+    ZL_Edge* stackInputsPtrs[8];
+    ZL_Edge** inputsPtrs = stackInputsPtrs;
+    if (nbInputs > 8) {
+        inputsPtrs = ALLOC_Arena_malloc(
+                cctx->graphArena, nbInputs * sizeof(ZL_Edge*));
+        ZL_ERR_IF_NULL(inputsPtrs, allocation);
+    }
+    ZL_Edge stackInputsArray[8];
+    ZL_Edge* heapInputsArray = NULL;
+    ZL_Edge* inputsArray     = stackInputsArray;
+    if (nbInputs > 8) {
+        heapInputsArray = ZL_malloc(nbInputs * sizeof(ZL_Edge));
+        ZL_ERR_IF_NULL(heapInputsArray, allocation);
+        inputsArray = heapInputsArray;
+    }
 
     ZL_Graph graphCtx     = GCTX_init(cctx, migd);
     graphCtx.privateParam = privateParam;
@@ -1143,7 +1184,7 @@ static ZL_Report CCTX_runGraphDesc(
         const ZL_Report ret =
                 SCTX_initInput(inputsArray + n, &graphCtx, rtsids[n]);
         if (ZL_isError(ret)) {
-            ZL_free(inputsArray);
+            ZL_free(heapInputsArray);
             GCTX_destroy(&graphCtx);
             return ret;
         }
@@ -1156,7 +1197,7 @@ static ZL_Report CCTX_runGraphDesc(
 
     // clean up context elements
     // Note: graphArena was already reset within CCTX_runGraph_internal
-    ZL_free(inputsArray);
+    ZL_free(heapInputsArray);
     GCTX_destroy(&graphCtx);
 
     /* Successors currently run synchronously and depth-first inside
@@ -1548,7 +1589,9 @@ CCTX_startCompression(ZL_CCtx* cctx, const ZL_Data* inputs[], size_t nbInputs)
                 cctx->dstCapacity - cctx->currentFrameSize,
                 1,
                 dstCapacity_tooSmall);
-        ZL_write8((char*)cctx->dstBuffer + cctx->currentFrameSize, 0);
+        if (cctx->dstBuffer != NULL) {
+            ZL_write8((char*)cctx->dstBuffer + cctx->currentFrameSize, 0);
+        }
         cctx->currentFrameSize += 1;
     }
     ZL_DLOG(FRAME, "Final compressed size: %zu", cctx->currentFrameSize);
@@ -1841,9 +1884,11 @@ CCTX_flushChunk(ZL_CCtx* cctx, const ZL_Data* inputs[], size_t nbInputs)
     int useStore           = 0; // set to 1 when STORE fallback is needed
 
     {
+        void* const headerDst =
+                dst != NULL ? (char*)dst + startFrameSize : NULL;
         ZL_Report const headerReport = CCTX_writeChunkHeader(
                 cctx,
-                (char*)dst + startFrameSize,
+                headerDst,
                 capacity - startFrameSize,
                 &gi);
 
@@ -1911,12 +1956,14 @@ CCTX_flushChunk(ZL_CCtx* cctx, const ZL_Data* inputs[], size_t nbInputs)
         ZL_ERR_IF_ERR(CCTX_getFinalGraph(cctx, &gi));
 
         // Write STORE chunk header (if this also fails, genuine error)
+        void* const storeHeaderDst =
+                dst != NULL ? (char*)dst + startFrameSize : NULL;
         ZL_TRY_LET(
                 size_t,
                 storeHeaderSize,
                 CCTX_writeChunkHeader(
                         cctx,
-                        (char*)dst + startFrameSize,
+                        storeHeaderDst,
                         capacity - startFrameSize,
                         &gi));
 
@@ -1937,7 +1984,9 @@ CCTX_flushChunk(ZL_CCtx* cctx, const ZL_Data* inputs[], size_t nbInputs)
         ZL_ERR_IF_GT(lbsize, capacity - frameSize, dstCapacity_tooSmall);
         if (lbsize) { // no need to copy when size==0, allows NULL src ptrs
             ZL_ASSERT_NN(gi.storedBuffs[n].start);
-            memcpy((char*)dst + frameSize, gi.storedBuffs[n].start, lbsize);
+            if (dst != NULL) {
+                memcpy((char*)dst + frameSize, gi.storedBuffs[n].start, lbsize);
+            }
         }
         frameSize += lbsize;
     }
@@ -1950,15 +1999,17 @@ CCTX_flushChunk(ZL_CCtx* cctx, const ZL_Data* inputs[], size_t nbInputs)
                 CCTX_getAppliedGParam(cctx, ZL_CParam_contentChecksum),
                 ZL_TernaryParam_enable);
         ZL_ERR_IF_LT(capacity - frameSize, 4, dstCapacity_tooSmall);
-        uint32_t const formatVersion =
-                (uint32_t)CCTX_getAppliedGParam(cctx, ZL_CParam_formatVersion);
-        ZL_TRY_LET(
-                size_t,
-                hashT,
-                STREAM_hashLastCommit_xxh3low32(
-                        inputs, nbInputs, formatVersion));
-        ZL_writeCE32((char*)dst + frameSize, (uint32_t)hashT);
-        ZL_DLOG(SEQ, "chunk content checksum: %08X", (uint32_t)hashT);
+        if (dst != NULL) {
+            uint32_t const formatVersion = (uint32_t)CCTX_getAppliedGParam(
+                    cctx, ZL_CParam_formatVersion);
+            ZL_TRY_LET(
+                    size_t,
+                    hashT,
+                    STREAM_hashLastCommit_xxh3low32(
+                            inputs, nbInputs, formatVersion));
+            ZL_writeCE32((char*)dst + frameSize, (uint32_t)hashT);
+            ZL_DLOG(SEQ, "chunk content checksum: %08X", (uint32_t)hashT);
+        }
         frameSize += 4;
     }
 
@@ -1969,22 +2020,24 @@ CCTX_flushChunk(ZL_CCtx* cctx, const ZL_Data* inputs[], size_t nbInputs)
                 CCTX_getAppliedGParam(cctx, ZL_CParam_compressedChecksum),
                 ZL_TernaryParam_enable);
         ZL_ERR_IF_LT(capacity - frameSize, 4, dstCapacity_tooSmall);
-        size_t startHashPosition = startFrameSize;
-        if (CCTX_getAppliedGParam(cctx, ZL_CParam_formatVersion)
-            < ZL_CHUNK_VERSION_MIN) {
-            /* versions < ZL_CHUNK_VERSION_MIN checksum the entire frame */
-            startHashPosition = 0;
+        if (dst != NULL) {
+            size_t startHashPosition = startFrameSize;
+            if (CCTX_getAppliedGParam(cctx, ZL_CParam_formatVersion)
+                < ZL_CHUNK_VERSION_MIN) {
+                /* versions < ZL_CHUNK_VERSION_MIN checksum the entire frame */
+                startHashPosition = 0;
+            }
+            ZL_ASSERT_LE(startHashPosition, frameSize);
+            ZL_DLOG(SEQ,
+                    "compressed checksum from pos %zu to %zu",
+                    startHashPosition,
+                    frameSize);
+            uint32_t const hash = (uint32_t)XXH3_64bits(
+                    (const char*)dst + startHashPosition,
+                    frameSize - startHashPosition);
+            ZL_writeCE32((char*)dst + frameSize, hash);
+            ZL_DLOG(SEQ, "chunk compressed checksum: %08X", hash);
         }
-        ZL_ASSERT_LE(startHashPosition, frameSize);
-        ZL_DLOG(SEQ,
-                "compressed checksum from pos %zu to %zu",
-                startHashPosition,
-                frameSize);
-        uint32_t const hash = (uint32_t)XXH3_64bits(
-                (const char*)dst + startHashPosition,
-                frameSize - startHashPosition);
-        ZL_writeCE32((char*)dst + frameSize, hash);
-        ZL_DLOG(SEQ, "chunk compressed checksum: %08X", hash);
         frameSize += 4;
     }
 
@@ -2170,6 +2223,11 @@ const RTGraph* CCTX_getRTGraph(const ZL_CCtx* cctx)
     return &cctx->rtgraph;
 }
 
+RTGraph* CCTX_getWRTGraph(ZL_CCtx* cctx)
+{
+    return &cctx->rtgraph;
+}
+
 bool CCTX_isNodeSupported(const ZL_CCtx* cctx, ZL_NodeID nodeid)
 {
     if (!ZL_NodeID_isValid(nodeid))
@@ -2252,7 +2310,142 @@ size_t CCTX_sizeof(const ZL_CCtx* cctx)
             + TRS_sizeof(&cctx->cachedCodecStates)
             + CCTX_TransformHeaders_sizeof(&cctx->trHeaders)
             + CodecCache_sizeof(cctx->tryGraphCodecOutputCache)
+            + CCTX_sizeof(cctx->cachedTrialCCtx)
             + ZL_OC_sizeof(&cctx->opCtx) + CCTX_arenaMemory(cctx);
+}
+
+static void CCTX_prehashTryGraphInputs(
+        ZL_CCtx* parentCCtx,
+        ZL_CodecOutputCache* cache,
+        const ZL_Input* inputs[],
+        size_t numInputs,
+        Arena* wkspArena)
+{
+    if (cache == NULL) {
+        return;
+    }
+    const size_t nbStreams = VECTOR_SIZE(parentCCtx->rtgraph.streams);
+    if (nbStreams == 0) {
+        return;
+    }
+    for (size_t i = 0; i < numInputs; ++i) {
+        const ZL_Data* const inData = ZL_codemodInputAsData(inputs[i]);
+        uint64_t existing;
+        if (STREAM_getCodecCacheKeyHash(inData, &existing)) {
+            continue;
+        }
+        for (size_t s = nbStreams; s > 0; --s) {
+            ZL_Data* const rtStream =
+                    VECTOR_AT(parentCCtx->rtgraph.streams, s - 1).stream;
+            if (rtStream == inData) {
+                CodecCache_ensureStreamKeyHash(cache, rtStream, wkspArena);
+                break;
+            }
+        }
+    }
+}
+
+static bool CCTX_resolveTrialEffectiveGCParams(
+        const ZL_CCtx* parentCCtx,
+        GCParams* effectiveOut)
+{
+    if (parentCCtx->cgraph == NULL || parentCCtx->comment.size != 0) {
+        return false;
+    }
+    *effectiveOut                    = parentCCtx->requestedGCParams;
+    effectiveOut->contentChecksum    = ZL_TernaryParam_disable;
+    effectiveOut->compressedChecksum = ZL_TernaryParam_disable;
+    const GCParams* const p2         = CGRAPH_getGCParams(parentCCtx->cgraph);
+    if (p2 == NULL) {
+        return false;
+    }
+    GCParams_applyDefaults(effectiveOut, p2);
+    GCParams_applyDefaults(effectiveOut, &GCParams_default);
+    return !ZL_isError(GCParams_finalize(effectiveOut));
+}
+
+static ZL_CCtx* CCTX_acquireTrialCCtx(
+        ZL_CCtx* parentCCtx,
+        ZL_CodecOutputCache* cache,
+        bool measureSizeOnly,
+        bool* isPooledOut)
+{
+    *isPooledOut = false;
+    ZL_CCtx* cctx = NULL;
+    if (!parentCCtx->trialCCtxInUse) {
+        if (parentCCtx->cachedTrialCCtx == NULL) {
+            ZL_CCtx* const created = CCTX_create();
+            if (created != NULL) {
+                created->isTrialCCtx        = true;
+                parentCCtx->cachedTrialCCtx = created;
+            }
+        }
+        if (parentCCtx->cachedTrialCCtx != NULL) {
+            cctx                       = parentCCtx->cachedTrialCCtx;
+            parentCCtx->trialCCtxInUse = true;
+            *isPooledOut               = true;
+        }
+    }
+    if (cctx == NULL) {
+        cctx = CCTX_create();
+        if (cctx == NULL) {
+            return NULL;
+        }
+        cctx->isTrialCCtx = true;
+    }
+
+    (void)ZL_CCtx_resetParameters(cctx);
+    if (ZL_isError(ZL_CCtx_refCompressor(cctx, parentCCtx->cgraph))) {
+        if (*isPooledOut) {
+            parentCCtx->trialCCtxInUse = false;
+            *isPooledOut               = false;
+        } else {
+            CCTX_free(cctx);
+        }
+        return NULL;
+    }
+    GCParams_copy(&cctx->requestedGCParams, &parentCCtx->requestedGCParams);
+    cctx->attachedCodecOutputCache         = cache;
+    cctx->tryGraphCodecOutputCacheMaxBytes =
+            parentCCtx->tryGraphCodecOutputCacheMaxBytes;
+    cctx->tryGraphCodecOutputCacheStatsEnabled =
+            parentCCtx->tryGraphCodecOutputCacheStatsEnabled;
+    cctx->borrowedCodecStates = parentCCtx->borrowedCodecStates != NULL
+            ? parentCCtx->borrowedCodecStates
+            : &parentCCtx->cachedCodecStates;
+    cctx->bfNarrowBorrowed = NULL;
+    cctx->bfNarrowOwner    = parentCCtx;
+    cctx->measureSizeOnly  = measureSizeOnly;
+    if (parentCCtx->introspectTrials) {
+        cctx->opCtx.compressIntrospectionHooks =
+                parentCCtx->opCtx.compressIntrospectionHooks;
+        cctx->opCtx.hasCompressionHooks =
+                parentCCtx->opCtx.hasCompressionHooks;
+        cctx->introspectTrials = true;
+    } else {
+        ZL_zeroes(
+                &cctx->opCtx.compressIntrospectionHooks,
+                sizeof(cctx->opCtx.compressIntrospectionHooks));
+        cctx->opCtx.hasCompressionHooks = false;
+        cctx->introspectTrials          = false;
+    }
+    return cctx;
+}
+
+static void CCTX_releaseTrialCCtx(
+        ZL_CCtx* parentCCtx,
+        ZL_CCtx* cctx,
+        bool isPooled)
+{
+    if (isPooled) {
+        cctx->borrowedCodecStates      = NULL;
+        cctx->bfNarrowOwner            = NULL;
+        cctx->attachedCodecOutputCache = NULL;
+        cctx->measureSizeOnly          = false;
+        parentCCtx->trialCCtxInUse     = false;
+    } else {
+        CCTX_free(cctx);
+    }
 }
 
 static ZL_RESULT_OF(ZL_GraphPerformance) CCTX_tryGraphInternal(
@@ -2306,25 +2499,69 @@ CCTX_tryGraph(
         }
     }
     const size_t dstCapacity = ZL_compressBound(totalInputSize);
-    void* const dst          = ALLOC_Arena_malloc(wkspArena, dstCapacity);
-    ZL_ERR_IF_NULL(dst, allocation);
 
     // Derived contexts borrow this cache. Allocation failure only disables the
     // optimization; it must not change tryGraph behavior.
-    (void)CCTX_enableTryGraphCodecOutputCache(parentCCtx);
+    ZL_CodecOutputCache* const cache =
+            CCTX_enableTryGraphCodecOutputCache(parentCCtx);
+    CCTX_prehashTryGraphInputs(parentCCtx, cache, inputs, numInputs, wkspArena);
 
-    ZL_CCtx* cctx = CCTX_createDerivedCCtx(parentCCtx);
+    const bool hasTrialHooks = parentCCtx->introspectTrials
+            && parentCCtx->opCtx.hasCompressionHooks;
+    CodecCache_TryGraphLookup* tgLookup = NULL;
+    if (cache != NULL && !hasTrialHooks) {
+        GCParams effectiveGCParams;
+        if (CCTX_resolveTrialEffectiveGCParams(
+                    parentCCtx, &effectiveGCParams)) {
+            size_t cachedSize = 0;
+            bool tgHit        = false;
+            tgLookup          = CodecCache_lookupTryGraph(
+                    cache,
+                    parentCCtx->cgraph,
+                    graph,
+                    &effectiveGCParams,
+                    params,
+                    ZL_codemodInputsAsDatas(inputs),
+                    numInputs,
+                    wkspArena,
+                    &cachedSize,
+                    &tgHit);
+            if (tgHit) {
+                CCTX_disableTryGraphCodecOutputCacheInsertions(parentCCtx);
+                return ZL_WRAP_VALUE((ZL_GraphPerformance){ cachedSize });
+            }
+        }
+    }
+
+    const bool measureSizeOnly = !hasTrialHooks;
+    void* dst                  = NULL;
+    if (!measureSizeOnly) {
+        dst = ALLOC_Arena_malloc(wkspArena, dstCapacity);
+        if (dst == NULL) {
+            CCTX_disableTryGraphCodecOutputCacheInsertions(parentCCtx);
+            ZL_ERR(allocation);
+        }
+    }
+
+    bool isPooled = false;
+    ZL_CCtx* cctx = CCTX_acquireTrialCCtx(
+            parentCCtx, cache, measureSizeOnly, &isPooled);
     if (cctx == NULL) {
         CCTX_disableTryGraphCodecOutputCacheInsertions(parentCCtx);
         ZL_ERR(allocation);
     }
-    cctx->bfNarrowBorrowed = CCTX_getBFNarrow(parentCCtx);
 
     ZL_RESULT_OF(ZL_GraphPerformance)
     result = CCTX_tryGraphInternal(
             cctx, dst, dstCapacity, inputs, numInputs, graph, params);
 
-    CCTX_free(cctx);
+    if (!ZL_RES_isError(result) && tgLookup != NULL) {
+        CodecCache_storeTryGraph(tgLookup, ZL_RES_value(result).compressedSize);
+    } else if (ZL_RES_isError(result)) {
+        ZL_RES_clearInfo(result);
+    }
+
+    CCTX_releaseTrialCCtx(parentCCtx, cctx, isPooled);
     CCTX_disableTryGraphCodecOutputCacheInsertions(parentCCtx);
 
     return result;

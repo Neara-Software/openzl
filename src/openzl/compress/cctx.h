@@ -649,6 +649,7 @@ const ZL_Compressor* CCTX_getCGraph(const ZL_CCtx* cctx);
  * @see CCTX_getCGraph for getting the static compression graph
  */
 const RTGraph* CCTX_getRTGraph(const ZL_CCtx* cctx);
+RTGraph* CCTX_getWRTGraph(ZL_CCtx* cctx);
 
 /**
  * @brief Check if a compression node is supported by the current format

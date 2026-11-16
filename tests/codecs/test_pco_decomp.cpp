@@ -236,6 +236,7 @@ TEST_F(PcoDecompTest, PcoBinSplitWideOffsetsAbove57Bits)
         }
         testRoundTrip(Input::refNumeric(poly::span<const uint64_t>{ wideMixed }));
     }
+}
 
 TEST_F(PcoDecompTest, IntMultSplitDetectsMultiplierAndFallsBack)
 {
