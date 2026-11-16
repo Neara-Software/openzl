@@ -10,7 +10,11 @@
 #include "openzl/shared/utils.h"
 #include "openzl/zl_errors.h"
 
-#define ZS_HAS_FAST_BITPACK (ZL_HAS_AVX2 && ZL_HAS_BMI2)
+#if ZL_HAS_AVX2 && ZL_HAS_BMI2 && !defined(__znver1__) && !defined(__znver2__)
+#    define ZS_HAS_FAST_BITPACK 1
+#else
+#    define ZS_HAS_FAST_BITPACK 0
+#endif
 
 #if ZS_HAS_FAST_BITPACK
 #    include <immintrin.h>

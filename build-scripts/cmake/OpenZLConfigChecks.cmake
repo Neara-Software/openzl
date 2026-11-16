@@ -3,13 +3,13 @@
 # This file handles configuration of what features we have based on dynamic build
 # time checks.
 
-set(OPENZL_HAVE_X86_64_ASM FALSE)
+set(ZL_HAVE_X86_64_ASM FALSE)
 if (${IS_X86_64_ARCH})
-    if (NOT MSVC)
+    if (NOT MSVC AND NOT EMSCRIPTEN)
         message(
             STATUS
             "Enabling x86-64 assembly"
         )
-        set(OPENZL_HAVE_X86_64_ASM TRUE)
+        set(ZL_HAVE_X86_64_ASM TRUE)
     endif()
 endif()

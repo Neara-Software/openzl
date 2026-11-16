@@ -91,6 +91,141 @@ ZS_deltaDecode32_ssse3(uint32_t* dst, uint32_t const* deltas, size_t nbElts)
 
 #endif // ZL_HAS_SSSE3
 
+#if ZL_HAS_AVX2
+
+static size_t
+ZS_deltaDecode64_avx2(uint64_t* dst, uint64_t const* deltas, size_t nbElts)
+{
+    assert(nbElts > 0);
+    size_t const kEltsPerIter = sizeof(__m256i) / sizeof(*deltas);
+    __m256i prev              = _mm256_set1_epi64x((long long)dst[0]);
+    __m256i const zero        = _mm256_setzero_si256();
+    size_t n                  = 1;
+    for (; n + kEltsPerIter <= nbElts; n += kEltsPerIter) {
+        __m256i values  = _mm256_loadu_si256((__m256i_u const*)&deltas[n - 1]);
+        values          = _mm256_add_epi64(values, _mm256_slli_si256(values, 8));
+        __m256i low_sum = _mm256_permute4x64_epi64(values, 0x55);
+        low_sum         = _mm256_blend_epi32(zero, low_sum, 0xF0);
+        values          = _mm256_add_epi64(values, low_sum);
+        _mm256_storeu_si256((__m256i_u*)&dst[n], _mm256_add_epi64(values, prev));
+        prev = _mm256_add_epi64(prev, _mm256_permute4x64_epi64(values, 0xFF));
+    }
+    return n;
+}
+
+#endif // ZL_HAS_AVX2
+
+#if ZL_HAS_WASM_SIMD128
+
+static size_t
+ZS_deltaDecode8_wasm(uint8_t* dst, uint8_t const* deltas, size_t nbElts)
+{
+    assert(nbElts > 0);
+    size_t const kEltsPerIter = sizeof(v128_t) / sizeof(*deltas);
+    v128_t prev               = wasm_u8x16_splat(dst[0]);
+    v128_t const zero         = wasm_u8x16_splat(0);
+    size_t n                  = 1;
+    for (; n + kEltsPerIter <= nbElts; n += kEltsPerIter) {
+        v128_t values = wasm_v128_load(&deltas[n - 1]);
+        values        = wasm_i8x16_add(
+                values,
+                wasm_i8x16_shuffle(
+                        zero, values, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23));
+        values = wasm_i8x16_add(
+                values,
+                wasm_i8x16_shuffle(
+                        zero, values, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27));
+        values = wasm_i8x16_add(
+                values,
+                wasm_i8x16_shuffle(
+                        zero, values, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29));
+        values = wasm_i8x16_add(
+                values,
+                wasm_i8x16_shuffle(
+                        zero, values, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30));
+        wasm_v128_store(&dst[n], wasm_i8x16_add(values, prev));
+        prev = wasm_i8x16_add(
+                prev,
+                wasm_i8x16_shuffle(
+                        values, values, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15));
+    }
+    return n;
+}
+
+static size_t
+ZS_deltaDecode16_wasm(uint16_t* dst, uint16_t const* deltas, size_t nbElts)
+{
+    assert(nbElts > 0);
+    size_t const kEltsPerIter = sizeof(v128_t) / sizeof(*deltas);
+    v128_t prev               = wasm_u16x8_splat(dst[0]);
+    v128_t const zero         = wasm_u16x8_splat(0);
+    size_t n                  = 1;
+    for (; n + kEltsPerIter <= nbElts; n += kEltsPerIter) {
+        v128_t values = wasm_v128_load(&deltas[n - 1]);
+        values        = wasm_i16x8_add(
+                values,
+                wasm_i8x16_shuffle(
+                        zero, values, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23));
+        values = wasm_i16x8_add(
+                values,
+                wasm_i8x16_shuffle(
+                        zero, values, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27));
+        values = wasm_i16x8_add(
+                values,
+                wasm_i8x16_shuffle(
+                        zero, values, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29));
+        wasm_v128_store(&dst[n], wasm_i16x8_add(values, prev));
+        prev = wasm_i16x8_add(
+                prev, wasm_i16x8_shuffle(values, values, 7, 7, 7, 7, 7, 7, 7, 7));
+    }
+    return n;
+}
+
+static size_t
+ZS_deltaDecode32_wasm(uint32_t* dst, uint32_t const* deltas, size_t nbElts)
+{
+    assert(nbElts > 0);
+    size_t const kEltsPerIter = sizeof(v128_t) / sizeof(*deltas);
+    v128_t prev               = wasm_u32x4_splat(dst[0]);
+    v128_t const zero         = wasm_u32x4_splat(0);
+    size_t n                  = 1;
+    for (; n + kEltsPerIter <= nbElts; n += kEltsPerIter) {
+        v128_t values = wasm_v128_load(&deltas[n - 1]);
+        values        = wasm_i32x4_add(
+                values,
+                wasm_i8x16_shuffle(
+                        zero, values, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23));
+        values = wasm_i32x4_add(
+                values,
+                wasm_i8x16_shuffle(
+                        zero, values, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27));
+        wasm_v128_store(&dst[n], wasm_i32x4_add(values, prev));
+        prev = wasm_i32x4_add(
+                prev, wasm_i32x4_shuffle(values, values, 3, 3, 3, 3));
+    }
+    return n;
+}
+
+static size_t
+ZS_deltaDecode64_wasm(uint64_t* dst, uint64_t const* deltas, size_t nbElts)
+{
+    assert(nbElts > 0);
+    size_t const kEltsPerIter = sizeof(v128_t) / sizeof(*deltas);
+    v128_t prev               = wasm_u64x2_splat(dst[0]);
+    v128_t const zero         = wasm_u64x2_splat(0);
+    size_t n                  = 1;
+    for (; n + kEltsPerIter <= nbElts; n += kEltsPerIter) {
+        v128_t values = wasm_v128_load(&deltas[n - 1]);
+        values        = wasm_i64x2_add(
+                values, wasm_i64x2_shuffle(zero, values, 0, 2));
+        wasm_v128_store(&dst[n], wasm_i64x2_add(values, prev));
+        prev = wasm_i64x2_add(prev, wasm_i64x2_shuffle(values, values, 1, 1));
+    }
+    return n;
+}
+
+#endif // ZL_HAS_WASM_SIMD128
+
 void ZS_deltaDecode8(
         uint8_t* dst,
         uint8_t first,
@@ -104,6 +239,8 @@ void ZS_deltaDecode8(
     size_t n = 1;
 #if ZL_HAS_SSSE3
     n = ZS_deltaDecode8_ssse3(dst, deltas, nbElts);
+#elif ZL_HAS_WASM_SIMD128
+    n = ZS_deltaDecode8_wasm(dst, deltas, nbElts);
 #endif
     for (; n < nbElts; ++n) {
         dst[n] = (uint8_t)(dst[n - 1] + deltas[n - 1]);
@@ -123,6 +260,8 @@ void ZS_deltaDecode16(
     size_t n = 1;
 #if ZL_HAS_SSSE3
     n = ZS_deltaDecode16_ssse3(dst, deltas, nbElts);
+#elif ZL_HAS_WASM_SIMD128
+    n = ZS_deltaDecode16_wasm(dst, deltas, nbElts);
 #endif
     for (; n < nbElts; ++n) {
         dst[n] = (uint16_t)(dst[n - 1] + deltas[n - 1]);
@@ -142,6 +281,8 @@ void ZS_deltaDecode32(
     size_t n = 1;
 #if ZL_HAS_SSSE3
     n = ZS_deltaDecode32_ssse3(dst, deltas, nbElts);
+#elif ZL_HAS_WASM_SIMD128
+    n = ZS_deltaDecode32_wasm(dst, deltas, nbElts);
 #endif
     for (; n < nbElts; ++n) {
         dst[n] = dst[n - 1] + deltas[n - 1];
@@ -157,8 +298,14 @@ void ZS_deltaDecode64(
     if (nbElts == 0) {
         return;
     }
-    dst[0] = first;
-    for (size_t n = 1; n < nbElts; ++n) {
+    dst[0]   = first;
+    size_t n = 1;
+#if ZL_HAS_AVX2
+    n = ZS_deltaDecode64_avx2(dst, deltas, nbElts);
+#elif ZL_HAS_WASM_SIMD128
+    n = ZS_deltaDecode64_wasm(dst, deltas, nbElts);
+#endif
+    for (; n < nbElts; ++n) {
         dst[n] = dst[n - 1] + deltas[n - 1];
     }
 }

@@ -46,6 +46,15 @@ set(OPENZL_COMMON_COMPILE_OPTIONS
     -g
     ${OPENZL_COMMON_COMPILE_OPTIONS})
 
+if (OPENZL_NATIVE_ARCH AND NOT EMSCRIPTEN)
+    check_c_compiler_flag(-march=native OPENZL_HAVE_C_MARCH_NATIVE)
+    check_cxx_compiler_flag(-march=native OPENZL_HAVE_CXX_MARCH_NATIVE)
+    if (OPENZL_HAVE_C_MARCH_NATIVE AND OPENZL_HAVE_CXX_MARCH_NATIVE)
+        message(STATUS "Enabling -march=native")
+        list(APPEND OPENZL_COMMON_COMPILE_OPTIONS -march=native)
+    endif()
+endif()
+
 
 
 separate_arguments(OPENZL_C_COMPILE_OPTIONS UNIX_COMMAND "${OPENZL_C_FLAGS}")

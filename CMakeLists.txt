@@ -34,6 +34,7 @@ option(OPENZL_BUILD_CLI "Build the cli subdirectory" ON)
 option(OPENZL_BUILD_EXAMPLES "Build the examples subdirectory" ON)
 option(OPENZL_BUILD_WASM "Builds WASM binding (requires Emscripten)" OFF)
 option(OPENZL_BUILD_GPU "Builds the CUDA GPU decoder in contrib/gpu (requires the CUDA Toolkit)" OFF)
+option(OPENZL_NATIVE_ARCH "Enable -march=native compiler optimization" OFF)
 
 set(OPENZL_SUPPORT_SHARED_LIBRARY "${OPENZL_BUILD_SHARED_LIBS}")
 
@@ -92,7 +93,7 @@ MESSAGE(STATUS "current platform: ${CMAKE_SYSTEM_NAME}")
 
 set_property(GLOBAL PROPERTY USE_FOLDERS ON)
 
-if(NOT DEFINED IS_X86_64_ARCH AND ${CMAKE_SYSTEM_PROCESSOR} MATCHES "x86_64|AMD64")
+if(NOT DEFINED IS_X86_64_ARCH AND NOT EMSCRIPTEN AND ${CMAKE_SYSTEM_PROCESSOR} MATCHES "x86_64|AMD64")
   set(IS_X86_64_ARCH TRUE)
 else()
   set(IS_X86_64_ARCH FALSE)

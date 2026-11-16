@@ -237,6 +237,8 @@ ZL_INLINE bool ZL_addressIsPoisoned(const void* ptr)
 #define ZL_ARCH_FLAG_PPC64LE ((1 << 8) | ZL_ARCH_FLAG_PPC64)
 #define ZL_ARCH_FLAG_PPC64BE ((1 << 9) | ZL_ARCH_FLAG_PPC64)
 
+#define ZL_ARCH_FLAG_WASM (1 << 10)
+
 #define ZL_ARCH_FLAG_UNKNOWN (1 << 30)
 
 #if defined(__x86_64__) || defined(_M_X64)
@@ -255,6 +257,8 @@ ZL_INLINE bool ZL_addressIsPoisoned(const void* ptr)
 #    else
 #        define ZL_ARCH_FLAGS ZL_ARCH_FLAG_PPC64BE
 #    endif
+#elif defined(__wasm__) || defined(__wasm32__) || defined(__wasm64__)
+#    define ZL_ARCH_FLAGS ZL_ARCH_FLAG_WASM
 #else
 #    define ZL_ARCH_FLAGS ZL_ARCH_FLAG_UNKNOWN
 #endif
@@ -269,6 +273,7 @@ ZL_INLINE bool ZL_addressIsPoisoned(const void* ptr)
 #define ZL_ARCH_PPC64 ((ZL_ARCH_FLAGS & ZL_ARCH_FLAG_PPC64) != 0)
 #define ZL_ARCH_PPC64LE ((ZL_ARCH_FLAGS & ZL_ARCH_FLAG_PPC64LE) != 0)
 #define ZL_ARCH_PPC64BE ((ZL_ARCH_FLAGS & ZL_ARCH_FLAG_PPC64BE) != 0)
+#define ZL_ARCH_WASM ((ZL_ARCH_FLAGS & ZL_ARCH_FLAG_WASM) != 0)
 
 // Enforce 64-bit compilation
 #if (ZL_ARCH_FLAGS == ZL_ARCH_FLAG_I386) \
@@ -358,6 +363,13 @@ typedef __m128i __m128i_u;
 #    include <immintrin.h>
 #else
 #    define ZL_HAS_SSE42 0
+#endif
+
+#if defined(__wasm_simd128__)
+#    define ZL_HAS_WASM_SIMD128 1
+#    include <wasm_simd128.h>
+#else
+#    define ZL_HAS_WASM_SIMD128 0
 #endif
 
 #ifndef ZL_FALLTHROUGH

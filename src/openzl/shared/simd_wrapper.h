@@ -13,6 +13,9 @@
 #if ZL_HAS_NEON
 #    include <arm_neon.h>
 #endif
+#if ZL_HAS_WASM_SIMD128
+#    include <wasm_simd128.h>
+#endif
 #if ZL_ARCH_X86_64
 #    include <emmintrin.h>
 #endif
@@ -165,6 +168,40 @@ ZL_INLINE ZL_VecMask ZL_Vec128_mask8(ZL_Vec128 v)
     uint8_t const hiAcc = vaddv_u8(vget_high_u8(weighted));
     return (ZL_VecMask)loAcc | ((ZL_VecMask)hiAcc << 8);
 #    endif
+}
+
+#elif ZL_HAS_WASM_SIMD128
+
+typedef v128_t ZL_Vec128;
+
+ZL_INLINE ZL_Vec128 ZL_Vec128_read(void const* ptr)
+{
+    return wasm_v128_load(ptr);
+}
+
+ZL_INLINE void ZL_Vec128_write(void* ptr, ZL_Vec128 v)
+{
+    wasm_v128_store(ptr, v);
+}
+
+ZL_INLINE ZL_Vec128 ZL_Vec128_set8(uint8_t val)
+{
+    return wasm_u8x16_splat(val);
+}
+
+ZL_INLINE ZL_Vec128 ZL_Vec128_cmp8(ZL_Vec128 x, ZL_Vec128 y)
+{
+    return wasm_i8x16_eq(x, y);
+}
+
+ZL_INLINE ZL_Vec128 ZL_Vec128_and(ZL_Vec128 x, ZL_Vec128 y)
+{
+    return wasm_v128_and(x, y);
+}
+
+ZL_INLINE ZL_VecMask ZL_Vec128_mask8(ZL_Vec128 v)
+{
+    return (ZL_VecMask)wasm_i8x16_bitmask(v);
 }
 
 #else
