@@ -236,6 +236,115 @@ TEST_F(PcoDecompTest, PcoBinSplitWideOffsetsAbove57Bits)
         }
         testRoundTrip(Input::refNumeric(poly::span<const uint64_t>{ wideMixed }));
     }
+}
+
+TEST_F(PcoDecompTest, PcoBinSplitSimdLutAndOffsetTiers)
+{
+    struct TierCase {
+        size_t numClusters;
+        uint64_t spreadMask; // 0 => allZeroOffsets; >0 => maxOb tier
+    };
+    const TierCase tiers[] = {
+        { 6, 0ULL },                  // <=8/16 LUT, allZeroOffsets
+        { 12, 0xFFULL },              // <=16 byte-plane LUT, ob<=8
+        { 40, 0x7FFFULL },            // 17..64 multi-register LUT, ob<=15
+        { 48, 0x1FFFFFULL },          // 17..64 LUT, ob==21 (32-bit extractor)
+        { 140, 0x3FFFFFFFFFULL },     // >64 scalar LUT, ob==38 (64-bit extractor)
+    };
+    const size_t lengths[] = { 15, 16, 17, 31, 32, 33, 255, 256, 257, 600 };
+
+    auto checkTiers = [&](auto tag, nodes::PcoBinSplit::LatentMode mode) {
+        using T            = decltype(tag);
+        constexpr size_t W = sizeof(T) * 8u;
+        const uint64_t typeMask =
+                (W == 64u) ? ~uint64_t(0) : ((uint64_t(1) << W) - 1ULL);
+        compressor_.setParameter(CParam::FormatVersion, ZL_MAX_FORMAT_VERSION);
+        compressor_.selectStartingGraph(nodes::PcoBinSplit{ mode }(
+                compressor_, graphs::Entropy{}(), graphs::Store{}()));
+
+        for (const auto& tc : tiers) {
+            uint64_t const mask = tc.spreadMask & (typeMask >> 2);
+            uint64_t const step =
+                    std::max<uint64_t>(mask + 17ULL, (typeMask / 200ULL) | 1ULL);
+            for (size_t len : lengths) {
+                std::vector<T> data(len);
+                for (size_t i = 0; i < len; ++i) {
+                    size_t const c   = (i * 7u + (i >> 3)) % tc.numClusters;
+                    uint64_t const v = (uint64_t(c) * step
+                                        + ((i * 0x9E3779B97F4A7C15ULL) & mask))
+                            & typeMask;
+                    data[i] = static_cast<T>(v);
+                }
+                testRoundTrip(Input::refNumeric(poly::span<const T>{ data }));
+            }
+        }
+    };
+
+    checkTiers(uint8_t{}, nodes::PcoBinSplit::LatentMode::Unsigned);
+    checkTiers(int8_t{}, nodes::PcoBinSplit::LatentMode::Signed);
+    checkTiers(uint16_t{}, nodes::PcoBinSplit::LatentMode::Unsigned);
+    checkTiers(int16_t{}, nodes::PcoBinSplit::LatentMode::Signed);
+    checkTiers(uint32_t{}, nodes::PcoBinSplit::LatentMode::Unsigned);
+    checkTiers(int32_t{}, nodes::PcoBinSplit::LatentMode::Signed);
+    checkTiers(uint64_t{}, nodes::PcoBinSplit::LatentMode::Unsigned);
+    checkTiers(int64_t{}, nodes::PcoBinSplit::LatentMode::Signed);
+}
+
+TEST_F(PcoDecompTest, PcoBinSplitFloat16AndCorruptBinRejection)
+{
+    compressor_.setParameter(CParam::FormatVersion, ZL_MAX_FORMAT_VERSION);
+    compressor_.selectStartingGraph(
+            nodes::PcoBinSplit{ nodes::PcoBinSplit::LatentMode::Float }(
+                    compressor_, graphs::Entropy{}(), graphs::Store{}()));
+
+    // 16-bit IEEE-754 half-precision bit patterns (+0, -0, normals, negatives, NaNs)
+    for (size_t len : { size_t(15), size_t(16), size_t(17), size_t(33), size_t(257) }) {
+        std::vector<uint16_t> f16Bits(len);
+        for (size_t i = 0; i < len; ++i) {
+            if (i == 0) {
+                f16Bits[i] = 0x8000u; // -0.0
+            } else if (i == 1) {
+                f16Bits[i] = 0x7E21u; // quiet NaN payload
+            } else {
+                uint16_t const mag = static_cast<uint16_t>(0x3C00u + ((i * 19u) & 0x03FFu));
+                f16Bits[i] = (i & 1u) ? static_cast<uint16_t>(mag | 0x8000u) : mag;
+            }
+        }
+        testRoundTrip(Input::refNumeric(poly::span<const uint16_t>{ f16Bits }));
+    }
+
+    // Out-of-bounds binId (>= numBins) must be rejected by decoder bin validation
+    compressor_.setParameter(CParam::CompressedChecksum, ZL_TernaryParam_disable);
+    compressor_.setParameter(CParam::ContentChecksum, ZL_TernaryParam_disable);
+    compressor_.selectStartingGraph(
+            nodes::PcoBinSplit{ nodes::PcoBinSplit::LatentMode::Unsigned }(
+                    compressor_, graphs::Store{}(), graphs::Store{}()));
+    std::vector<uint32_t> twoCluster(64);
+    for (size_t i = 0; i < twoCluster.size(); ++i) {
+        twoCluster[i] = (i & 1u) ? (100000u + uint32_t(i & 7u)) : (10u + uint32_t(i & 7u));
+    }
+    cctx_.refCompressor(compressor_);
+    std::string frame = cctx_.compressOne(
+            Input::refNumeric(poly::span<const uint32_t>{ twoCluster }));
+
+    std::string pattern(64, '\0');
+    for (size_t i = 0; i < pattern.size(); ++i) {
+        pattern[i] = static_cast<char>(i & 1u);
+    }
+    size_t const pos = frame.find(pattern);
+    ASSERT_NE(pos, std::string::npos);
+
+    frame[pos + 17] = 0; // Valid binId < numBins succeeds (positive control)
+    EXPECT_NO_THROW((void)dctx_.decompressOne(frame));
+
+    for (size_t lane : { size_t(17), size_t(61) }) {
+        for (uint8_t badBin : { uint8_t(2), uint8_t(0xFE) }) {
+            std::string bad = frame;
+            bad[pos + lane] = static_cast<char>(badBin);
+            EXPECT_ANY_THROW((void)dctx_.decompressOne(bad));
+        }
+    }
+}
 
 TEST_F(PcoDecompTest, IntMultSplitDetectsMultiplierAndFallsBack)
 {
