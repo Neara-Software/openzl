@@ -11,9 +11,11 @@
 #include "openzl/shared/portability.h"
 
 enum {
-    LBD_MODE_RAW         = 0,
-    LBD_MODE_CONSECUTIVE = 1,
-    LBD_MODE_LOOKBACK    = 2,
+    LBD_MODE_RAW           = 0,
+    LBD_MODE_CONSECUTIVE   = 1,
+    LBD_MODE_LOOKBACK      = 2,
+    LBD_MODE_CONSECUTIVE_2 = 3,
+    LBD_MODE_CONSECUTIVE_3 = 4,
 };
 
 static inline int lbd_validate_lb(const uint16_t* lb, size_t nLb)
@@ -64,6 +66,37 @@ static inline int lbd_validate_lb(const uint16_t* lb, size_t nLb)
             dst[i] = (T)(dst[i - (size_t)lb[i - 1u] - 1u] + res[i]);           \
         }                                                                      \
         return 1;                                                              \
+    }                                                                          \
+    static void lbd_dec_consec2_##W(T* dst, const T* res, size_t n)            \
+    {                                                                          \
+        T s0   = res[0];                                                       \
+        T d1   = res[1];                                                       \
+        T s1   = (T)(s0 + d1);                                                 \
+        dst[0] = s0;                                                           \
+        dst[1] = s1;                                                           \
+        for (size_t i = 2; i < n; i++) {                                       \
+            d1     = (T)(d1 + res[i]);                                         \
+            s1     = (T)(s1 + d1);                                             \
+            dst[i] = s1;                                                       \
+        }                                                                      \
+    }                                                                          \
+    static void lbd_dec_consec3_##W(T* dst, const T* res, size_t n)            \
+    {                                                                          \
+        T s0   = res[0];                                                       \
+        T d1   = res[1];                                                       \
+        T d2   = res[2];                                                       \
+        T s1   = (T)(s0 + d1);                                                 \
+        d1     = (T)(d1 + d2);                                                 \
+        T s2   = (T)(s1 + d1);                                                 \
+        dst[0] = s0;                                                           \
+        dst[1] = s1;                                                           \
+        dst[2] = s2;                                                           \
+        for (size_t i = 3; i < n; i++) {                                       \
+            d2     = (T)(d2 + res[i]);                                         \
+            d1     = (T)(d1 + d2);                                             \
+            s2     = (T)(s2 + d1);                                             \
+            dst[i] = s2;                                                       \
+        }                                                                      \
     }
 
 LBD_DEFINE_DECODE(1, uint8_t)
@@ -89,13 +122,14 @@ ZL_Report DI_lookback_delta(ZL_Decoder* dictx, const ZL_Input* ins[])
     ZL_RBuffer const hdr = ZL_Decoder_getCodecHeader(dictx);
     ZL_ERR_IF_NE(hdr.size, 1, corruption);
     uint8_t const mode = *(const uint8_t*)hdr.start;
-    ZL_ERR_IF_GT(mode, LBD_MODE_LOOKBACK, corruption);
+    ZL_ERR_IF_GT(mode, LBD_MODE_CONSECUTIVE_3, corruption);
 
     ZL_Output* const out = ZL_Decoder_create1OutStream(dictx, n, eltWidth);
     ZL_ERR_IF_NULL(out, allocation);
 
     if (n == 0) {
         ZL_ERR_IF_NE(ZL_Input_numElts(lbIn), 0, corruption);
+        ZL_ERR_IF_GE(mode, LBD_MODE_LOOKBACK, corruption);
         ZL_ERR_IF_ERR(ZL_Output_commit(out, 0));
         return ZL_returnValue(1);
     }
@@ -112,6 +146,64 @@ ZL_Report DI_lookback_delta(ZL_Decoder* dictx, const ZL_Input* ins[])
                 resPtr + eltWidth,
                 n,
                 eltWidth);
+    } else if (mode == LBD_MODE_CONSECUTIVE_2) {
+        ZL_ERR_IF_LT(n, 2, corruption);
+        ZL_ERR_IF_NE(ZL_Input_numElts(lbIn), 0, corruption);
+        switch (eltWidth) {
+            case 1:
+                lbd_dec_consec2_1(
+                        (uint8_t*)ZL_Output_ptr(out),
+                        (const uint8_t*)ZL_Input_ptr(resIn),
+                        n);
+                break;
+            case 2:
+                lbd_dec_consec2_2(
+                        (uint16_t*)ZL_Output_ptr(out),
+                        (const uint16_t*)ZL_Input_ptr(resIn),
+                        n);
+                break;
+            case 4:
+                lbd_dec_consec2_4(
+                        (uint32_t*)ZL_Output_ptr(out),
+                        (const uint32_t*)ZL_Input_ptr(resIn),
+                        n);
+                break;
+            case 8:
+                lbd_dec_consec2_8(
+                        (uint64_t*)ZL_Output_ptr(out),
+                        (const uint64_t*)ZL_Input_ptr(resIn),
+                        n);
+                break;
+        }
+    } else if (mode == LBD_MODE_CONSECUTIVE_3) {
+        ZL_ERR_IF_LT(n, 3, corruption);
+        ZL_ERR_IF_NE(ZL_Input_numElts(lbIn), 0, corruption);
+        switch (eltWidth) {
+            case 1:
+                lbd_dec_consec3_1(
+                        (uint8_t*)ZL_Output_ptr(out),
+                        (const uint8_t*)ZL_Input_ptr(resIn),
+                        n);
+                break;
+            case 2:
+                lbd_dec_consec3_2(
+                        (uint16_t*)ZL_Output_ptr(out),
+                        (const uint16_t*)ZL_Input_ptr(resIn),
+                        n);
+                break;
+            case 4:
+                lbd_dec_consec3_4(
+                        (uint32_t*)ZL_Output_ptr(out),
+                        (const uint32_t*)ZL_Input_ptr(resIn),
+                        n);
+                break;
+            case 8:
+                lbd_dec_consec3_8(
+                        (uint64_t*)ZL_Output_ptr(out),
+                        (const uint64_t*)ZL_Input_ptr(resIn),
+                        n);
+                break;
+        }
     } else {
         ZL_ERR_IF_NE(ZL_Input_numElts(lbIn), n - 1, corruption);
         const uint16_t* const lbPtr = (const uint16_t*)ZL_Input_ptr(lbIn);
