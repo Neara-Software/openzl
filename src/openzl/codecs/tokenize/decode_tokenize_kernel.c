@@ -6,6 +6,7 @@
 
 #include "openzl/codecs/common/copy.h"
 #include "openzl/common/assertion.h"
+#include "openzl/shared/portability.h"
 
 ZL_FORCE_INLINE uint64_t
 readIndexAt(void const* indices, size_t i, size_t idxWidth)
@@ -32,6 +33,75 @@ ZL_FORCE_INLINE bool tokenizeValidateIndicesImpl(
         size_t nbElts,
         size_t idxWidth)
 {
+    if (alphabetSize == 0) {
+        return nbElts == 0;
+    }
+    if (idxWidth == 1) {
+        if (alphabetSize >= 256u) {
+            return true;
+        }
+        uint8_t const* const p = (uint8_t const*)indices;
+        uint8_t const maxOk    = (uint8_t)(alphabetSize - 1u);
+        size_t i               = 0;
+#if ZL_HAS_AVX2
+        __m256i const lim = _mm256_set1_epi8((char)maxOk);
+        for (; i + 32u <= nbElts; i += 32u) {
+            __m256i const v    = _mm256_loadu_si256((const __m256i_u*)(p + i));
+            __m256i const diff = _mm256_subs_epu8(v, lim);
+            if (ZL_UNLIKELY(!_mm256_testz_si256(diff, diff))) {
+                return false;
+            }
+        }
+#elif ZL_HAS_WASM_SIMD128
+        v128_t const lim = wasm_u8x16_splat(maxOk);
+        for (; i + 16u <= nbElts; i += 16u) {
+            v128_t const v   = wasm_v128_load(p + i);
+            v128_t const bad = wasm_u8x16_gt(v, lim);
+            if (ZL_UNLIKELY(wasm_v128_any_true(bad))) {
+                return false;
+            }
+        }
+#endif
+        for (; i < nbElts; ++i) {
+            if (ZL_UNLIKELY(p[i] > maxOk)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if (idxWidth == 2) {
+        if (alphabetSize >= 65536u) {
+            return true;
+        }
+        uint16_t const* const p = (uint16_t const*)indices;
+        uint16_t const maxOk    = (uint16_t)(alphabetSize - 1u);
+        size_t i                = 0;
+#if ZL_HAS_AVX2
+        __m256i const lim = _mm256_set1_epi16((short)maxOk);
+        for (; i + 16u <= nbElts; i += 16u) {
+            __m256i const v    = _mm256_loadu_si256((const __m256i_u*)(p + i));
+            __m256i const diff = _mm256_subs_epu16(v, lim);
+            if (ZL_UNLIKELY(!_mm256_testz_si256(diff, diff))) {
+                return false;
+            }
+        }
+#elif ZL_HAS_WASM_SIMD128
+        v128_t const lim = wasm_u16x8_splat(maxOk);
+        for (; i + 8u <= nbElts; i += 8u) {
+            v128_t const v   = wasm_v128_load(p + i);
+            v128_t const bad = wasm_u16x8_gt(v, lim);
+            if (ZL_UNLIKELY(wasm_v128_any_true(bad))) {
+                return false;
+            }
+        }
+#endif
+        for (; i < nbElts; ++i) {
+            if (ZL_UNLIKELY(p[i] > maxOk)) {
+                return false;
+            }
+        }
+        return true;
+    }
     bool bad = false;
     for (size_t i = 0; i < nbElts; ++i) {
         bad |= readIndexAt(indices, i, idxWidth) >= alphabetSize;
@@ -94,13 +164,56 @@ ZL_FORCE_INLINE bool tokenizeDecodeEltWidthIdxWidth(
         size_t eltWidth,
         size_t idxWidth)
 {
+    ZL_ASSERT_NE(alphabetSize, 0, "Already validated");
+    if (idxWidth == 1 && eltWidth <= 8) {
+        uint8_t padded[256 * 8];
+        void const* alphaPtr = alphabet;
+        if (alphabetSize < 256u) {
+            memcpy(padded, alphabet, alphabetSize * eltWidth);
+            for (size_t a = alphabetSize; a < 256u; ++a) {
+                memcpy(padded + a * eltWidth, alphabet, eltWidth);
+            }
+            alphaPtr = padded;
+        }
+        uint8_t const* const idx8 = (uint8_t const*)indices;
+        size_t i                  = 0;
+        for (; i + 8u <= nbElts; i += 8u) {
+            writeSymbolAt(dst, i + 0u, alphaPtr, idx8[i + 0u], eltWidth);
+            writeSymbolAt(dst, i + 1u, alphaPtr, idx8[i + 1u], eltWidth);
+            writeSymbolAt(dst, i + 2u, alphaPtr, idx8[i + 2u], eltWidth);
+            writeSymbolAt(dst, i + 3u, alphaPtr, idx8[i + 3u], eltWidth);
+            writeSymbolAt(dst, i + 4u, alphaPtr, idx8[i + 4u], eltWidth);
+            writeSymbolAt(dst, i + 5u, alphaPtr, idx8[i + 5u], eltWidth);
+            writeSymbolAt(dst, i + 6u, alphaPtr, idx8[i + 6u], eltWidth);
+            writeSymbolAt(dst, i + 7u, alphaPtr, idx8[i + 7u], eltWidth);
+        }
+        for (; i < nbElts; ++i) {
+            writeSymbolAt(dst, i, alphaPtr, idx8[i], eltWidth);
+        }
+        return true;
+    }
+    if (idxWidth == 2 && eltWidth <= 8
+        && ZL_LIKELY(tokenizeValidateIndicesImpl(alphabetSize, indices, nbElts, 2))) {
+        uint16_t const* const idx16 = (uint16_t const*)indices;
+        size_t i                    = 0;
+        for (; i + 8u <= nbElts; i += 8u) {
+            writeSymbolAt(dst, i + 0u, alphabet, idx16[i + 0u], eltWidth);
+            writeSymbolAt(dst, i + 1u, alphabet, idx16[i + 1u], eltWidth);
+            writeSymbolAt(dst, i + 2u, alphabet, idx16[i + 2u], eltWidth);
+            writeSymbolAt(dst, i + 3u, alphabet, idx16[i + 3u], eltWidth);
+            writeSymbolAt(dst, i + 4u, alphabet, idx16[i + 4u], eltWidth);
+            writeSymbolAt(dst, i + 5u, alphabet, idx16[i + 5u], eltWidth);
+            writeSymbolAt(dst, i + 6u, alphabet, idx16[i + 6u], eltWidth);
+            writeSymbolAt(dst, i + 7u, alphabet, idx16[i + 7u], eltWidth);
+        }
+        for (; i < nbElts; ++i) {
+            writeSymbolAt(dst, i, alphabet, idx16[i], eltWidth);
+        }
+        return true;
+    }
     for (size_t i = 0; i < nbElts; ++i) {
         uint64_t index = readIndexAt(indices, i, idxWidth);
-        // For speed don't return an error if an out-of-bounds index is
-        // detected, simply replace it with the 0 symbol. We've already handled
-        // the case where alphabetSize == 0.
-        ZL_ASSERT_NE(alphabetSize, 0, "Already validated");
-        index = ZL_UNLIKELY(index >= alphabetSize) ? 0 : index;
+        index          = ZL_UNLIKELY(index >= alphabetSize) ? 0 : index;
         writeSymbolAt(dst, i, alphabet, index, eltWidth);
     }
     return true;

@@ -9,6 +9,7 @@
 #include "openzl/compress/enc_interface.h"
 #include "openzl/compress/private_nodes.h"
 #include "openzl/shared/bits.h"
+#include "openzl/shared/mem.h"
 #include "openzl/shared/pdqsort.h"
 #include "openzl/zl_ctransform.h"
 #include "openzl/zl_data.h"
@@ -223,96 +224,133 @@ ZL_FORCE_INLINE ZL_Report tokenizeImpl(
         return tokenizeImpl(eictx, in, alphabet, sort, eltWidth);             \
     }
 
-GEN_TOKENIZE(2)
 GEN_TOKENIZE(4)
 GEN_TOKENIZE(8)
 
-#include "openzl/codecs/tokenize/encode_tokenize2to1_kernel.h" // TOK2_*
-
-// tokenize2_shell() :
-// route between the specialized TOK2_* implementation
-// and the generic tokenize2 implementation
-// if conditions are right
-// i.e. mainly alphabetSize <= 256.
 static ZL_Report tokenize2_shell(
         ZL_Encoder* eictx,
         ZL_Input const* in,
-        Map8* alphabet,
         bool sort)
 {
     ZL_RESULT_DECLARE_SCOPE_REPORT(eictx);
     ZL_ASSERT_NN(in);
     ZL_ASSERT_EQ(ZL_Input_eltWidth(in), 2);
 
-    if (!sort || ZL_Input_type(in) == ZL_Type_struct) {
-        /* Currently, !sort actually means
-         * "dictionary is generated using input occurrence order",
-         * and not "no particular order".
-         * Therefore, don't use TOK2_*, which employs native numeric order.
-         * In the case of ZL_Type_struct, `sort` actually means
-         * alphabetical order,
-         * which is different from the order produced by TOK2_fsf_* variant.
-         * Reverting to generic tokenize2() for these cases.
-         * Note : we probably need a better defined approach to "dictionary
-         * order". In particular, we should spell out "input occurrence
-         * order" more explicitly, and eventually create a separate "no
-         * particular order" category.
-         */
-        return tokenize2(eictx, in, alphabet, sort);
+    const uint8_t* const srcBytes = (const uint8_t*)ZL_Input_ptr(in);
+    size_t const nbSymbols        = ZL_Input_numElts(in);
+
+    if (nbSymbols == 0) {
+        ZL_Output* const alphabetStream =
+                ZL_Encoder_createTypedStream(eictx, 0, 0, 2);
+        ZL_ERR_IF_NULL(alphabetStream, allocation);
+        ZL_Output* const indexStream =
+                ZL_Encoder_createTypedStream(eictx, 1, 0, 1);
+        ZL_ERR_IF_NULL(indexStream, allocation);
+        ZL_ERR_IF_ERR(ZL_Output_commit(alphabetStream, 0));
+        ZL_ERR_IF_ERR(ZL_Output_commit(indexStream, 0));
+        return ZL_returnSuccess();
     }
 
-    /* Only case allowed : numeric input, numeric order */
-    ZL_ASSERT_EQ(ZL_Input_type(in), ZL_Type_numeric);
+    uint64_t* const bitmap = (uint64_t*)ZL_Encoder_getScratchSpace(
+            eictx, 1024u * sizeof(uint64_t));
+    uint16_t* const valToIdx = (uint16_t*)ZL_Encoder_getScratchSpace(
+            eictx, 65536u * sizeof(uint16_t));
+    ZL_ERR_IF(bitmap == NULL || valToIdx == NULL, allocation);
+    memset(bitmap, 0, 1024u * sizeof(uint64_t));
 
-    const void* const srcPtr = ZL_Input_ptr(in);
-    size_t const nbSymbols   = ZL_Input_numElts(in);
+    if (sort) {
+        ZL_ASSERT_EQ(ZL_Input_type(in), ZL_Type_numeric);
+        const uint16_t* const src = (const uint16_t*)srcBytes;
+        for (size_t i = 0; i < nbSymbols; i++) {
+            uint16_t const v = src[i];
+            bitmap[v >> 6] |= 1ULL << (v & 63u);
+        }
+        size_t alphabetSize = 0;
+        for (size_t w = 0; w < 1024u; w++) {
+            alphabetSize += (size_t)ZL_popcount64(bitmap[w]);
+        }
 
-    if (nbSymbols < 5000) {
-        /* TOK2_* is about x5 faster than tokenize2(),
-         * but it features a fixed processing overhead
-         * which becomes dominant for small inputs.
-         * The 5000 cutoff value is an heuristic, discovered through
-         * benchmark. In the future, this cutoff value could be updated with
-         * optimizations.
-         */
-        return tokenize2(eictx, in, alphabet, sort);
+        ZL_Output* const alphabetStream =
+                ZL_Encoder_createTypedStream(eictx, 0, alphabetSize, 2);
+        ZL_ERR_IF_NULL(alphabetStream, allocation);
+        uint16_t* const dstAlpha = (uint16_t*)ZL_Output_ptr(alphabetStream);
+
+        size_t idx = 0;
+        for (size_t w = 0; w < 1024u; w++) {
+            uint64_t word       = bitmap[w];
+            uint16_t const base = (uint16_t)(w << 6);
+            while (word != 0) {
+                uint16_t const sym =
+                        (uint16_t)(base | (unsigned)ZL_ctz64(word));
+                dstAlpha[idx] = sym;
+                valToIdx[sym] = (uint16_t)idx;
+                idx++;
+                word &= word - 1ULL;
+            }
+        }
+
+        size_t const idxWidth = (alphabetSize <= 256u) ? 1u : 2u;
+        ZL_Output* const indexStream =
+                ZL_Encoder_createTypedStream(eictx, 1, nbSymbols, idxWidth);
+        ZL_ERR_IF_NULL(indexStream, allocation);
+
+        if (idxWidth == 1u) {
+            uint8_t* const dstIdx = (uint8_t*)ZL_Output_ptr(indexStream);
+            for (size_t i = 0; i < nbSymbols; i++) {
+                dstIdx[i] = (uint8_t)valToIdx[src[i]];
+            }
+        } else {
+            uint16_t* const dstIdx = (uint16_t*)ZL_Output_ptr(indexStream);
+            for (size_t i = 0; i < nbSymbols; i++) {
+                dstIdx[i] = valToIdx[src[i]];
+            }
+        }
+
+        ZL_ERR_IF_ERR(ZL_Output_commit(alphabetStream, alphabetSize));
+        ZL_ERR_IF_ERR(ZL_Output_commit(indexStream, nbSymbols));
+        return ZL_returnSuccess();
+    } else {
+        size_t const maxCap = nbSymbols < 65536u ? nbSymbols : 65536u;
+        ZL_Output* const alphabetStream =
+                ZL_Encoder_createTypedStream(eictx, 0, maxCap, 2);
+        ZL_ERR_IF_NULL(alphabetStream, allocation);
+        uint8_t* const dstAlphaBytes = (uint8_t*)ZL_Output_ptr(alphabetStream);
+
+        size_t alphabetSize = 0;
+        for (size_t i = 0; i < nbSymbols; i++) {
+            uint16_t const v    = ZL_read16(srcBytes + 2u * i);
+            uint64_t const mask = 1ULL << (v & 63u);
+            uint64_t const word = bitmap[v >> 6];
+            if (!(word & mask)) {
+                bitmap[v >> 6] = word | mask;
+                valToIdx[v]    = (uint16_t)alphabetSize;
+                ZL_write16(dstAlphaBytes + 2u * alphabetSize, v);
+                alphabetSize++;
+            }
+        }
+
+        size_t const idxWidth = (alphabetSize <= 256u) ? 1u : 2u;
+        ZL_Output* const indexStream =
+                ZL_Encoder_createTypedStream(eictx, 1, nbSymbols, idxWidth);
+        ZL_ERR_IF_NULL(indexStream, allocation);
+
+        if (idxWidth == 1u) {
+            uint8_t* const dstIdx = (uint8_t*)ZL_Output_ptr(indexStream);
+            for (size_t i = 0; i < nbSymbols; i++) {
+                dstIdx[i] = (uint8_t)valToIdx[ZL_read16(srcBytes + 2u * i)];
+            }
+        } else {
+            uint8_t* const dstIdxBytes = (uint8_t*)ZL_Output_ptr(indexStream);
+            for (size_t i = 0; i < nbSymbols; i++) {
+                uint16_t const idx = valToIdx[ZL_read16(srcBytes + 2u * i)];
+                ZL_write16(dstIdxBytes + 2u * i, idx);
+            }
+        }
+
+        ZL_ERR_IF_ERR(ZL_Output_commit(alphabetStream, alphabetSize));
+        ZL_ERR_IF_ERR(ZL_Output_commit(indexStream, nbSymbols));
+        return ZL_returnSuccess();
     }
-
-    void* const workspace =
-            ZL_Encoder_getScratchSpace(eictx, TOK2_CARDINALITY_MAX);
-    ZL_ERR_IF_NULL(workspace, allocation);
-
-    size_t const alphabetSize =
-            TOK2_numSort_cardinality(workspace, srcPtr, nbSymbols);
-
-    if (alphabetSize > 256) {
-        /* fast variant TOK2_numSort_encode_into1()
-         * only works for small alphabets <= 256 */
-        return tokenize2(eictx, in, alphabet, sort);
-    }
-
-    ZL_DLOG(SEQ, "tokenize2_shell: alphabetSize: %zu", alphabetSize);
-    ZL_Output* const alphabetStream =
-            ZL_Encoder_createTypedStream(eictx, 0, alphabetSize, 2);
-    ZL_ERR_IF_NULL(alphabetStream, allocation);
-
-    ZL_Output* const indexStream =
-            ZL_Encoder_createTypedStream(eictx, 1, nbSymbols, 1);
-    ZL_ERR_IF_NULL(indexStream, allocation);
-
-    TOK2_numSort_encode_into1(
-            ZL_Output_ptr(indexStream),
-            nbSymbols,
-            ZL_Output_ptr(alphabetStream),
-            alphabetSize,
-            srcPtr,
-            nbSymbols,
-            workspace);
-
-    ZL_ERR_IF_ERR(ZL_Output_commit(alphabetStream, alphabetSize));
-    ZL_ERR_IF_ERR(ZL_Output_commit(indexStream, nbSymbols));
-
-    return ZL_returnSuccess();
 }
 
 ZL_FORCE_INLINE ZL_Report
@@ -372,40 +410,43 @@ tokenize1(ZL_Encoder* eictx, ZL_Input const* in, bool sort)
 }
 
 static ZL_Report
-tokenize(ZL_Encoder* eictx, Map8* alphabet, const ZL_Input* in, bool sort)
-{
-    ZL_RESULT_DECLARE_SCOPE_REPORT(eictx);
-    ZL_ASSERT_NN(in);
-    switch (ZL_Input_eltWidth(in)) {
-        case 1:
-            return tokenize1(eictx, in, sort);
-        case 2:
-            return tokenize2_shell(eictx, in, alphabet, sort);
-        case 4:
-            return tokenize4(eictx, in, alphabet, sort);
-        case 8:
-            return tokenize8(eictx, in, alphabet, sort);
-        default:
-            ZL_ERR(temporaryLibraryLimitation,
-                   "Elt width %u not supported yet! But decoder the decoder "
-                   "supports all width, so you only need to extend the encoder",
-                   (unsigned)ZL_Input_eltWidth(in));
-    }
-}
-
-static ZL_Report
 EI_tokenizeImpl(ZL_Encoder* eictx, const ZL_Input* in, bool sort)
 {
     ZL_RESULT_DECLARE_SCOPE_REPORT(eictx);
+    ZL_ASSERT_NN(in);
 
     ZL_ERR_IF(
             ZL_Input_type(in) != ZL_Type_numeric && sort,
             graph_invalid,
             "sort only works on numeric inputs");
 
-    size_t const nbElts    = ZL_Input_numElts(in);
-    Map8 alphabet          = Map8_create((uint32_t)nbElts + 1);
-    ZL_Report const report = tokenize(eictx, &alphabet, in, sort);
+    size_t const eltWidth = ZL_Input_eltWidth(in);
+    if (eltWidth == 1) {
+        ZL_ERR_IF_ERR(tokenize1(eictx, in, sort));
+        return ZL_returnValue(2);
+    }
+    if (eltWidth == 2) {
+        ZL_ERR_IF_ERR(tokenize2_shell(eictx, in, sort));
+        return ZL_returnValue(2);
+    }
+
+    size_t const nbElts = ZL_Input_numElts(in);
+    Map8 alphabet       = Map8_create((uint32_t)nbElts + 1);
+    ZL_Report report;
+    switch (eltWidth) {
+        case 4:
+            report = tokenize4(eictx, in, &alphabet, sort);
+            break;
+        case 8:
+            report = tokenize8(eictx, in, &alphabet, sort);
+            break;
+        default:
+            Map8_destroy(&alphabet);
+            ZL_ERR(temporaryLibraryLimitation,
+                   "Elt width %u not supported yet! But decoder the decoder "
+                   "supports all width, so you only need to extend the encoder",
+                   (unsigned)eltWidth);
+    }
     Map8_destroy(&alphabet);
     ZL_ERR_IF_ERR(report);
 
