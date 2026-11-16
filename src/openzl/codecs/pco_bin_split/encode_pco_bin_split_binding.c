@@ -999,6 +999,34 @@ PBS_DEFINE_RADIX_SORT(8, uint64_t, 8)
                 }                                                                  \
             }                                                                      \
         } else {                                                                   \
+            if (maxOb <= 14u && packedBytes >= 8u) {                               \
+                uint8_t* const dstSafe = dstEnd - 8u;                              \
+                while (i + 4u <= n && dst <= dstSafe) {                            \
+                    unsigned const b0  = binIds[i];                                \
+                    unsigned const b1  = binIds[i + 1u];                           \
+                    unsigned const b2  = binIds[i + 2u];                           \
+                    unsigned const b3  = binIds[i + 3u];                           \
+                    unsigned const ob0 = offsetBits[b0];                           \
+                    unsigned const ob1 = offsetBits[b1];                           \
+                    unsigned const ob2 = offsetBits[b2];                           \
+                    unsigned const ob3 = offsetBits[b3];                           \
+                    uint64_t const o0  = (uint64_t)(latents[i] - lowers[b0]);      \
+                    uint64_t const o1  = (uint64_t)(latents[i + 1u] - lowers[b1]); \
+                    uint64_t const o2  = (uint64_t)(latents[i + 2u] - lowers[b2]); \
+                    uint64_t const o3  = (uint64_t)(latents[i + 3u] - lowers[b3]); \
+                    unsigned const s1  = bitcnt + ob0;                             \
+                    unsigned const s2  = s1 + ob1;                                 \
+                    unsigned const s3  = s2 + ob2;                                 \
+                    bitbuf |= (o0 << bitcnt) | (o1 << s1) | (o2 << s2) | (o3 << s3); \
+                    bitcnt = s3 + ob3;                                             \
+                    ZL_writeLE64(dst, bitbuf);                                     \
+                    unsigned const adv = bitcnt >> 3;                              \
+                    dst += adv;                                                    \
+                    bitbuf >>= (adv << 3);                                         \
+                    bitcnt &= 7u;                                                  \
+                    i += 4u;                                                       \
+                }                                                                  \
+            }                                                                      \
             if (maxOb <= 56u && packedBytes >= 8u) {                               \
                 uint8_t* const dstSafe = dstEnd - 8u;                              \
                 while (i < n && dst <= dstSafe) {                                  \
@@ -1431,7 +1459,20 @@ ZL_Report EI_pco_bin_split(
                     totalBits += (uint64_t)counts1[v]
                             * (uint64_t)offsetBits[valToBin[v]];
                 }
-                for (size_t i = 0; i < n; i++) {
+                size_t i = 0;
+                for (; i + 8u <= n; i += 8u) {
+                    uint64_t const pack =
+                            (uint64_t)valToBin[latents1[i]]
+                            | ((uint64_t)valToBin[latents1[i + 1u]] << 8)
+                            | ((uint64_t)valToBin[latents1[i + 2u]] << 16)
+                            | ((uint64_t)valToBin[latents1[i + 3u]] << 24)
+                            | ((uint64_t)valToBin[latents1[i + 4u]] << 32)
+                            | ((uint64_t)valToBin[latents1[i + 5u]] << 40)
+                            | ((uint64_t)valToBin[latents1[i + 6u]] << 48)
+                            | ((uint64_t)valToBin[latents1[i + 7u]] << 56);
+                    ZL_writeLE64(binDst + i, pack);
+                }
+                for (; i < n; i++) {
                     binDst[i] = valToBin[latents1[i]];
                 }
                 break;
