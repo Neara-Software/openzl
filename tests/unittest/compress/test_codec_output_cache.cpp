@@ -9,7 +9,11 @@
 
 #include <gtest/gtest.h>
 
+#include "openzl/codecs/entropy/encode_entropy_binding.h"
 #include "openzl/codecs/zl_sparse_num.h"
+#define HUF_STATIC_LINKING_ONLY
+#include "openzl/fse/huf.h"
+#include "openzl/shared/histogram.h"
 #include "openzl/common/allocation.h"
 #include "openzl/common/stream.h"
 #include "openzl/compress/cctx.h"
@@ -815,6 +819,115 @@ TEST(CodecOutputCacheIntegrationTest, MultiInputCodecBypassesCache)
     ZL_CCtx_free(cctx);
     ZL_CodecOutputCache_free(cache);
     ZL_Compressor_free(compressor);
+}
+
+TEST_F(CodecOutputCacheTest, EntropyRefParamsCacheSameTableAndDistinguishChanges)
+{
+    Cache cache;
+    const uint8_t bytes[64] = {
+        0, 0, 0, 0, 1, 1, 2, 3, 0, 0, 1, 2, 0, 1, 0, 4,
+        0, 0, 1, 1, 0, 2, 0, 0, 1, 3, 0, 0, 1, 0, 2, 0,
+        0, 0, 0, 1, 1, 2, 0, 0, 0, 1, 0, 3, 0, 0, 1, 0,
+        0, 1, 2, 0, 0, 0, 1, 0, 0, 2, 0, 1, 0, 0, 0, 1,
+    };
+    const Stream* const input = makeInput(bytes, sizeof(bytes));
+    ASSERT_NE(input, nullptr);
+
+    ZL_Histogram8 histA;
+    ZL_Histogram8 histB;
+    ZL_Histogram_init(&histA.base, 255);
+    ZL_Histogram_init(&histB.base, 255);
+    uint8_t bytesB[sizeof(bytes)];
+    for (size_t i = 0; i < sizeof(bytes); ++i) {
+        bytesB[i] = static_cast<uint8_t>(4 - bytes[i]);
+    }
+    ZL_Histogram_build(&histA.base, bytes, sizeof(bytes), 1);
+    ZL_Histogram_build(&histB.base, bytesB, sizeof(bytesB), 1);
+
+    HUF_CREATE_STATIC_CTABLE(ctableA, 255);
+    HUF_CREATE_STATIC_CTABLE(ctableB, 255);
+    std::vector<uint8_t> wksp(HUF_CTABLE_WORKSPACE_SIZE);
+    ASSERT_FALSE(HUF_isError(HUF_buildCTable_wksp(
+            ctableA,
+            histA.base.count,
+            histA.base.maxSymbol,
+            0,
+            wksp.data(),
+            wksp.size())));
+    ASSERT_FALSE(HUF_isError(HUF_buildCTable_wksp(
+            ctableB,
+            histB.base.count,
+            histB.base.maxSymbol,
+            0,
+            wksp.data(),
+            wksp.size())));
+
+    const auto checkRefParams = [&](ZL_NodeID node,
+                                    const ZL_RefParam* sameRefs,
+                                    const ZL_RefParam* diffRefs,
+                                    size_t nbRefs) {
+        const ZL_LocalParams sameLp = { .refParams = { sameRefs, nbRefs } };
+        const ZL_LocalParams diffLp = { .refParams = { diffRefs, nbRefs } };
+        CodecCache_Lookup* const miss =
+                lookupWithParams(cache.get(), node, input, &sameLp);
+        ASSERT_NE(miss, nullptr);
+        EXPECT_EQ(CodecCache_Lookup_getResult(miss), nullptr);
+        const CodecCache_Output out   = makeOutput("encoded", 7);
+        const CodecCache_Result res   = makeResult(&out, 1);
+        ASSERT_EQ(
+                CodecCache_store(miss, &res),
+                CodecCache_InsertResult_inserted);
+
+        CodecCache_Lookup* const hit =
+                lookupWithParams(cache.get(), node, input, &sameLp);
+        ASSERT_NE(hit, nullptr);
+        EXPECT_NE(CodecCache_Lookup_getResult(hit), nullptr);
+
+        CodecCache_Lookup* const diffLookup =
+                lookupWithParams(cache.get(), node, input, &diffLp);
+        ASSERT_NE(diffLookup, nullptr);
+        EXPECT_EQ(CodecCache_Lookup_getResult(diffLookup), nullptr);
+    };
+
+    const ZL_RefParam fseSame[] = {
+        { ENTROPY_HISTORAM_PID, &histA.base, 0 },
+    };
+    const ZL_RefParam fseDiff[] = {
+        { ENTROPY_HISTORAM_PID, &histB.base, 0 },
+    };
+    checkRefParams(
+            ZL_NodeID{ ZL_PrivateStandardNodeID_fse_v2 }, fseSame, fseDiff, 1);
+
+    const ZL_RefParam hufSame[] = {
+        { ENTROPY_HISTORAM_PID, &histA.base, 0 },
+        { ENTROPY_HUF_CTABLE_PID, ctableA, 0 },
+    };
+    const ZL_RefParam hufDiff[] = {
+        { ENTROPY_HISTORAM_PID, &histA.base, 0 },
+        { ENTROPY_HUF_CTABLE_PID, ctableB, 0 },
+    };
+    checkRefParams(
+            ZL_NodeID{ ZL_PrivateStandardNodeID_huffman_v2 },
+            hufSame,
+            hufDiff,
+            2);
+    checkRefParams(
+            ZL_NodeID{ ZL_PrivateStandardNodeID_pivco_huffman },
+            hufSame,
+            hufDiff,
+            2);
+
+    const int unknownPayload        = 42;
+    const ZL_RefParam unknownRef    = { 999, &unknownPayload, 0 };
+    const ZL_LocalParams unknownLp  = { .refParams = { &unknownRef, 1 } };
+    EXPECT_EQ(
+            lookupWithParams(
+                    cache.get(),
+                    ZL_NodeID{ ZL_PrivateStandardNodeID_fse_v2 },
+                    input,
+                    &unknownLp),
+            nullptr);
+    EXPECT_EQ(CodecCache_getStats(cache.get()).refParamSkips, 1);
 }
 
 } // namespace

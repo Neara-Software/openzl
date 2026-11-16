@@ -15,6 +15,10 @@
 #include "openzl/compress/private_nodes.h"
 #include "openzl/compress/selectors/selector_brute_force.h"
 #include "openzl/codecs/zl_brute_force_selector.h"
+#include "openzl/codecs/zl_delta.h"
+#include "openzl/codecs/zl_entropy.h"
+#include "openzl/codecs/zl_pco_bin_split.h"
+#include "openzl/codecs/zl_tokenize.h"
 #include "openzl/zl_codec_output_cache.h"
 #include "openzl/zl_compress.h"
 #include "openzl/zl_segmenter.h"
@@ -793,6 +797,163 @@ TEST_F(BruteForceSelectorTest, testString)
 
     roundTripWithGid(data, gid, CacheHitCheck::Skipped);
     ZL_TypedRef_free(data);
+}
+
+TEST_F(BruteForceSelectorTest, testNestedSharedPipelinesAndEntropyCacheBitExact)
+{
+    const auto tokA = ZL_Compressor_parameterizeTokenizeNode(
+            cgraph_, ZL_Type_numeric, true);
+    const auto tokB = ZL_Compressor_parameterizeTokenizeNode(
+            cgraph_, ZL_Type_numeric, true);
+    ASSERT_FALSE(ZL_RES_isError(tokA));
+    ASSERT_FALSE(ZL_RES_isError(tokB));
+
+    const ZL_GraphID innerEntropySuccs[] = {
+        ZL_GRAPH_FSE,
+        ZL_GRAPH_HUFFMAN,
+        ZL_GRAPH_ENTROPY,
+        ZL_GRAPH_BITPACK,
+    };
+    const ZL_GraphID innerSelector = buildBruteForceGraph(
+            cgraph_,
+            innerEntropySuccs,
+            sizeof(innerEntropySuccs) / sizeof(innerEntropySuccs[0]));
+    ASSERT_TRUE(ZL_GraphID_isValid(innerSelector));
+
+    const ZL_GraphID pcoSuccs1[] = { ZL_GRAPH_FSE, ZL_GRAPH_STORE };
+    const ZL_GraphID pcoSuccs2[] = { ZL_GRAPH_HUFFMAN, ZL_GRAPH_ZSTD };
+    const ZL_GraphID pcoBranch1  = ZL_Compressor_registerStaticGraph_fromNode(
+            cgraph_, ZL_NODE_PCO_BIN_SPLIT, pcoSuccs1, 2);
+    const ZL_GraphID pcoBranch2  = ZL_Compressor_registerStaticGraph_fromNode(
+            cgraph_, ZL_NODE_PCO_BIN_SPLIT, pcoSuccs2, 2);
+
+    const ZL_GraphID deltaInner  = ZL_Compressor_registerStaticGraph_fromNode1o(
+            cgraph_, ZL_NODE_DELTA_INT, innerSelector);
+    const ZL_GraphID tokSuccs1[] = { deltaInner, innerSelector };
+    const ZL_GraphID tokSuccs2[] = { pcoBranch1, innerSelector };
+    const ZL_GraphID tokBranch1  = ZL_Compressor_registerStaticGraph_fromNode(
+            cgraph_, ZL_RES_value(tokA), tokSuccs1, 2);
+    const ZL_GraphID tokBranch2  = ZL_Compressor_registerStaticGraph_fromNode(
+            cgraph_, ZL_RES_value(tokB), tokSuccs2, 2);
+
+    const ZL_GraphID outerSuccs[] = {
+        tokBranch1,
+        tokBranch2,
+        pcoBranch1,
+        pcoBranch2,
+        deltaInner,
+    };
+    const ZL_GraphID outerSelector = buildBruteForceGraph(
+            cgraph_,
+            outerSuccs,
+            sizeof(outerSuccs) / sizeof(outerSuccs[0]));
+    ASSERT_TRUE(ZL_GraphID_isValid(outerSelector));
+
+    const ZL_IntParam narrowParam[] = {
+        { ZL_BRUTE_FORCE_NARROW_PARAM_BASE, 2 },
+    };
+    const ZL_LocalParams narrowLp      = { .intParams = { narrowParam, 1 } };
+    const ZL_GraphParameters narrowCfg = {
+        .customGraphs   = outerSuccs,
+        .nbCustomGraphs = sizeof(outerSuccs) / sizeof(outerSuccs[0]),
+        .localParams    = &narrowLp,
+    };
+    const auto narrowedSelector = ZL_Compressor_parameterizeGraph(
+            cgraph_, ZL_GRAPH_BRUTE_FORCE, &narrowCfg);
+    ASSERT_FALSE(ZL_RES_isError(narrowedSelector));
+
+    std::vector<uint32_t> skewed(8192);
+    std::vector<uint32_t> monotone(8192);
+    std::vector<uint32_t> noise(4096);
+    std::mt19937 rng(12345);
+    for (size_t i = 0; i < skewed.size(); ++i) {
+        skewed[i]   = static_cast<uint32_t>((i * 7) % 37);
+        monotone[i] = static_cast<uint32_t>(100000 + i * 3 + (i % 5));
+    }
+    for (size_t i = 0; i < noise.size(); ++i) {
+        noise[i] = rng();
+    }
+
+    const auto compressSequence = [&](ZL_GraphID startGraph,
+                                      size_t cacheBudget,
+                                      const std::vector<const std::vector<uint32_t>*>& inputs,
+                                      std::vector<CodecCache_Stats>* statsOut) {
+        std::vector<std::string> frames;
+        ZL_CCtx* const cctx = ZL_CCtx_create();
+        EXPECT_NE(cctx, nullptr);
+        CCTX_setTryGraphCacheStatsEnabled(cctx, statsOut != nullptr);
+        ZL_REQUIRE_SUCCESS(ZL_CCtx_setTryGraphCacheBudget(cctx, cacheBudget));
+        ZL_REQUIRE_SUCCESS(ZL_CCtx_setParameter(
+                cctx, ZL_CParam_formatVersion, ZL_MAX_FORMAT_VERSION));
+        ZL_REQUIRE_SUCCESS(ZL_CCtx_setParameter(
+                cctx, ZL_CParam_stickyParameters, 1));
+        ZL_REQUIRE_SUCCESS(
+                ZL_Compressor_selectStartingGraphID(cgraph_, startGraph));
+        ZL_REQUIRE_SUCCESS(ZL_CCtx_refCompressor(cctx, cgraph_));
+        for (const auto* vec : inputs) {
+            const size_t rawBytes = vec->size() * sizeof(uint32_t);
+            ZL_TypedRef* const ref = ZL_TypedRef_createNumeric(
+                    vec->data(), sizeof(uint32_t), vec->size());
+            std::string frame(ZL_compressBound(rawBytes), '\0');
+            const ZL_Report r = ZL_CCtx_compressTypedRef(
+                    cctx, frame.data(), frame.size(), ref);
+            ZL_REQUIRE_SUCCESS(r);
+            frame.resize(ZL_validResult(r));
+            frames.push_back(std::move(frame));
+            if (statsOut != nullptr) {
+                CodecCache_Stats st{};
+                CCTX_getLastChunkTryGraphCacheStats(&st, cctx);
+                statsOut->push_back(st);
+            }
+            ZL_TypedRef_free(ref);
+        }
+        ZL_CCtx_free(cctx);
+        return frames;
+    };
+
+    const std::vector<const std::vector<uint32_t>*> cases = {
+        &skewed, &monotone, &noise,
+    };
+    std::vector<CodecCache_Stats> cachedStats;
+    const auto uncachedFrames =
+            compressSequence(outerSelector, 0, cases, nullptr);
+    const auto cachedFrames = compressSequence(
+            outerSelector,
+            CodecCache_getDefaultMaxBytes(),
+            cases,
+            &cachedStats);
+    ASSERT_EQ(uncachedFrames.size(), cachedFrames.size());
+    for (size_t i = 0; i < cases.size(); ++i) {
+        EXPECT_EQ(cachedFrames[i], uncachedFrames[i]) << "case " << i;
+        EXPECT_GT(cachedStats[i].hits, 0) << "case " << i;
+        EXPECT_EQ(cachedStats[i].refParamSkips, 0) << "case " << i;
+
+        ZL_TypedBuffer* const regen = ZL_TypedBuffer_create();
+        ASSERT_NE(regen, nullptr);
+        EXPECT_SUCCESS(ZL_DCtx_decompressTBuffer(
+                dctx_,
+                regen,
+                cachedFrames[i].data(),
+                cachedFrames[i].size()));
+        const size_t expectedBytes = cases[i]->size() * sizeof(uint32_t);
+        ASSERT_EQ(ZL_TypedBuffer_byteSize(regen), expectedBytes);
+        EXPECT_EQ(
+                std::memcmp(
+                        ZL_TypedBuffer_rPtr(regen),
+                        cases[i]->data(),
+                        expectedBytes),
+                0);
+        ZL_TypedBuffer_free(regen);
+    }
+
+    const auto narrowedUncached = compressSequence(
+            ZL_RES_value(narrowedSelector), 0, cases, nullptr);
+    const auto narrowedCached = compressSequence(
+            ZL_RES_value(narrowedSelector),
+            CodecCache_getDefaultMaxBytes(),
+            cases,
+            nullptr);
+    EXPECT_EQ(narrowedCached, narrowedUncached);
 }
 
 } // namespace openzl::tests

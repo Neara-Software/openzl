@@ -58,8 +58,15 @@ static ZL_Report writeFrameHeader(
             ZL_runtimeInputLimit(formatVersion),
             formatVersion_unsupported);
 
-    // Allocate array for description of inputs
-    ALLOC_MALLOC_CHECKED(InputDesc, inputDescs, numInputs);
+    // Allocate array for description of inputs (stack fast-path for <= 8 inputs)
+    InputDesc stackInputDescs[8];
+    InputDesc* heapInputDescs = NULL;
+    InputDesc* inputDescs     = stackInputDescs;
+    if (numInputs > 8) {
+        heapInputDescs = ZL_malloc(numInputs * sizeof(InputDesc));
+        ZL_ERR_IF_NULL(heapInputDescs, allocation);
+        inputDescs = heapInputDescs;
+    }
     for (size_t n = 0; n < numInputs; n++) {
         inputDescs[n].byteSize = ZL_Data_contentSize(inputs[n]);
         inputDescs[n].type     = ZL_Data_type(inputs[n]);
@@ -96,7 +103,7 @@ static ZL_Report writeFrameHeader(
     ZL_Report const r =
             EFH_writeFrameHeader(dst, dstCapacity, &fi, formatVersion);
 
-    ZL_free(inputDescs);
+    ZL_free(heapInputDescs);
     return r;
 }
 

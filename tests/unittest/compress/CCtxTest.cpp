@@ -9,7 +9,9 @@
 #include <gtest/gtest.h>
 
 #include "openzl/common/errors_internal.h"
+#include "openzl/codecs/zl_brute_force_selector.h"
 #include "openzl/compress/cctx.h"
+#include "openzl/zl_codec_output_cache.h"
 #include "openzl/openzl.hpp"
 #include "openzl/shared/portability.h"
 #include "openzl/zl_ctransform.h"
@@ -356,5 +358,71 @@ TEST_F(CCtxTest, sizeofMatchesJemalloc)
     expectSizeofMatchesJemalloc(dctxSizeof, dctxJemalloc);
 }
 #endif
+
+TEST_F(CCtxTest, cctxSizeofIncludesTryGraphCacheAndPooledTrialCCtx)
+{
+    ZL_Compressor* const rawComp = ZL_Compressor_create();
+    ASSERT_NE(rawComp, nullptr);
+    ASSERT_FALSE(ZL_isError(ZL_Compressor_setParameter(
+            rawComp, ZL_CParam_formatVersion, ZL_MAX_FORMAT_VERSION)));
+    const ZL_GraphID succs[] = {
+        ZL_GRAPH_ZSTD,
+        ZL_GRAPH_COMPRESS_GENERIC,
+    };
+    const auto bf = ZL_Compressor_buildBruteForceSelectorGraph(
+            rawComp, succs, sizeof(succs) / sizeof(succs[0]));
+    ASSERT_FALSE(ZL_RES_isError(bf));
+    ASSERT_FALSE(ZL_isError(
+            ZL_Compressor_selectStartingGraphID(rawComp, ZL_RES_value(bf))));
+
+    std::string input(64 * 1024, '\0');
+    for (size_t i = 0; i < input.size(); ++i) {
+        input[i] = static_cast<char>((i * 13) % 97);
+    }
+    std::string compressed(ZL_compressBound(input.size()), '\0');
+
+#if ZL_USE_JEMALLOC
+    const JemallocThreadMemory memory;
+    if (memory.ok()) {
+        ZL_CCtx* const warm = ZL_CCtx_create();
+        ASSERT_NE(warm, nullptr);
+        ASSERT_FALSE(ZL_isError(ZL_CCtx_refCompressor(warm, rawComp)));
+        ASSERT_FALSE(
+                ZL_isError(ZL_CCtx_setTryGraphCacheBudget(warm, 8u << 20)));
+        ASSERT_FALSE(ZL_isError(ZL_CCtx_compress(
+                warm,
+                compressed.data(),
+                compressed.size(),
+                input.data(),
+                input.size())));
+        ZL_CCtx_free(warm);
+    }
+    const uint64_t beforeCCtx = memory.ok() ? memory.retained() : 0;
+#endif
+
+    ZL_CCtx* const cctx = ZL_CCtx_create();
+    ASSERT_NE(cctx, nullptr);
+    ASSERT_FALSE(ZL_isError(ZL_CCtx_refCompressor(cctx, rawComp)));
+    const size_t beforeCompress = ZL_CCtx_sizeof(cctx);
+    ASSERT_FALSE(ZL_isError(ZL_CCtx_setTryGraphCacheBudget(cctx, 8u << 20)));
+    ASSERT_FALSE(ZL_isError(ZL_CCtx_compress(
+            cctx,
+            compressed.data(),
+            compressed.size(),
+            input.data(),
+            input.size())));
+    const size_t afterCompress = ZL_CCtx_sizeof(cctx);
+    EXPECT_GT(afterCompress, beforeCompress);
+
+#if ZL_USE_JEMALLOC
+    if (memory.ok()) {
+        const uint64_t cctxJemalloc = memory.retained() - beforeCCtx;
+        expectSizeofMatchesJemalloc(afterCompress, cctxJemalloc);
+    }
+#endif
+
+    ZL_CCtx_free(cctx);
+    ZL_Compressor_free(rawComp);
+}
 
 } // namespace openzl::tests

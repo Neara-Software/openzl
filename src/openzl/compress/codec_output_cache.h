@@ -7,10 +7,14 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "openzl/common/stream.h" // Stream_IntMetadata
+#include "openzl/common/allocation.h" // Arena
+#include "openzl/common/stream.h"     // Stream_IntMetadata
+#include "openzl/compress/gcparams.h" // GCParams
 #include "openzl/shared/portability.h"
 #include "openzl/zl_codec_output_cache.h"
+#include "openzl/zl_compressor.h"
 #include "openzl/zl_data.h"
+#include "openzl/zl_graph_api.h"
 
 ZL_BEGIN_C_DECLS
 
@@ -69,6 +73,7 @@ typedef struct {
      * replay stamps it on the reconstructed stream to avoid rehashing.
      */
     uint64_t keyHash64;
+    bool hasKeyHash64;
 } CodecCache_Output;
 
 /** Complete result of one successful codec invocation. */
@@ -246,6 +251,64 @@ const CodecCache_Result* CodecCache_Lookup_getResult(
 CodecCache_InsertResult CodecCache_store(
         const CodecCache_Lookup* lookup,
         const CodecCache_Result* result);
+
+/**
+ * Same as CodecCache_store(), and additionally writes the immutable stored or
+ * already-existing cache result into @p storedResultOut (or NULL if not stored)
+ * so callers can stamp output key hashes onto live streams immediately.
+ */
+CodecCache_InsertResult CodecCache_storeAndGetResult(
+        const CodecCache_Lookup* lookup,
+        const CodecCache_Result* result,
+        const CodecCache_Result** storedResultOut);
+
+/**
+ * Computes and stamps the stream's codec-cache key digest if not already
+ * present and if the stream is fixed-width (non-string).
+ */
+void CodecCache_ensureStreamKeyHash(
+        ZL_CodecOutputCache* cache,
+        ZL_Data* stream,
+        Arena* scratchArena);
+
+/** Opaque handle representing a pure-graph trial lookup within the current chunk. */
+typedef struct CodecCache_TryGraphLookup_s CodecCache_TryGraphLookup;
+
+/**
+ * Clears per-chunk TryGraph memoization and graph-purity caches while leaving
+ * codec output entries and statistics untouched. Accepts NULL.
+ */
+void CodecCache_resetTryGraph(ZL_CodecOutputCache* cache);
+
+/**
+ * Looks up a memoized pure-graph compressed size for the given effective
+ * context parameters, runtime graph parameters, and inputs.
+ *
+ * If an exact match exists, writes the exact compressed size into
+ * @p cachedSizeOut, sets @p hitOut to true, and returns NULL.
+ * Otherwise sets @p hitOut to false and returns a workspace-allocated lookup
+ * handle when the graph is pure and insertions are enabled, or NULL if
+ * uncacheable.
+ */
+CodecCache_TryGraphLookup* CodecCache_lookupTryGraph(
+        ZL_CodecOutputCache* cache,
+        const ZL_Compressor* cgraph,
+        ZL_GraphID graph,
+        const GCParams* effectiveGCParams,
+        const ZL_RuntimeGraphParameters* rgp,
+        const ZL_Data* const inputs[],
+        size_t nbInputs,
+        Arena* scratchArena,
+        size_t* cachedSizeOut,
+        bool* hitOut);
+
+/**
+ * Stores @p compressedSize for a completed pure-graph trial represented by
+ * @p lookup if insertions are enabled and budget permits.
+ */
+void CodecCache_storeTryGraph(
+        const CodecCache_TryGraphLookup* lookup,
+        size_t compressedSize);
 
 ZL_END_C_DECLS
 
