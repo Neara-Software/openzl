@@ -62,7 +62,8 @@ class ACEMutate {
             const auto& node = comp.asNode();
             for (size_t i = 0; i < node.successors.size(); ++i) {
                 if ((node.node.name == "zl.pco_bin_split"
-                     || node.node.name == "zl.int_mult_split")
+                     || node.node.name == "zl.int_mult_split"
+                     || node.node.name == "zl.float_mult_split")
                     && i == 1) {
                     continue;
                 }
@@ -89,7 +90,8 @@ class ACEMutate {
             successors.reserve(node.successors.size());
             for (size_t i = 0; i < node.successors.size(); ++i) {
                 if ((node.node.name == "zl.pco_bin_split"
-                     || node.node.name == "zl.int_mult_split")
+                     || node.node.name == "zl.int_mult_split"
+                     || node.node.name == "zl.float_mult_split")
                     && i == 1) {
                     successors.push_back(
                             std::make_unique<ACECompressor>(*node.successors[i]));
@@ -236,6 +238,30 @@ class ACEMutate {
                 }
                 return ACENodeCompressor(std::move(nextNode), std::move(succs));
             }
+        } else if (nc.node.name == "zl.float_mult_split") {
+            std::vector<std::unique_ptr<ACECompressor>> succs;
+            succs.push_back(
+                    std::make_unique<ACECompressor>(*nc.successors[0]));
+            const bool currentlyPco = nc.successors[1]->isNode()
+                    && nc.successors[1]->asNode().node.name
+                            == "zl.pco_bin_split";
+            const bool currentlyStore = nc.successors[1]->isGraph()
+                    && nc.successors[1]->asGraph().graph.name == "zl.store";
+            if (currentlyPco) {
+                succs.push_back(std::make_unique<ACECompressor>(
+                        buildCompressGenericCompressor()));
+            } else if (currentlyStore) {
+                succs.push_back(std::make_unique<ACECompressor>(
+                        ACENode(nodes::PcoBinSplit{
+                                nodes::PcoBinSplit::LatentMode::Signed }),
+                        std::vector<ACECompressor>{
+                                ACECompressor(ACEGraph(graphs::Fse{})),
+                                buildStoreCompressor() }));
+            } else {
+                succs.push_back(
+                        std::make_unique<ACECompressor>(buildStoreCompressor()));
+            }
+            return ACENodeCompressor(nc.node, std::move(succs));
         } else if (
                 nc.node.name == "zl.tokenize_numeric"
                 || nc.node.name == "zl.lookback_delta") {
@@ -309,7 +335,9 @@ class ACEMutate {
                 || (node.name == "zl.range_pack"
                     && childNodeName == "zl.range_pack")
                 || (node.name == "zl.int_mult_split"
-                    && childNodeName == "zl.int_mult_split")) {
+                    && childNodeName == "zl.int_mult_split")
+                || (node.name == "zl.float_mult_split"
+                    && childNodeName == "zl.float_mult_split")) {
                 continue;
             }
             if (!node.outputTypes.empty()
@@ -346,6 +374,21 @@ class ACEMutate {
                         useCompress(rng_)
                                 ? ACECompressor(ACEGraph(graphs::Compress{}))
                                 : buildStoreCompressor());
+            } else if (node.name == "zl.float_mult_split" && i == 1) {
+                std::uniform_int_distribution<int> adjChoice(0, 2);
+                const int choice = adjChoice(rng_);
+                if (choice == 0) {
+                    successors.push_back(ACECompressor(
+                            ACENode(nodes::PcoBinSplit{
+                                    nodes::PcoBinSplit::LatentMode::Signed }),
+                            std::vector<ACECompressor>{
+                                    ACECompressor(ACEGraph(graphs::Fse{})),
+                                    buildStoreCompressor() }));
+                } else if (choice == 1) {
+                    successors.push_back(buildCompressGenericCompressor());
+                } else {
+                    successors.push_back(buildStoreCompressor());
+                }
             } else {
                 successors.push_back(buildRandomCompressor(
                         rng_,

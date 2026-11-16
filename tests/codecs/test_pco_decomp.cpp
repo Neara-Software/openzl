@@ -9,6 +9,7 @@
 
 #include "openzl/cpp/codecs/LookbackDelta.hpp"
 #include "openzl/cpp/codecs/Delta.hpp"
+#include "openzl/cpp/codecs/FloatMultSplit.hpp"
 #include "openzl/cpp/codecs/IntMultSplit.hpp"
 #include "openzl/cpp/codecs/PcoBinSplit.hpp"
 #include "openzl/openzl.hpp"
@@ -412,6 +413,118 @@ TEST_F(PcoDecompTest, IntMultSplitDetectsMultiplierAndFallsBack)
         dense[i] = static_cast<uint32_t>(rng >> 32);
     }
     testRoundTrip(Input::refNumeric(poly::span<const uint32_t>{ dense }));
+    EXPECT_EQ(adjCount, 0u);
+}
+
+TEST_F(PcoDecompTest, FloatMultSplitDetectsMultipliersAndPreservesAllBits)
+{
+    compressor_.setParameter(CParam::FormatVersion, ZL_MAX_FORMAT_VERSION);
+
+    size_t adjCount = 0;
+    auto capAdj     = compressor_.registerFunctionGraph(
+            std::make_shared<CaptureLookbackCountGraph>(&adjCount));
+    auto multNode = nodes::FloatMultSplit{}.parameterize(compressor_);
+    auto gCap     = compressor_.buildStaticGraph(
+            multNode, { graphs::Store{}(), capAdj });
+
+    auto signedPco = nodes::PcoBinSplit{
+        nodes::PcoBinSplit::LatentMode::Signed
+    }(compressor_, graphs::Entropy{}(), graphs::Store{}());
+    auto unsignedPco = nodes::PcoBinSplit{
+        nodes::PcoBinSplit::LatentMode::Unsigned
+    }(compressor_, graphs::Entropy{}(), graphs::Store{}());
+    auto lbdGraph = compressor_.buildStaticGraph(
+            nodes::LookbackDelta{}.parameterize(compressor_),
+            { signedPco, unsignedPco });
+    auto gComp = nodes::FloatMultSplit{}(compressor_, lbdGraph, signedPco);
+
+    // 1. f64 decimal multiples (0.001) + special bit patterns (-0.0, +/-Inf, NaN payloads)
+    std::vector<double> f64Scaled(2048);
+    for (size_t i = 0; i < f64Scaled.size(); ++i) {
+        f64Scaled[i] = static_cast<double>(static_cast<int64_t>(i) - 512) * 0.001;
+        if (i % 37 == 0) {
+            uint64_t bits;
+            std::memcpy(&bits, &f64Scaled[i], sizeof(bits));
+            bits += 1ULL;
+            std::memcpy(&f64Scaled[i], &bits, sizeof(bits));
+        }
+    }
+    f64Scaled[0] = -0.0;
+    f64Scaled[1] = std::numeric_limits<double>::infinity();
+    f64Scaled[2] = -std::numeric_limits<double>::infinity();
+    {
+        uint64_t qnan = 0x7ff8000000001234ULL;
+        uint64_t snan = 0xfff0000000005678ULL;
+        uint64_t subn = 0x0000000000000003ULL;
+        std::memcpy(&f64Scaled[3], &qnan, sizeof(qnan));
+        std::memcpy(&f64Scaled[4], &snan, sizeof(snan));
+        std::memcpy(&f64Scaled[5], &subn, sizeof(subn));
+    }
+
+    compressor_.selectStartingGraph(gCap);
+    testRoundTrip(Input::refNumeric(poly::span<const double>{ f64Scaled }));
+    EXPECT_EQ(adjCount, f64Scaled.size());
+
+    compressor_.selectStartingGraph(gComp);
+    auto compF64 = testRoundTrip(
+            Input::refNumeric(poly::span<const double>{ f64Scaled }));
+    EXPECT_LT(
+            static_cast<double>(compF64.size()),
+            0.15 * static_cast<double>(f64Scaled.size() * sizeof(double)));
+
+    // 2. f64 trailing-zero integer multiples (e.g. gps_time seconds)
+    std::vector<double> f64Sec(1024);
+    for (size_t i = 0; i < f64Sec.size(); ++i) {
+        f64Sec[i] = 381355792.0 + static_cast<double>(i * 3);
+    }
+    adjCount = 0;
+    compressor_.selectStartingGraph(gCap);
+    testRoundTrip(Input::refNumeric(poly::span<const double>{ f64Sec }));
+    EXPECT_EQ(adjCount, f64Sec.size());
+
+    compressor_.selectStartingGraph(gComp);
+    auto compSec = testRoundTrip(
+            Input::refNumeric(poly::span<const double>{ f64Sec }));
+    EXPECT_LT(
+            static_cast<double>(compSec.size()),
+            0.05 * static_cast<double>(f64Sec.size() * sizeof(double)));
+
+    // 3. f32 decimal + reciprocal multiples (0.1f and 1/7) with edge floats
+    std::vector<float> f32Scaled(2048);
+    for (size_t i = 0; i < f32Scaled.size(); ++i) {
+        f32Scaled[i] = static_cast<float>(static_cast<int32_t>(i) - 512) * 0.1f;
+    }
+    f32Scaled[0] = -0.0f;
+    {
+        uint32_t qnan = 0x7fc01234u;
+        uint32_t snan = 0xff800007u;
+        uint32_t subn = 0x00000005u;
+        std::memcpy(&f32Scaled[1], &qnan, sizeof(qnan));
+        std::memcpy(&f32Scaled[2], &snan, sizeof(snan));
+        std::memcpy(&f32Scaled[3], &subn, sizeof(subn));
+    }
+    adjCount = 0;
+    compressor_.selectStartingGraph(gCap);
+    testRoundTrip(Input::refNumeric(poly::span<const float>{ f32Scaled }));
+    EXPECT_EQ(adjCount, f32Scaled.size());
+
+    compressor_.selectStartingGraph(gComp);
+    auto compF32 = testRoundTrip(
+            Input::refNumeric(poly::span<const float>{ f32Scaled }));
+    EXPECT_LT(
+            static_cast<double>(compF32.size()),
+            0.15 * static_cast<double>(f32Scaled.size() * sizeof(float)));
+
+    // 4. Random non-multiple f64 -> fallback (0 adjustments) + bit-exact roundtrip
+    adjCount = 999999;
+    compressor_.selectStartingGraph(gCap);
+    std::vector<uint64_t> randomBits(1024);
+    uint64_t rng = 0x123456789abcdef0ULL;
+    for (size_t i = 0; i < randomBits.size(); ++i) {
+        rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
+        randomBits[i] = rng;
+    }
+    testRoundTrip(Input::refNumeric(poly::span<const uint64_t>{ randomBits }));
     EXPECT_EQ(adjCount, 0u);
 }
 
