@@ -61,7 +61,9 @@ class ACEMutate {
         if (comp.isNode()) {
             const auto& node = comp.asNode();
             for (size_t i = 0; i < node.successors.size(); ++i) {
-                if (node.node.name == "zl.pco_bin_split" && i == 1) {
+                if ((node.node.name == "zl.pco_bin_split"
+                     || node.node.name == "zl.int_mult_split")
+                    && i == 1) {
                     continue;
                 }
                 visitMutable(
@@ -86,7 +88,9 @@ class ACEMutate {
             std::vector<std::unique_ptr<ACECompressor>> successors;
             successors.reserve(node.successors.size());
             for (size_t i = 0; i < node.successors.size(); ++i) {
-                if (node.node.name == "zl.pco_bin_split" && i == 1) {
+                if ((node.node.name == "zl.pco_bin_split"
+                     || node.node.name == "zl.int_mult_split")
+                    && i == 1) {
                     successors.push_back(
                             std::make_unique<ACECompressor>(*node.successors[i]));
                 } else {
@@ -197,6 +201,41 @@ class ACEMutate {
                 }
                 return ACENodeCompressor(std::move(nextNode), std::move(succs));
             }
+        } else if (nc.node.name == "zl.int_mult_split") {
+            std::bernoulli_distribution flipAdj(0.5);
+            if (flipAdj(rng_)) {
+                std::vector<std::unique_ptr<ACECompressor>> succs;
+                succs.push_back(
+                        std::make_unique<ACECompressor>(*nc.successors[0]));
+                const bool currentlyStore =
+                        nc.successors[1]->isGraph()
+                        && nc.successors[1]->asGraph().graph.name == "zl.store";
+                succs.push_back(
+                        std::make_unique<ACECompressor>(
+                                currentlyStore ? ACECompressor(ACEGraph(
+                                                         graphs::Compress{}))
+                                               : buildStoreCompressor()));
+                return ACENodeCompressor(nc.node, std::move(succs));
+            }
+            const auto compatible =
+                    getNodesComptabileWith(inputType, formatVersion_);
+            std::vector<ACENode> variants;
+            for (const auto& cand : compatible) {
+                if (cand.name == nc.node.name) {
+                    variants.push_back(cand);
+                }
+            }
+            if (variants.size() > 1) {
+                auto nextNode = randomChoice(
+                        rng_,
+                        poly::span<const ACENode>(
+                                variants.data(), variants.size()));
+                std::vector<std::unique_ptr<ACECompressor>> succs;
+                for (const auto& s : nc.successors) {
+                    succs.push_back(std::make_unique<ACECompressor>(*s));
+                }
+                return ACENodeCompressor(std::move(nextNode), std::move(succs));
+            }
         } else if (
                 nc.node.name == "zl.tokenize_numeric"
                 || nc.node.name == "zl.lookback_delta") {
@@ -268,7 +307,9 @@ class ACEMutate {
         for (const auto& node : compatibleNodes) {
             if ((node.name == "zl.zigzag" && childNodeName == "zl.zigzag")
                 || (node.name == "zl.range_pack"
-                    && childNodeName == "zl.range_pack")) {
+                    && childNodeName == "zl.range_pack")
+                || (node.name == "zl.int_mult_split"
+                    && childNodeName == "zl.int_mult_split")) {
                 continue;
             }
             if (!node.outputTypes.empty()
@@ -299,6 +340,12 @@ class ACEMutate {
                         useStore(rng_)
                                 ? buildStoreCompressor()
                                 : ACECompressor(ACEGraph(graphs::Entropy{})));
+            } else if (node.name == "zl.int_mult_split" && i == 1) {
+                std::bernoulli_distribution useCompress(0.5);
+                successors.push_back(
+                        useCompress(rng_)
+                                ? ACECompressor(ACEGraph(graphs::Compress{}))
+                                : buildStoreCompressor());
             } else {
                 successors.push_back(buildRandomCompressor(
                         rng_,

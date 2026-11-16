@@ -14,6 +14,7 @@
 #include <set>
 #include <string_view>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include "openzl/cpp/Compressor.hpp"
@@ -416,6 +417,18 @@ std::vector<ACECompressor> pickComplementary(
     for (const auto& e : extra) {
         solutions.emplace_back(e, ace.fitness()[0]);
     }
+    {
+        std::unordered_set<uint64_t> seen;
+        seen.reserve(solutions.size());
+        decltype(solutions) dedup;
+        dedup.reserve(solutions.size());
+        for (auto& sol : solutions) {
+            if (seen.insert(sol.first.hash()).second) {
+                dedup.push_back(std::move(sol));
+            }
+        }
+        solutions = std::move(dedup);
+    }
     const auto inputs = ace.inputs();
     const size_t n    = inputs.size();
     auto benchmarkOne = [&](const ACECompressor& c, size_t i) {
@@ -572,6 +585,59 @@ std::vector<ACECompressor> pickComplementary(
         picked.push_back(cands[bestIdx]);
         pickedDtime.push_back(dtime[bestIdx]);
     }
+    // If every picked pipeline contains a partial-domain codec (such as
+    // zl.constant or zl.bitunpack) and there is room, append universal fallback
+    // graphs so unseen non-constant inputs do not fall back to raw store.
+    auto hasPartialCodec = [&](const ACECompressor& comp) {
+        bool partial = false;
+        comp.forEachComponent(
+                ace.inputType(), [&](const ACECompressor& sub, Type) {
+                    if (sub.isGraph()) {
+                        const auto& nm = sub.asGraph().graph.name;
+                        if (nm == "zl.constant" || nm == "zl.constant_fixed") {
+                            partial = true;
+                        }
+                    } else if (sub.asNode().node.name == "zl.bitunpack") {
+                        partial = true;
+                    }
+                });
+        return partial;
+    };
+    if (!picked.empty() && picked.size() < maxPicks
+        && std::all_of(picked.begin(), picked.end(), hasPartialCodec)) {
+        std::vector<ACECompressor> fallbacks;
+        if (ace.inputType() == Type::Serial
+            || ace.inputType() == Type::Numeric) {
+            fallbacks.emplace_back(ACEGraph(graphs::Fse{}));
+            fallbacks.emplace_back(ACEGraph(graphs::Zstd{}));
+        } else {
+            fallbacks.emplace_back(ACEGraph(graphs::Compress{}));
+        }
+        for (const auto& fb : fallbacks) {
+            if (picked.size() >= maxPicks) {
+                break;
+            }
+            bool already = false;
+            for (const auto& p : picked) {
+                if (p.hash() == fb.hash()) {
+                    already = true;
+                    break;
+                }
+            }
+            if (already) {
+                continue;
+            }
+            double fbDtime = pickedDtime.back();
+            for (size_t c = 0; c < cands.size(); ++c) {
+                if (cands[c].hash() == fb.hash()) {
+                    fbDtime = dtime[c];
+                    break;
+                }
+            }
+            picked.push_back(fb);
+            pickedDtime.push_back(fbDtime);
+        }
+    }
     // ACE_BRUTE_SLACK: the selector takes the first successor within the slack
     // of the smallest, so list the fastest-decoding successors first.
     if (std::getenv("ACE_BRUTE_SLACK") != nullptr) {
@@ -723,20 +789,21 @@ void logNodeCensus(uint32_t formatVersion)
  * brute-force picks can then put file-specialist graphs next to the
  * generalist.
  */
-void addSpecialists(
+std::vector<ACECompressor> addSpecialists(
         AutomatedCompressorExplorer& ace,
         const std::vector<MultiInput>& samples,
         poly::span<const Input> flattened,
         AutomatedCompressorExplorer::Parameters params,
         size_t graphIdx)
 {
+    std::vector<ACECompressor> specFronts;
     std::map<std::string, std::vector<size_t>> groups;
     const auto groupOf = inputGroups(samples);
     for (size_t i = 0; i < groupOf.size(); ++i) {
         groups[groupOf[i]].push_back(i);
     }
     if (groups.size() < 2) {
-        return;
+        return specFronts;
     }
     const char* sg        = std::getenv("ACE_SPEC_GENERATIONS");
     params.maxGenerations = sg ? std::strtoul(sg, nullptr, 10) : 60;
@@ -777,14 +844,22 @@ void addSpecialists(
         run.get();
     }
     for (const auto& spec : specs) {
+        auto sol = spec.explorer->solution();
+        std::sort(sol.begin(), sol.end(), [](const auto& a, const auto& b) {
+            return a.second[0] < b.second[0];
+        });
         fprintf(stderr,
                 "ACE_SPEC graph=%zu group=%s inputs=%zu best=%.0f\n",
                 graphIdx,
                 spec.name.c_str(),
                 spec.inputs.size(),
-                (double)spec.explorer->solution()[0].second[0]);
+                (double)sol[0].second[0]);
+        for (size_t k = 0; k < sol.size() && k < 3; ++k) {
+            specFronts.push_back(sol[k].first);
+        }
         ace.loadPopulation(spec.explorer->savePopulation(10));
     }
+    return specFronts;
 }
 
 /**
@@ -909,6 +984,7 @@ std::vector<SerializedCompressorInternal> ACETrainer::train(
         std::unique_ptr<AutomatedCompressorExplorer> ace;
         std::shared_ptr<const std::string> aceState;
         std::vector<std::string> groupOf;
+        std::vector<ACECompressor> specialistExtra;
     };
     std::vector<BruteSlot> bruteSlots;
     if (std::getenv("ACE_CENSUS") != nullptr) {
@@ -933,6 +1009,7 @@ std::vector<SerializedCompressorInternal> ACETrainer::train(
         poly::optional<std::string> savedAceState;
         poly::optional<std::chrono::seconds> maxTime;
         std::unique_ptr<AutomatedCompressorExplorer> ace;
+        std::vector<ACECompressor> specialistExtra;
     };
 
     // Graph searches are independent, so without a time budget they run at
@@ -966,7 +1043,7 @@ std::vector<SerializedCompressorInternal> ACETrainer::train(
                         compressionLevel,
                         poly::nullopt);
                 specParams.threadPool = sharedPool;
-                addSpecialists(
+                slot.specialistExtra = addSpecialists(
                         ace,
                         samples[slot.backendGraph],
                         flattened,
@@ -1040,7 +1117,8 @@ std::vector<SerializedCompressorInternal> ACETrainer::train(
                           std::move(flattenedOwned),
                           savedAceState,
                           maxTime,
-                          nullptr });
+                          nullptr,
+                          {} });
         if (!concurrentGraphs) {
             trainSlot(slots.back());
         }
@@ -1081,7 +1159,8 @@ std::vector<SerializedCompressorInternal> ACETrainer::train(
                                    std::move(slot.flattened),
                                    std::move(slot.ace),
                                    savedState,
-                                   inputGroups(samples[backendGraph]) });
+                                   inputGroups(samples[backendGraph]),
+                                   std::move(slot.specialistExtra) });
         } else {
             candidates.emplace(
                     backendGraph,
@@ -1098,7 +1177,7 @@ std::vector<SerializedCompressorInternal> ACETrainer::train(
     // same kind of data, and one slot's search can miss a regime).
     const bool crossSlot = std::getenv("ACE_BRUTE_CROSS_SLOT") != nullptr;
     for (const auto& slot : bruteSlots) {
-        std::vector<ACECompressor> extra;
+        std::vector<ACECompressor> extra = slot.specialistExtra;
         for (const auto& other : bruteSlots) {
             if (!crossSlot || &other == &slot
                 || other.ace->inputType() != slot.ace->inputType()) {

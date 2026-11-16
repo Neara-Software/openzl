@@ -11,6 +11,7 @@
 #include "tools/training/ace/ace_sampling.h"
 
 #include "openzl/cpp/codecs/Bitsplit.hpp"
+#include "openzl/cpp/codecs/IntMultSplit.hpp"
 
 namespace openzl {
 namespace training {
@@ -53,6 +54,10 @@ std::vector<ACENode> makeAllNodes()
     n.push_back(buildNode(nodes::QuantizeOffsets{}));
     n.push_back(buildNode(nodes::QuantizeLengths{}));
     n.push_back(buildNode(nodes::LookbackDelta{}));
+    n.push_back(buildNode(
+            nodes::IntMultSplit{ nodes::IntMultSplit::Mode::Unsigned }));
+    n.push_back(buildNode(
+            nodes::IntMultSplit{ nodes::IntMultSplit::Mode::Signed }));
     n.push_back(buildNode(
             nodes::PcoBinSplit{ nodes::PcoBinSplit::LatentMode::Unsigned }));
     n.push_back(buildNode(
@@ -210,6 +215,19 @@ std::vector<ACECompressor> makePrebuiltNumericCompressors()
             buildNode(nodes::RangePack{}), { lookbackPcoBin2 });
     ACECompressor divideByRangePackLookbackPcoBin(
             buildNode(nodes::DivideBy{}), { rangePackLookbackPcoBin });
+    ACECompressor compressGeneric(buildGraph(graphs::Compress{}));
+    ACECompressor intMultDeltaPcoBin(
+            buildNode(nodes::IntMultSplit{
+                    nodes::IntMultSplit::Mode::Unsigned }),
+            { deltaPcoBinSigned, compressGeneric });
+    ACECompressor intMultSignedDeltaPcoBin(
+            buildNode(nodes::IntMultSplit{
+                    nodes::IntMultSplit::Mode::Signed }),
+            { deltaPcoBinSigned, compressGeneric });
+    ACECompressor intMultLookbackPcoBin(
+            buildNode(nodes::IntMultSplit{
+                    nodes::IntMultSplit::Mode::Unsigned }),
+            { lookbackPcoBin2, compressGeneric });
     std::vector<ACECompressor> prebuilt = {
         fieldLz,
         zstd,
@@ -246,6 +264,9 @@ std::vector<ACECompressor> makePrebuiltNumericCompressors()
         lookbackPcoBinFieldLz,
         rangePackLookbackPcoBin,
         divideByRangePackLookbackPcoBin,
+        intMultDeltaPcoBin,
+        intMultSignedDeltaPcoBin,
+        intMultLookbackPcoBin,
     };
     if (transformerAllowed()) {
         prebuilt.insert(prebuilt.begin(), transformer);
@@ -344,6 +365,29 @@ std::vector<ACECompressor> makePrebuiltNumericCompressors()
                         buildNode(nodes::DeltaInt{}),
                         { ACECompressor(
                                 buildNode(nodes::Zigzag{}), { tokQo }) }) });
+        // Delta -> Zigzag -> TokenizeNumeric(sorted) -> RangePack/Delta -> Transpose -> Zstd
+        // (strong on smooth floating-point/integer streams like gps_time)
+        ACECompressor dZzTokRpDTZstd(
+                buildNode(nodes::DeltaInt{}),
+                { ACECompressor(
+                        buildNode(nodes::Zigzag{}),
+                        { ACECompressor(
+                                buildNode(nodes::TokenizeNumeric{ true }),
+                                { ACECompressor(
+                                          buildNode(nodes::RangePack{}),
+                                          { ACECompressor(
+                                                  buildNode(nodes::DeltaInt{}),
+                                                  { transposeZstd }) }),
+                                  transposeZstd }) }) });
+        compressors.push_back(dZzTokRpDTZstd);
+        compressors.emplace_back(
+                buildNode(nodes::IntMultSplit{
+                        nodes::IntMultSplit::Mode::Unsigned }),
+                std::vector{ dZzTokRpDTZstd, compressGeneric });
+        compressors.emplace_back(
+                buildNode(nodes::IntMultSplit{
+                        nodes::IntMultSplit::Mode::Unsigned }),
+                std::vector{ tokenizeSortedPcoBinUnsigned, compressGeneric });
     }
     return compressors;
 }
@@ -417,6 +461,12 @@ std::vector<ACECompressor> makePrebuiltSerialCompressors()
     ACECompressor lookbackPcoBin2(
             buildNode(nodes::LookbackDelta{}),
             { pcoBinSignedFse, pcoBinUnsignedFse });
+    ACECompressor deltaPcoBinSigned(
+            buildNode(nodes::DeltaInt{}), { pcoBinSignedFse });
+    ACECompressor intMultDeltaPcoBin(
+            buildNode(nodes::IntMultSplit{
+                    nodes::IntMultSplit::Mode::Unsigned }),
+            { deltaPcoBinSigned, store });
     std::vector<ACECompressor> coreNumeric = {
         zstd,
         fieldLz,
@@ -431,6 +481,7 @@ std::vector<ACECompressor> makePrebuiltSerialCompressors()
         pcoBinUnsignedFse,
         pcoBinSignedFse,
         lookbackPcoBin2,
+        intMultDeltaPcoBin,
     };
     const bool bigEndian = std::getenv("ACE_BIG_ENDIAN") != nullptr;
     for (const auto& compressor : coreNumeric) {
@@ -683,6 +734,12 @@ ACECompressor buildRandomNodeCompressor(
             successors.push_back(std::make_unique<ACECompressor>(
                     useStore(rng) ? ACEGraphCompressor(buildGraph(graphs::Store{}))
                                   : ACEGraphCompressor(buildGraph(graphs::Entropy{}))));
+        } else if (node.name == "zl.int_mult_split" && i == 1) {
+            std::bernoulli_distribution useCompress(0.5);
+            successors.push_back(std::make_unique<ACECompressor>(
+                    useCompress(rng)
+                            ? ACEGraphCompressor(buildGraph(graphs::Compress{}))
+                            : ACEGraphCompressor(buildGraph(graphs::Store{}))));
         } else {
             successors.push_back(
                     std::make_unique<ACECompressor>(buildRandomCompressor(
@@ -692,7 +749,8 @@ ACECompressor buildRandomNodeCompressor(
                             maxDepth - 1)));
         }
     }
-    if ((node.name == "zl.zigzag" || node.name == "zl.range_pack")
+    if ((node.name == "zl.zigzag" || node.name == "zl.range_pack"
+         || node.name == "zl.int_mult_split")
         && successors[0]->isNode()
         && successors[0]->asNode().node.name == node.name) {
         return *successors[0];
