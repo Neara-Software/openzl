@@ -22,6 +22,7 @@
 #include "openzl/cpp/codecs/Hilbert3.hpp"         // IWYU pragma: export
 #include "openzl/cpp/codecs/LookbackDelta.hpp"    // IWYU pragma: export
 #include "openzl/cpp/codecs/IntMultSplit.hpp"     // IWYU pragma: export
+#include "openzl/cpp/codecs/FloatMultSplit.hpp"   // IWYU pragma: export
 #include "openzl/cpp/codecs/PcoBinSplit.hpp"      // IWYU pragma: export
 #include "openzl/cpp/codecs/Illegal.hpp"          // IWYU pragma: export
 #include "openzl/cpp/codecs/Lz.hpp"               // IWYU pragma: export

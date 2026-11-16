@@ -11,6 +11,7 @@
 #include "tools/training/ace/ace_sampling.h"
 
 #include "openzl/cpp/codecs/Bitsplit.hpp"
+#include "openzl/cpp/codecs/FloatMultSplit.hpp"
 #include "openzl/cpp/codecs/IntMultSplit.hpp"
 
 namespace openzl {
@@ -58,6 +59,7 @@ std::vector<ACENode> makeAllNodes()
             nodes::IntMultSplit{ nodes::IntMultSplit::Mode::Unsigned }));
     n.push_back(buildNode(
             nodes::IntMultSplit{ nodes::IntMultSplit::Mode::Signed }));
+    n.push_back(buildNode(nodes::FloatMultSplit{}));
     n.push_back(buildNode(
             nodes::PcoBinSplit{ nodes::PcoBinSplit::LatentMode::Unsigned }));
     n.push_back(buildNode(
@@ -228,6 +230,12 @@ std::vector<ACECompressor> makePrebuiltNumericCompressors()
             buildNode(nodes::IntMultSplit{
                     nodes::IntMultSplit::Mode::Unsigned }),
             { lookbackPcoBin2, compressGeneric });
+    ACECompressor floatMultLookbackPcoBin(
+            buildNode(nodes::FloatMultSplit{}),
+            { lookbackPcoBin2, pcoBinSignedFse });
+    ACECompressor floatMultDeltaPcoBin(
+            buildNode(nodes::FloatMultSplit{}),
+            { deltaPcoBinSigned, pcoBinSignedFse });
     std::vector<ACECompressor> prebuilt = {
         fieldLz,
         zstd,
@@ -267,6 +275,8 @@ std::vector<ACECompressor> makePrebuiltNumericCompressors()
         intMultDeltaPcoBin,
         intMultSignedDeltaPcoBin,
         intMultLookbackPcoBin,
+        floatMultLookbackPcoBin,
+        floatMultDeltaPcoBin,
     };
     if (transformerAllowed()) {
         prebuilt.insert(prebuilt.begin(), transformer);
@@ -467,6 +477,9 @@ std::vector<ACECompressor> makePrebuiltSerialCompressors()
             buildNode(nodes::IntMultSplit{
                     nodes::IntMultSplit::Mode::Unsigned }),
             { deltaPcoBinSigned, store });
+    ACECompressor floatMultLookbackPcoBin(
+            buildNode(nodes::FloatMultSplit{}),
+            { lookbackPcoBin2, pcoBinSignedFse });
     std::vector<ACECompressor> coreNumeric = {
         zstd,
         fieldLz,
@@ -482,6 +495,7 @@ std::vector<ACECompressor> makePrebuiltSerialCompressors()
         pcoBinSignedFse,
         lookbackPcoBin2,
         intMultDeltaPcoBin,
+        floatMultLookbackPcoBin,
     };
     const bool bigEndian = std::getenv("ACE_BIG_ENDIAN") != nullptr;
     for (const auto& compressor : coreNumeric) {
@@ -740,6 +754,23 @@ ACECompressor buildRandomNodeCompressor(
                     useCompress(rng)
                             ? ACEGraphCompressor(buildGraph(graphs::Compress{}))
                             : ACEGraphCompressor(buildGraph(graphs::Store{}))));
+        } else if (node.name == "zl.float_mult_split" && i == 1) {
+            std::uniform_int_distribution<int> adjChoice(0, 2);
+            const int choice = adjChoice(rng);
+            if (choice == 0) {
+                successors.push_back(std::make_unique<ACECompressor>(
+                        buildNode(nodes::PcoBinSplit{
+                                nodes::PcoBinSplit::LatentMode::Signed }),
+                        std::vector<ACECompressor>{
+                                ACEGraphCompressor(buildGraph(graphs::Fse{})),
+                                ACEGraphCompressor(buildGraph(graphs::Store{})) }));
+            } else if (choice == 1) {
+                successors.push_back(std::make_unique<ACECompressor>(
+                        ACEGraphCompressor(buildGraph(graphs::Compress{}))));
+            } else {
+                successors.push_back(std::make_unique<ACECompressor>(
+                        ACEGraphCompressor(buildGraph(graphs::Store{}))));
+            }
         } else {
             successors.push_back(
                     std::make_unique<ACECompressor>(buildRandomCompressor(
@@ -750,7 +781,8 @@ ACECompressor buildRandomNodeCompressor(
         }
     }
     if ((node.name == "zl.zigzag" || node.name == "zl.range_pack"
-         || node.name == "zl.int_mult_split")
+         || node.name == "zl.int_mult_split"
+         || node.name == "zl.float_mult_split")
         && successors[0]->isNode()
         && successors[0]->asNode().node.name == node.name) {
         return *successors[0];

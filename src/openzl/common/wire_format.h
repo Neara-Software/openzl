@@ -326,9 +326,10 @@ typedef enum {
     ZL_StandardTransformID_morton3_u16 = 70,
     ZL_StandardTransformID_morton3_i32 = 71,
 
-    ZL_StandardTransformID_lookback_delta = 72,
-    ZL_StandardTransformID_pco_bin_split  = 73,
-    ZL_StandardTransformID_int_mult_split = 74,
+    ZL_StandardTransformID_lookback_delta   = 72,
+    ZL_StandardTransformID_pco_bin_split    = 73,
+    ZL_StandardTransformID_int_mult_split   = 74,
+    ZL_StandardTransformID_float_mult_split = 75,
 
     ZL_StandardTransformID_end =
             128 // last id, used to detect end of ID range (impacts
