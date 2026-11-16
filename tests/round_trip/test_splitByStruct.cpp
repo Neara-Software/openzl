@@ -8,6 +8,16 @@
 #include <vector>
 
 // Zstrong
+#if defined(__cplusplus)
+#    define restrict __restrict__
+#endif
+#include "openzl/codecs/splitByStruct/decode_splitByStruct_kernel.h"
+extern "C" {
+#include "openzl/codecs/splitByStruct/encode_splitByStruct_kernel.h"
+}
+#if defined(__cplusplus)
+#    undef restrict
+#endif
 #include "openzl/common/debug.h" // ZL_REQUIRE
 #include "openzl/zl_compress.h"
 #include "openzl/zl_compressor.h"
@@ -292,6 +302,74 @@ TEST(SplitByStruct, test_splitByStruct_0)
     cFailTest(
             splitGraph_struct_0_0,
             "splitByStruct with a structure of size 0 => failure expected");
+}
+
+TEST(SplitByStruct, test_splitByStruct_3ch_2b_4b_edgeLengths)
+{
+    const std::vector<size_t> lengths = { 0, 1, 7, 8, 15, 16, 31, 32, 1000 };
+    for (size_t fs : { size_t(2), size_t(4) }) {
+        const size_t fieldSizes[3] = { fs, fs, fs };
+        for (size_t n : lengths) {
+            const size_t totalBytes = n * 3 * fs;
+            std::vector<uint8_t> src(totalBytes);
+            for (size_t i = 0; i < totalBytes; ++i) {
+                src[i] = static_cast<uint8_t>((i * 37 + 13) & 0xff);
+            }
+
+            const size_t chBytes = n * fs;
+            std::vector<uint8_t> c0(chBytes), c1(chBytes), c2(chBytes);
+            void* dstPtrs[3] = {
+                chBytes ? c0.data() : nullptr,
+                chBytes ? c1.data() : nullptr,
+                chBytes ? c2.data() : nullptr,
+            };
+            ZS_dispatchArrayFixedSizeStruct(
+                    dstPtrs,
+                    3,
+                    totalBytes ? src.data() : nullptr,
+                    totalBytes,
+                    fieldSizes);
+
+            // Verify dstPtrs updated to end positions and exact channel contents
+            EXPECT_EQ(
+                    dstPtrs[0],
+                    chBytes ? static_cast<void*>(c0.data() + chBytes) : nullptr);
+            EXPECT_EQ(
+                    dstPtrs[1],
+                    chBytes ? static_cast<void*>(c1.data() + chBytes) : nullptr);
+            EXPECT_EQ(
+                    dstPtrs[2],
+                    chBytes ? static_cast<void*>(c2.data() + chBytes) : nullptr);
+            for (size_t p = 0; p < n; ++p) {
+                for (size_t b = 0; b < fs; ++b) {
+                    EXPECT_EQ(c0[p * fs + b], src[p * 3 * fs + 0 * fs + b]);
+                    EXPECT_EQ(c1[p * fs + b], src[p * 3 * fs + 1 * fs + b]);
+                    EXPECT_EQ(c2[p * fs + b], src[p * 3 * fs + 2 * fs + b]);
+                }
+            }
+
+            std::vector<uint8_t> dst(totalBytes, 0xCC);
+            const void* srcPtrs[3] = {
+                chBytes ? c0.data() : nullptr,
+                chBytes ? c1.data() : nullptr,
+                chBytes ? c2.data() : nullptr,
+            };
+            const size_t written = ZS_dispatchArrayFixedSizeStruct_decode(
+                    totalBytes ? dst.data() : nullptr,
+                    totalBytes,
+                    srcPtrs,
+                    fieldSizes,
+                    3,
+                    n);
+            EXPECT_EQ(written, totalBytes);
+            EXPECT_EQ(dst, src);
+        }
+
+        // Full OpenZL round-trip with FSE compression so decoder is exercised
+        for (size_t n : { size_t(1000), size_t(1031) }) {
+            fieldsRoundTrip({ fs, fs, fs }, n);
+        }
+    }
 }
 
 } // namespace

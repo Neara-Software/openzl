@@ -7,6 +7,282 @@
 #include <assert.h>
 #include <string.h> // memcpy
 
+#include "openzl/shared/mem.h"
+#include "openzl/shared/portability.h"
+
+#if ZL_HAS_SSSE3
+#    include <tmmintrin.h>
+#endif
+
+static void rejoin_3ch_2b(
+        void* restrict dst,
+        const void* restrict xPtr,
+        const void* restrict yPtr,
+        const void* restrict zPtr,
+        size_t nbElts)
+{
+    uint8_t* out       = (uint8_t*)dst;
+    const uint8_t* x   = (const uint8_t*)xPtr;
+    const uint8_t* y   = (const uint8_t*)yPtr;
+    const uint8_t* z   = (const uint8_t*)zPtr;
+    size_t i           = 0;
+
+#if ZL_HAS_AVX2
+    __m256i const dm2_0_0 = _mm256_setr_epi8(0, 1, -1, -1, -1, -1, 2, 3, -1, -1, -1, -1, 4, 5, -1, -1, 0, 1, -1, -1, -1, -1, 2, 3, -1, -1, -1, -1, 4, 5, -1, -1);
+    __m256i const dm2_0_1 = _mm256_setr_epi8(-1, -1, 0, 1, -1, -1, -1, -1, 2, 3, -1, -1, -1, -1, 4, 5, -1, -1, 0, 1, -1, -1, -1, -1, 2, 3, -1, -1, -1, -1, 4, 5);
+    __m256i const dm2_0_2 = _mm256_setr_epi8(-1, -1, -1, -1, 0, 1, -1, -1, -1, -1, 2, 3, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, -1, -1, -1, -1, 2, 3, -1, -1, -1, -1);
+    __m256i const dm2_1_0 = _mm256_setr_epi8(-1, -1, 6, 7, -1, -1, -1, -1, 8, 9, -1, -1, -1, -1, 10, 11, -1, -1, 6, 7, -1, -1, -1, -1, 8, 9, -1, -1, -1, -1, 10, 11);
+    __m256i const dm2_1_1 = _mm256_setr_epi8(-1, -1, -1, -1, 6, 7, -1, -1, -1, -1, 8, 9, -1, -1, -1, -1, -1, -1, -1, -1, 6, 7, -1, -1, -1, -1, 8, 9, -1, -1, -1, -1);
+    __m256i const dm2_1_2 = _mm256_setr_epi8(4, 5, -1, -1, -1, -1, 6, 7, -1, -1, -1, -1, 8, 9, -1, -1, 4, 5, -1, -1, -1, -1, 6, 7, -1, -1, -1, -1, 8, 9, -1, -1);
+    __m256i const dm2_2_0 = _mm256_setr_epi8(-1, -1, -1, -1, 12, 13, -1, -1, -1, -1, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1, 12, 13, -1, -1, -1, -1, 14, 15, -1, -1, -1, -1);
+    __m256i const dm2_2_1 = _mm256_setr_epi8(10, 11, -1, -1, -1, -1, 12, 13, -1, -1, -1, -1, 14, 15, -1, -1, 10, 11, -1, -1, -1, -1, 12, 13, -1, -1, -1, -1, 14, 15, -1, -1);
+    __m256i const dm2_2_2 = _mm256_setr_epi8(-1, -1, 10, 11, -1, -1, -1, -1, 12, 13, -1, -1, -1, -1, 14, 15, -1, -1, 10, 11, -1, -1, -1, -1, 12, 13, -1, -1, -1, -1, 14, 15);
+#endif
+#if ZL_HAS_SSSE3
+    __m128i const dm2_128_0_0 = _mm_setr_epi8(0, 1, -1, -1, -1, -1, 2, 3, -1, -1, -1, -1, 4, 5, -1, -1);
+    __m128i const dm2_128_0_1 = _mm_setr_epi8(-1, -1, 0, 1, -1, -1, -1, -1, 2, 3, -1, -1, -1, -1, 4, 5);
+    __m128i const dm2_128_0_2 = _mm_setr_epi8(-1, -1, -1, -1, 0, 1, -1, -1, -1, -1, 2, 3, -1, -1, -1, -1);
+    __m128i const dm2_128_1_0 = _mm_setr_epi8(-1, -1, 6, 7, -1, -1, -1, -1, 8, 9, -1, -1, -1, -1, 10, 11);
+    __m128i const dm2_128_1_1 = _mm_setr_epi8(-1, -1, -1, -1, 6, 7, -1, -1, -1, -1, 8, 9, -1, -1, -1, -1);
+    __m128i const dm2_128_1_2 = _mm_setr_epi8(4, 5, -1, -1, -1, -1, 6, 7, -1, -1, -1, -1, 8, 9, -1, -1);
+    __m128i const dm2_128_2_0 = _mm_setr_epi8(-1, -1, -1, -1, 12, 13, -1, -1, -1, -1, 14, 15, -1, -1, -1, -1);
+    __m128i const dm2_128_2_1 = _mm_setr_epi8(10, 11, -1, -1, -1, -1, 12, 13, -1, -1, -1, -1, 14, 15, -1, -1);
+    __m128i const dm2_128_2_2 = _mm_setr_epi8(-1, -1, 10, 11, -1, -1, -1, -1, 12, 13, -1, -1, -1, -1, 14, 15);
+#endif
+#if ZL_HAS_WASM_SIMD128
+    v128_t const dm2_w_0_0 = wasm_i8x16_const(0, 1, -1, -1, -1, -1, 2, 3, -1, -1, -1, -1, 4, 5, -1, -1);
+    v128_t const dm2_w_0_1 = wasm_i8x16_const(-1, -1, 0, 1, -1, -1, -1, -1, 2, 3, -1, -1, -1, -1, 4, 5);
+    v128_t const dm2_w_0_2 = wasm_i8x16_const(-1, -1, -1, -1, 0, 1, -1, -1, -1, -1, 2, 3, -1, -1, -1, -1);
+    v128_t const dm2_w_1_0 = wasm_i8x16_const(-1, -1, 6, 7, -1, -1, -1, -1, 8, 9, -1, -1, -1, -1, 10, 11);
+    v128_t const dm2_w_1_1 = wasm_i8x16_const(-1, -1, -1, -1, 6, 7, -1, -1, -1, -1, 8, 9, -1, -1, -1, -1);
+    v128_t const dm2_w_1_2 = wasm_i8x16_const(4, 5, -1, -1, -1, -1, 6, 7, -1, -1, -1, -1, 8, 9, -1, -1);
+    v128_t const dm2_w_2_0 = wasm_i8x16_const(-1, -1, -1, -1, 12, 13, -1, -1, -1, -1, 14, 15, -1, -1, -1, -1);
+    v128_t const dm2_w_2_1 = wasm_i8x16_const(10, 11, -1, -1, -1, -1, 12, 13, -1, -1, -1, -1, 14, 15, -1, -1);
+    v128_t const dm2_w_2_2 = wasm_i8x16_const(-1, -1, 10, 11, -1, -1, -1, -1, 12, 13, -1, -1, -1, -1, 14, 15);
+#endif
+
+#if ZL_HAS_AVX2
+    for (; i + 16u <= nbElts; i += 16u) {
+        __m256i const vx = _mm256_loadu_si256((const __m256i_u*)(x + i * 2u));
+        __m256i const vy = _mm256_loadu_si256((const __m256i_u*)(y + i * 2u));
+        __m256i const vz = _mm256_loadu_si256((const __m256i_u*)(z + i * 2u));
+        __m256i const t0 = _mm256_or_si256(
+                _mm256_or_si256(
+                        _mm256_shuffle_epi8(vx, dm2_0_0),
+                        _mm256_shuffle_epi8(vy, dm2_0_1)),
+                _mm256_shuffle_epi8(vz, dm2_0_2));
+        __m256i const t1 = _mm256_or_si256(
+                _mm256_or_si256(
+                        _mm256_shuffle_epi8(vx, dm2_1_0),
+                        _mm256_shuffle_epi8(vy, dm2_1_1)),
+                _mm256_shuffle_epi8(vz, dm2_1_2));
+        __m256i const t2 = _mm256_or_si256(
+                _mm256_or_si256(
+                        _mm256_shuffle_epi8(vx, dm2_2_0),
+                        _mm256_shuffle_epi8(vy, dm2_2_1)),
+                _mm256_shuffle_epi8(vz, dm2_2_2));
+        _mm256_storeu_si256(
+                (__m256i_u*)(out + i * 6u + 0u),
+                _mm256_permute2x128_si256(t0, t1, 0x20));
+        _mm256_storeu_si256(
+                (__m256i_u*)(out + i * 6u + 32u),
+                _mm256_permute2x128_si256(t2, t0, 0x30));
+        _mm256_storeu_si256(
+                (__m256i_u*)(out + i * 6u + 64u),
+                _mm256_permute2x128_si256(t1, t2, 0x31));
+    }
+#endif
+#if ZL_HAS_SSSE3
+    for (; i + 8u <= nbElts; i += 8u) {
+        __m128i const vx = _mm_loadu_si128((const __m128i_u*)(x + i * 2u));
+        __m128i const vy = _mm_loadu_si128((const __m128i_u*)(y + i * 2u));
+        __m128i const vz = _mm_loadu_si128((const __m128i_u*)(z + i * 2u));
+        __m128i const o0 = _mm_or_si128(
+                _mm_or_si128(
+                        _mm_shuffle_epi8(vx, dm2_128_0_0),
+                        _mm_shuffle_epi8(vy, dm2_128_0_1)),
+                _mm_shuffle_epi8(vz, dm2_128_0_2));
+        __m128i const o1 = _mm_or_si128(
+                _mm_or_si128(
+                        _mm_shuffle_epi8(vx, dm2_128_1_0),
+                        _mm_shuffle_epi8(vy, dm2_128_1_1)),
+                _mm_shuffle_epi8(vz, dm2_128_1_2));
+        __m128i const o2 = _mm_or_si128(
+                _mm_or_si128(
+                        _mm_shuffle_epi8(vx, dm2_128_2_0),
+                        _mm_shuffle_epi8(vy, dm2_128_2_1)),
+                _mm_shuffle_epi8(vz, dm2_128_2_2));
+        _mm_storeu_si128((__m128i_u*)(out + i * 6u + 0u), o0);
+        _mm_storeu_si128((__m128i_u*)(out + i * 6u + 16u), o1);
+        _mm_storeu_si128((__m128i_u*)(out + i * 6u + 32u), o2);
+    }
+#elif ZL_HAS_WASM_SIMD128
+    for (; i + 8u <= nbElts; i += 8u) {
+        v128_t const vx = wasm_v128_load(x + i * 2u);
+        v128_t const vy = wasm_v128_load(y + i * 2u);
+        v128_t const vz = wasm_v128_load(z + i * 2u);
+        v128_t const o0 = wasm_v128_or(
+                wasm_v128_or(
+                        wasm_i8x16_swizzle(vx, dm2_w_0_0),
+                        wasm_i8x16_swizzle(vy, dm2_w_0_1)),
+                wasm_i8x16_swizzle(vz, dm2_w_0_2));
+        v128_t const o1 = wasm_v128_or(
+                wasm_v128_or(
+                        wasm_i8x16_swizzle(vx, dm2_w_1_0),
+                        wasm_i8x16_swizzle(vy, dm2_w_1_1)),
+                wasm_i8x16_swizzle(vz, dm2_w_1_2));
+        v128_t const o2 = wasm_v128_or(
+                wasm_v128_or(
+                        wasm_i8x16_swizzle(vx, dm2_w_2_0),
+                        wasm_i8x16_swizzle(vy, dm2_w_2_1)),
+                wasm_i8x16_swizzle(vz, dm2_w_2_2));
+        wasm_v128_store(out + i * 6u + 0u, o0);
+        wasm_v128_store(out + i * 6u + 16u, o1);
+        wasm_v128_store(out + i * 6u + 32u, o2);
+    }
+#endif
+    for (; i < nbElts; i++) {
+        ZL_write16(out + i * 6u + 0u, ZL_read16(x + i * 2u));
+        ZL_write16(out + i * 6u + 2u, ZL_read16(y + i * 2u));
+        ZL_write16(out + i * 6u + 4u, ZL_read16(z + i * 2u));
+    }
+}
+
+static void rejoin_3ch_4b(
+        void* restrict dst,
+        const void* restrict xPtr,
+        const void* restrict yPtr,
+        const void* restrict zPtr,
+        size_t nbElts)
+{
+    uint8_t* out       = (uint8_t*)dst;
+    const uint8_t* x   = (const uint8_t*)xPtr;
+    const uint8_t* y   = (const uint8_t*)yPtr;
+    const uint8_t* z   = (const uint8_t*)zPtr;
+    size_t i           = 0;
+
+#if ZL_HAS_AVX2
+    __m256i const dm4_0_0 = _mm256_setr_epi8(0, 1, 2, 3, -1, -1, -1, -1, -1, -1, -1, -1, 4, 5, 6, 7, 0, 1, 2, 3, -1, -1, -1, -1, -1, -1, -1, -1, 4, 5, 6, 7);
+    __m256i const dm4_0_1 = _mm256_setr_epi8(-1, -1, -1, -1, 0, 1, 2, 3, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2, 3, -1, -1, -1, -1, -1, -1, -1, -1);
+    __m256i const dm4_0_2 = _mm256_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2, 3, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2, 3, -1, -1, -1, -1);
+    __m256i const dm4_1_0 = _mm256_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 8, 9, 10, 11, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 8, 9, 10, 11, -1, -1, -1, -1);
+    __m256i const dm4_1_1 = _mm256_setr_epi8(4, 5, 6, 7, -1, -1, -1, -1, -1, -1, -1, -1, 8, 9, 10, 11, 4, 5, 6, 7, -1, -1, -1, -1, -1, -1, -1, -1, 8, 9, 10, 11);
+    __m256i const dm4_1_2 = _mm256_setr_epi8(-1, -1, -1, -1, 4, 5, 6, 7, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 4, 5, 6, 7, -1, -1, -1, -1, -1, -1, -1, -1);
+    __m256i const dm4_2_0 = _mm256_setr_epi8(-1, -1, -1, -1, 12, 13, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 12, 13, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1);
+    __m256i const dm4_2_1 = _mm256_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 12, 13, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 12, 13, 14, 15, -1, -1, -1, -1);
+    __m256i const dm4_2_2 = _mm256_setr_epi8(8, 9, 10, 11, -1, -1, -1, -1, -1, -1, -1, -1, 12, 13, 14, 15, 8, 9, 10, 11, -1, -1, -1, -1, -1, -1, -1, -1, 12, 13, 14, 15);
+#endif
+#if ZL_HAS_SSSE3
+    __m128i const dm4_128_0_0 = _mm_setr_epi8(0, 1, 2, 3, -1, -1, -1, -1, -1, -1, -1, -1, 4, 5, 6, 7);
+    __m128i const dm4_128_0_1 = _mm_setr_epi8(-1, -1, -1, -1, 0, 1, 2, 3, -1, -1, -1, -1, -1, -1, -1, -1);
+    __m128i const dm4_128_0_2 = _mm_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2, 3, -1, -1, -1, -1);
+    __m128i const dm4_128_1_0 = _mm_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 8, 9, 10, 11, -1, -1, -1, -1);
+    __m128i const dm4_128_1_1 = _mm_setr_epi8(4, 5, 6, 7, -1, -1, -1, -1, -1, -1, -1, -1, 8, 9, 10, 11);
+    __m128i const dm4_128_1_2 = _mm_setr_epi8(-1, -1, -1, -1, 4, 5, 6, 7, -1, -1, -1, -1, -1, -1, -1, -1);
+    __m128i const dm4_128_2_0 = _mm_setr_epi8(-1, -1, -1, -1, 12, 13, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1);
+    __m128i const dm4_128_2_1 = _mm_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, 12, 13, 14, 15, -1, -1, -1, -1);
+    __m128i const dm4_128_2_2 = _mm_setr_epi8(8, 9, 10, 11, -1, -1, -1, -1, -1, -1, -1, -1, 12, 13, 14, 15);
+#endif
+#if ZL_HAS_WASM_SIMD128
+    v128_t const dm4_w_0_0 = wasm_i8x16_const(0, 1, 2, 3, -1, -1, -1, -1, -1, -1, -1, -1, 4, 5, 6, 7);
+    v128_t const dm4_w_0_1 = wasm_i8x16_const(-1, -1, -1, -1, 0, 1, 2, 3, -1, -1, -1, -1, -1, -1, -1, -1);
+    v128_t const dm4_w_0_2 = wasm_i8x16_const(-1, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2, 3, -1, -1, -1, -1);
+    v128_t const dm4_w_1_0 = wasm_i8x16_const(-1, -1, -1, -1, -1, -1, -1, -1, 8, 9, 10, 11, -1, -1, -1, -1);
+    v128_t const dm4_w_1_1 = wasm_i8x16_const(4, 5, 6, 7, -1, -1, -1, -1, -1, -1, -1, -1, 8, 9, 10, 11);
+    v128_t const dm4_w_1_2 = wasm_i8x16_const(-1, -1, -1, -1, 4, 5, 6, 7, -1, -1, -1, -1, -1, -1, -1, -1);
+    v128_t const dm4_w_2_0 = wasm_i8x16_const(-1, -1, -1, -1, 12, 13, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1);
+    v128_t const dm4_w_2_1 = wasm_i8x16_const(-1, -1, -1, -1, -1, -1, -1, -1, 12, 13, 14, 15, -1, -1, -1, -1);
+    v128_t const dm4_w_2_2 = wasm_i8x16_const(8, 9, 10, 11, -1, -1, -1, -1, -1, -1, -1, -1, 12, 13, 14, 15);
+#endif
+
+#if ZL_HAS_AVX2
+    for (; i + 8u <= nbElts; i += 8u) {
+        __m256i const vx = _mm256_loadu_si256((const __m256i_u*)(x + i * 4u));
+        __m256i const vy = _mm256_loadu_si256((const __m256i_u*)(y + i * 4u));
+        __m256i const vz = _mm256_loadu_si256((const __m256i_u*)(z + i * 4u));
+        __m256i const t0 = _mm256_or_si256(
+                _mm256_or_si256(
+                        _mm256_shuffle_epi8(vx, dm4_0_0),
+                        _mm256_shuffle_epi8(vy, dm4_0_1)),
+                _mm256_shuffle_epi8(vz, dm4_0_2));
+        __m256i const t1 = _mm256_or_si256(
+                _mm256_or_si256(
+                        _mm256_shuffle_epi8(vx, dm4_1_0),
+                        _mm256_shuffle_epi8(vy, dm4_1_1)),
+                _mm256_shuffle_epi8(vz, dm4_1_2));
+        __m256i const t2 = _mm256_or_si256(
+                _mm256_or_si256(
+                        _mm256_shuffle_epi8(vx, dm4_2_0),
+                        _mm256_shuffle_epi8(vy, dm4_2_1)),
+                _mm256_shuffle_epi8(vz, dm4_2_2));
+        _mm256_storeu_si256(
+                (__m256i_u*)(out + i * 12u + 0u),
+                _mm256_permute2x128_si256(t0, t1, 0x20));
+        _mm256_storeu_si256(
+                (__m256i_u*)(out + i * 12u + 32u),
+                _mm256_permute2x128_si256(t2, t0, 0x30));
+        _mm256_storeu_si256(
+                (__m256i_u*)(out + i * 12u + 64u),
+                _mm256_permute2x128_si256(t1, t2, 0x31));
+    }
+#endif
+#if ZL_HAS_SSSE3
+    for (; i + 4u <= nbElts; i += 4u) {
+        __m128i const vx = _mm_loadu_si128((const __m128i_u*)(x + i * 4u));
+        __m128i const vy = _mm_loadu_si128((const __m128i_u*)(y + i * 4u));
+        __m128i const vz = _mm_loadu_si128((const __m128i_u*)(z + i * 4u));
+        __m128i const o0 = _mm_or_si128(
+                _mm_or_si128(
+                        _mm_shuffle_epi8(vx, dm4_128_0_0),
+                        _mm_shuffle_epi8(vy, dm4_128_0_1)),
+                _mm_shuffle_epi8(vz, dm4_128_0_2));
+        __m128i const o1 = _mm_or_si128(
+                _mm_or_si128(
+                        _mm_shuffle_epi8(vx, dm4_128_1_0),
+                        _mm_shuffle_epi8(vy, dm4_128_1_1)),
+                _mm_shuffle_epi8(vz, dm4_128_1_2));
+        __m128i const o2 = _mm_or_si128(
+                _mm_or_si128(
+                        _mm_shuffle_epi8(vx, dm4_128_2_0),
+                        _mm_shuffle_epi8(vy, dm4_128_2_1)),
+                _mm_shuffle_epi8(vz, dm4_128_2_2));
+        _mm_storeu_si128((__m128i_u*)(out + i * 12u + 0u), o0);
+        _mm_storeu_si128((__m128i_u*)(out + i * 12u + 16u), o1);
+        _mm_storeu_si128((__m128i_u*)(out + i * 12u + 32u), o2);
+    }
+#elif ZL_HAS_WASM_SIMD128
+    for (; i + 4u <= nbElts; i += 4u) {
+        v128_t const vx = wasm_v128_load(x + i * 4u);
+        v128_t const vy = wasm_v128_load(y + i * 4u);
+        v128_t const vz = wasm_v128_load(z + i * 4u);
+        v128_t const o0 = wasm_v128_or(
+                wasm_v128_or(
+                        wasm_i8x16_swizzle(vx, dm4_w_0_0),
+                        wasm_i8x16_swizzle(vy, dm4_w_0_1)),
+                wasm_i8x16_swizzle(vz, dm4_w_0_2));
+        v128_t const o1 = wasm_v128_or(
+                wasm_v128_or(
+                        wasm_i8x16_swizzle(vx, dm4_w_1_0),
+                        wasm_i8x16_swizzle(vy, dm4_w_1_1)),
+                wasm_i8x16_swizzle(vz, dm4_w_1_2));
+        v128_t const o2 = wasm_v128_or(
+                wasm_v128_or(
+                        wasm_i8x16_swizzle(vx, dm4_w_2_0),
+                        wasm_i8x16_swizzle(vy, dm4_w_2_1)),
+                wasm_i8x16_swizzle(vz, dm4_w_2_2));
+        wasm_v128_store(out + i * 12u + 0u, o0);
+        wasm_v128_store(out + i * 12u + 16u, o1);
+        wasm_v128_store(out + i * 12u + 32u, o2);
+    }
+#endif
+    for (; i < nbElts; i++) {
+        ZL_write32(out + i * 12u + 0u, ZL_read32(x + i * 4u));
+        ZL_write32(out + i * 12u + 4u, ZL_read32(y + i * 4u));
+        ZL_write32(out + i * 12u + 8u, ZL_read32(z + i * 4u));
+    }
+}
+
+
 static size_t sumArrayST(const size_t array[], size_t arraySize)
 {
     size_t total = 0;
@@ -189,6 +465,18 @@ size_t ZS_dispatchArrayFixedSizeStruct_decode(
     size_t const structSize = sumArrayST(fieldSizes, nbFields);
     size_t const dstSize    = structSize * nbElts;
     assert(dstSize <= dstCapacity);
+
+    if (nbFields == 3 && fieldSizes[0] == fieldSizes[1]
+        && fieldSizes[1] == fieldSizes[2]) {
+        if (fieldSizes[0] == 2) {
+            rejoin_3ch_2b(dst, srcs[0], srcs[1], srcs[2], nbElts);
+            return dstSize;
+        }
+        if (fieldSizes[0] == 4) {
+            rejoin_3ch_4b(dst, srcs[0], srcs[1], srcs[2], nbElts);
+            return dstSize;
+        }
+    }
 
     // Shortcut to 8-bytes variant
     if (maxFieldSize <= 8 && minFieldSize >= 1) {
