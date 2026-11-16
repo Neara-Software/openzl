@@ -263,6 +263,39 @@ TEST_F(Hilbert3Test, Hilbert3I32ParityAndRoundTrip)
     });
 }
 
+TEST_F(Hilbert3Test, SimdBatchBoundariesAndCacheTiers)
+{
+    for (size_t n = 0; n <= 35; n++) {
+        // U16 Tier-1 cache hits: constant top 4 bits (>>12), varying bits 9..11 and 0..8
+        std::vector<uint16_t> tier1Pts(3 * n);
+        for (size_t i = 0; i < n; i++) {
+            uint16_t const base = static_cast<uint16_t>(((i / 19) * 0x3000u) & 0xF000u);
+            tier1Pts[3 * i + 0] = static_cast<uint16_t>(base | ((i * 513u) & 0x0FFFu));
+            tier1Pts[3 * i + 1] = static_cast<uint16_t>((base ^ 0x5000u) | ((i * 771u) & 0x0FFFu));
+            tier1Pts[3 * i + 2] = static_cast<uint16_t>((base ^ 0xA000u) | ((i * 259u) & 0x0FFFu));
+        }
+        checkU16ParityAndRoundTrip(tier1Pts);
+
+        // Zero-key initial run (all-zero prefix vs sentinel)
+        std::vector<uint16_t> zeroRunU16(3 * n, 0);
+        if (n > 0) {
+            zeroRunU16[3 * (n - 1)] = 1;
+        }
+        checkU16ParityAndRoundTrip(zeroRunU16);
+
+        // I32 Hilbert-ordered fast path + mid-batch backward escape inside same >>12 cell
+        std::vector<int32_t> fastI32(3 * n);
+        for (size_t i = 0; i < n; i++) {
+            int32_t const cell = static_cast<int32_t>((i / 19) << 13) - (1 << 20);
+            size_t const step  = (i == 13) ? 0 : (i % 19); // backward jump on i==13 in same >>12 cell
+            fastI32[3 * i + 0] = cell + static_cast<int32_t>(step);
+            fastI32[3 * i + 1] = cell;
+            fastI32[3 * i + 2] = cell;
+        }
+        checkI32ParityAndRoundTrip(fastI32);
+    }
+}
+
 } // namespace
 } // namespace tests
 } // namespace openzl
