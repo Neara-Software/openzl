@@ -47,10 +47,68 @@ class ACECrossover {
         return ACEMutate(rng_, inputType_, formatVersion_)(recipient);
     }
 
+    static bool isProtectedPort(const ACENodeCompressor& node, size_t port)
+    {
+        return port == 1
+                && (node.node.name == "zl.pco_bin_split"
+                    || node.node.name == "zl.int_mult_split"
+                    || node.node.name == "zl.float_mult_split");
+    }
+
+    template <typename Fn>
+    static void forEachMutable(
+            const ACECompressor& comp,
+            Type inputType,
+            Fn&& fn)
+    {
+        fn(comp, inputType);
+        if (comp.isNode()) {
+            const auto& node = comp.asNode();
+            for (size_t i = 0; i < node.successors.size(); ++i) {
+                if (isProtectedPort(node, i)) {
+                    continue;
+                }
+                forEachMutable(
+                        *node.successors[i], node.node.outputTypes[i], fn);
+            }
+        }
+    }
+
+    template <typename Fn>
+    static ACECompressor replaceMutable(
+            const ACECompressor& comp,
+            Type inputType,
+            Fn&& fn)
+    {
+        auto replacement = fn(comp, inputType);
+        if (replacement.has_value()) {
+            return std::move(*replacement);
+        }
+        if (comp.isNode()) {
+            const auto& node = comp.asNode();
+            std::vector<std::unique_ptr<ACECompressor>> successors;
+            successors.reserve(node.successors.size());
+            for (size_t i = 0; i < node.successors.size(); ++i) {
+                if (isProtectedPort(node, i)) {
+                    successors.push_back(
+                            std::make_unique<ACECompressor>(*node.successors[i]));
+                } else {
+                    successors.push_back(std::make_unique<ACECompressor>(
+                            replaceMutable(
+                                    *node.successors[i],
+                                    node.node.outputTypes[i],
+                                    fn)));
+                }
+            }
+            return ACENodeCompressor(node.node, std::move(successors));
+        }
+        return comp;
+    }
+
     ACECompressor getRandomComponent(const ACECompressor& donor)
     {
         ACEReservoirSampler<const ACECompressor> sampler(rng_);
-        donor.forEachComponent(inputType_, [&](const auto& component, auto) {
+        forEachMutable(donor, inputType_, [&](const auto& component, auto) {
             sampler.update(component);
         });
         return *sampler.get();
@@ -61,19 +119,19 @@ class ACECrossover {
             ACECompressor&& donorComponent)
     {
         ACEReservoirSampler<const ACECompressor> sampler(rng_);
-        recipient.forEachComponent(
-                inputType_, [&](const auto& component, auto inputType) {
+        forEachMutable(
+                recipient, inputType_, [&](const auto& component, auto inputType) {
                     if (donorComponent.acceptsInputType(inputType)) {
                         sampler.update(component);
                     }
                 });
         if (sampler.get()) {
-            return recipient.replace(
+            return replaceMutable(
+                    recipient,
                     inputType_,
                     [&donorComponent, target = sampler.get()](
                             const auto& component,
-                            auto inputType,
-                            size_t) mutable -> poly::optional<ACECompressor> {
+                            auto inputType) mutable -> poly::optional<ACECompressor> {
                         if (&component == target) {
                             assert(donorComponent.acceptsInputType(inputType));
                             return std::move(donorComponent);

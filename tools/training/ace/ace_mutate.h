@@ -337,7 +337,11 @@ class ACEMutate {
                 || (node.name == "zl.int_mult_split"
                     && childNodeName == "zl.int_mult_split")
                 || (node.name == "zl.float_mult_split"
-                    && childNodeName == "zl.float_mult_split")) {
+                    && childNodeName == "zl.float_mult_split")
+                || (node.name == "zl.lookback_delta"
+                    && childNodeName == "zl.lookback_delta")
+                || (node.name == "zl.pco_bin_split"
+                    && childNodeName == "zl.pco_bin_split")) {
                 continue;
             }
             if (!node.outputTypes.empty()

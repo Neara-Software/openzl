@@ -236,6 +236,13 @@ std::vector<ACECompressor> makePrebuiltNumericCompressors()
     ACECompressor floatMultDeltaPcoBin(
             buildNode(nodes::FloatMultSplit{}),
             { deltaPcoBinSigned, pcoBinSignedFse });
+    ACECompressor floatMultPcoBin(
+            buildNode(nodes::FloatMultSplit{}),
+            { pcoBinSignedFse, pcoBinSignedFse });
+    ACECompressor intMultSignedLookbackPcoBin(
+            buildNode(nodes::IntMultSplit{
+                    nodes::IntMultSplit::Mode::Signed }),
+            { lookbackPcoBin2, compressGeneric });
     std::vector<ACECompressor> prebuilt = {
         fieldLz,
         zstd,
@@ -277,6 +284,8 @@ std::vector<ACECompressor> makePrebuiltNumericCompressors()
         intMultLookbackPcoBin,
         floatMultLookbackPcoBin,
         floatMultDeltaPcoBin,
+        floatMultPcoBin,
+        intMultSignedLookbackPcoBin,
     };
     if (transformerAllowed()) {
         prebuilt.insert(prebuilt.begin(), transformer);
@@ -782,7 +791,9 @@ ACECompressor buildRandomNodeCompressor(
     }
     if ((node.name == "zl.zigzag" || node.name == "zl.range_pack"
          || node.name == "zl.int_mult_split"
-         || node.name == "zl.float_mult_split")
+         || node.name == "zl.float_mult_split"
+         || node.name == "zl.lookback_delta"
+         || node.name == "zl.pco_bin_split")
         && successors[0]->isNode()
         && successors[0]->asNode().node.name == node.name) {
         return *successors[0];
