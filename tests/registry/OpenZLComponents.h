@@ -97,6 +97,7 @@ enum class OpenZLComponentID {
     LookbackDelta,
     PcoBinSplit,
     PcoBinSplitFloat,
+    IntMultSplit,
     // Must be last enum value
     NumComponents,
 };
@@ -180,6 +181,7 @@ std::unique_ptr<OpenZLComponent> makeBruteForceComponent();
 std::unique_ptr<OpenZLComponent> makeLookbackDeltaComponent();
 std::unique_ptr<OpenZLComponent> makePcoBinSplitComponent();
 std::unique_ptr<OpenZLComponent> makePcoBinSplitFloatComponent();
+std::unique_ptr<OpenZLComponent> makeIntMultSplitComponent();
 
 } // namespace components
 
@@ -331,6 +333,8 @@ inline std::unique_ptr<OpenZLComponent> makeOpenZLComponent(
             return components::makePcoBinSplitComponent();
         case OpenZLComponentID::PcoBinSplitFloat:
             return components::makePcoBinSplitFloatComponent();
+        case OpenZLComponentID::IntMultSplit:
+            return components::makeIntMultSplitComponent();
         case OpenZLComponentID::NumComponents:
         default:
             throw std::runtime_error("Invalid component");

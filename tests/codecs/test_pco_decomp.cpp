@@ -8,6 +8,8 @@
 #include <gtest/gtest.h>
 
 #include "openzl/cpp/codecs/LookbackDelta.hpp"
+#include "openzl/cpp/codecs/Delta.hpp"
+#include "openzl/cpp/codecs/IntMultSplit.hpp"
 #include "openzl/cpp/codecs/PcoBinSplit.hpp"
 #include "openzl/openzl.hpp"
 #include "tests/codecs/test_codec.h"
@@ -234,6 +236,74 @@ TEST_F(PcoDecompTest, PcoBinSplitWideOffsetsAbove57Bits)
         }
         testRoundTrip(Input::refNumeric(poly::span<const uint64_t>{ wideMixed }));
     }
+
+TEST_F(PcoDecompTest, IntMultSplitDetectsMultiplierAndFallsBack)
+{
+    compressor_.setParameter(CParam::FormatVersion, ZL_MAX_FORMAT_VERSION);
+
+    // 1. Multiples of 1,000,000 + offset + 5% noisy outliers -> auto-detects base
+    size_t adjCount = 0;
+    auto capAdj = compressor_.registerFunctionGraph(
+            std::make_shared<CaptureLookbackCountGraph>(&adjCount));
+    auto multNode = nodes::IntMultSplit{ nodes::IntMultSplit::Mode::Unsigned }
+                            .parameterize(compressor_);
+    auto gCap = compressor_.buildStaticGraph(
+            multNode, { graphs::Store{}(), capAdj });
+    compressor_.selectStartingGraph(gCap);
+
+    std::vector<uint64_t> scaled(2048);
+    for (size_t i = 0; i < scaled.size(); ++i) {
+        scaled[i] = (i * 7ULL + 123ULL) * 1000000ULL + 42ULL;
+        if (i % 20 == 0) {
+            scaled[i] += 3ULL;
+        }
+    }
+    testRoundTrip(Input::refNumeric(poly::span<const uint64_t>{ scaled }));
+    EXPECT_EQ(adjCount, scaled.size());
+
+    // End-to-end compression ratio with Delta + PcoBinSplit on quotients
+    auto qGraph = nodes::DeltaInt{}(
+            compressor_,
+            nodes::PcoBinSplit{ nodes::PcoBinSplit::LatentMode::Signed }(
+                    compressor_, graphs::Entropy{}(), graphs::Store{}()));
+    auto gComp = nodes::IntMultSplit{ nodes::IntMultSplit::Mode::Unsigned }(
+            compressor_, qGraph, graphs::Compress{}());
+    compressor_.selectStartingGraph(gComp);
+    auto comp = testRoundTrip(
+            Input::refNumeric(poly::span<const uint64_t>{ scaled }));
+    EXPECT_LT(
+            static_cast<double>(comp.size()),
+            0.15 * static_cast<double>(scaled.size() * sizeof(uint64_t)));
+
+    // 2. Signed mode on negative/positive multiples of 16
+    std::vector<int32_t> signedScaled(1024);
+    for (size_t i = 0; i < signedScaled.size(); ++i) {
+        int32_t k = static_cast<int32_t>((i & 31) - 16);
+        signedScaled[i] = k * 16 + ((i % 25 == 0) ? 1 : 0);
+    }
+    compressor_.selectStartingGraph(
+            nodes::IntMultSplit{ nodes::IntMultSplit::Mode::Signed }(
+                    compressor_,
+                    nodes::PcoBinSplit{ nodes::PcoBinSplit::LatentMode::Signed }(
+                            compressor_, graphs::Entropy{}(), graphs::Store{}()),
+                    graphs::Compress{}()));
+    auto compS = testRoundTrip(
+            Input::refNumeric(poly::span<const int32_t>{ signedScaled }));
+    EXPECT_LT(
+            static_cast<double>(compS.size()),
+            0.20 * static_cast<double>(signedScaled.size() * sizeof(int32_t)));
+
+    // 3. No multiplier (pseudorandom) -> falls back to base=1 (0 adjustments)
+    adjCount = 999999;
+    compressor_.selectStartingGraph(gCap);
+    std::vector<uint32_t> dense(1024);
+    uint64_t rng = 0x123456789abcdef0ULL;
+    for (size_t i = 0; i < dense.size(); ++i) {
+        rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
+        dense[i] = static_cast<uint32_t>(rng >> 32);
+    }
+    testRoundTrip(Input::refNumeric(poly::span<const uint32_t>{ dense }));
+    EXPECT_EQ(adjCount, 0u);
 }
 
 } // namespace
