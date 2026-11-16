@@ -91,6 +91,7 @@ typedef struct {
                                                  Transforms */
     ZL_OpaquePtrRegistry opaquePtrs;
     ZL_OperationContext* opCtx;
+    bool hasStandardStates;
 } DTransforms_manager;
 
 // Constructors / destructors

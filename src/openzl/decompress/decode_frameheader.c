@@ -4,20 +4,19 @@
 
 #include "openzl/decompress/decode_frameheader.h" // DFH_Interface
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include "openzl/codecs/bitpack/common_bitpack_kernel.h" // ZS_bitpackDecode32
-#include "openzl/codecs/dispatch_by_tag/decode_dispatch_by_tag_kernel.h" // ZS_DispatchByTag_decode
-#include "openzl/common/allocation.h" //ZL_malloc
-#include "openzl/common/assertion.h"  // ZS_ASSERT_*
-#include "openzl/common/cursor.h"     // ZL_RC
+#include "openzl/common/allocation.h"                    // ZL_malloc
+#include "openzl/common/assertion.h"                     // ZS_ASSERT_*
+#include "openzl/common/cursor.h"                        // ZL_RC
 #include "openzl/common/limits.h"
 #include "openzl/common/wire_format.h"  // ZL_StandardTransformID_numBits
 #include "openzl/dict/dict_constants.h" // ZL_MAX_DICTS_PER_BUNDLE
-#include "openzl/fse/fse.h"             // FSE_getErrorName
-#include "openzl/fse/hist.h"            // HIST_count_simple
 #include "openzl/shared/bits.h"
 #include "openzl/shared/mem.h"    // ZL_readLE32, etc.
+#include "openzl/shared/utils.h"  // ZL_CONTAINER_OF
 #include "openzl/shared/xxhash.h" // XXH3_64bits
 #include "openzl/zl_data.h"
 #include "openzl/zl_decompress.h" // ZS2_* public methods
@@ -28,18 +27,39 @@
 // -------------------------------------------------
 // General Frame Information, to start decompression
 // -------------------------------------------------
-struct ZL_FrameInfo {
-    size_t formatVersion;
-    ZL_FrameProperties properties;
-    size_t nbOutputs;
-    ZL_Type* types;
-    uint64_t* decompressedSizes;
-    uint64_t* numElts;
-    size_t frameHeaderSize;
-    void* comment;
-    size_t commentSize;
-    ZL_BundleID bundleID; // v25+: dict bundle ID
-};
+
+static void ZL_FrameInfo_freeArrays(ZL_FrameInfo* zfi)
+{
+    if (zfi == NULL)
+        return;
+    if (zfi->types != zfi->inlineTypes)
+        ZL_free(zfi->types);
+    if (zfi->decompressedSizes != zfi->inlineDecompressedSizes)
+        ZL_free(zfi->decompressedSizes);
+    if (zfi->numElts != zfi->inlineNumElts)
+        ZL_free(zfi->numElts);
+    ZL_free(zfi->comment);
+    zfi->types             = NULL;
+    zfi->decompressedSizes = NULL;
+    zfi->numElts           = NULL;
+    zfi->comment           = NULL;
+    zfi->commentSize       = 0;
+}
+
+static size_t ZL_FrameInfo_heapArraysSize(const ZL_FrameInfo* zfi)
+{
+    if (zfi == NULL)
+        return 0;
+    size_t total = zfi->commentSize;
+    if (zfi->types != NULL && zfi->types != zfi->inlineTypes)
+        total += zfi->nbOutputs * sizeof(*zfi->types);
+    if (zfi->decompressedSizes != NULL
+        && zfi->decompressedSizes != zfi->inlineDecompressedSizes)
+        total += zfi->nbOutputs * sizeof(*zfi->decompressedSizes);
+    if (zfi->numElts != NULL && zfi->numElts != zfi->inlineNumElts)
+        total += zfi->nbOutputs * sizeof(*zfi->numElts);
+    return total;
+}
 
 static ZL_Type decodeType(uint8_t et)
 {
@@ -281,7 +301,7 @@ static ZL_Report DFH_FrameInfo_decodeFrameHeader(
 {
     ZL_RESULT_DECLARE_SCOPE_REPORT(NULL);
     ZL_DLOG(BLOCK, "*****   DFH_FrameInfo_decodeFrameHeader   ***** \n");
-    memset(zfi, 0, sizeof(*zfi));
+    memset(zfi, 0, offsetof(struct ZL_FrameInfo, inlineTypes));
     ZL_TRY_LET(
             size_t, formatVersion, ZL_getFormatVersionFromFrame(cSrc, cSize));
     ZL_ASSERT_NN(zfi);
@@ -343,18 +363,32 @@ static ZL_Report DFH_FrameInfo_decodeFrameHeader(
     // (which is different from an empty output).
     ZL_ERR_IF_EQ(zfi->nbOutputs, 0, GENERIC, "doesn't support 0 output");
 
-    // Decode Output Types
-    ALLOC_MALLOC_CHECKED(ZL_Type, types, zfi->nbOutputs);
-    zfi->types = types;
+    // Decode Output Types & Sizes (inline for <= 4 outputs)
+    ZL_Type* types;
+    uint64_t* dSizes;
+    uint64_t* numElts;
+    if (zfi->nbOutputs <= ZL_FRAMEINFO_INLINE_OUTPUTS) {
+        types   = zfi->inlineTypes;
+        dSizes  = zfi->inlineDecompressedSizes;
+        numElts = zfi->inlineNumElts;
+    } else {
+        ALLOC_MALLOC_CHECKED(ZL_Type, heapTypes, zfi->nbOutputs);
+        types      = heapTypes;
+        zfi->types = types;
+        ALLOC_MALLOC_CHECKED(uint64_t, heapDSizes, zfi->nbOutputs);
+        dSizes                 = heapDSizes;
+        zfi->decompressedSizes = dSizes;
+        ALLOC_MALLOC_CHECKED(uint64_t, heapNumElts, zfi->nbOutputs);
+        numElts      = heapNumElts;
+        zfi->numElts = numElts;
+    }
+    zfi->types             = types;
+    zfi->decompressedSizes = dSizes;
+    zfi->numElts           = numElts;
     ZL_ERR_IF_ERR(DFH_decoderOutputTypes(
             types, zfi->nbOutputs, cSrc, cSize, &consumed, formatVersion));
 
-    // Decode Output Sizes
     ZL_ASSERT_LE(consumed, cSize);
-    ALLOC_MALLOC_CHECKED(uint64_t, dSizes, zfi->nbOutputs);
-    zfi->decompressedSizes = dSizes;
-    ALLOC_MALLOC_CHECKED(uint64_t, numElts, zfi->nbOutputs);
-    zfi->numElts = numElts;
     ZL_TRY_LET(
             size_t,
             oss,
@@ -429,20 +463,8 @@ void ZL_FrameInfo_free(ZL_FrameInfo* zfi)
 {
     if (zfi == NULL)
         return;
-    ZL_free(zfi->types);
-    ZL_free(zfi->decompressedSizes);
-    ZL_free(zfi->numElts);
-    ZL_free(zfi->comment);
+    ZL_FrameInfo_freeArrays(zfi);
     ZL_free(zfi);
-}
-
-static size_t ZL_FrameInfo_sizeof(const ZL_FrameInfo* zfi)
-{
-    if (zfi == NULL)
-        return 0;
-    return sizeof(*zfi) + zfi->nbOutputs * sizeof(*zfi->types)
-            + zfi->nbOutputs * sizeof(*zfi->decompressedSizes)
-            + zfi->nbOutputs * sizeof(*zfi->numElts) + zfi->commentSize;
 }
 
 ZL_Report ZL_FrameInfo_getFormatVersion(const ZL_FrameInfo* zfi)
@@ -525,26 +547,28 @@ ZL_Report ZL_FrameInfo_getNumElts(const ZL_FrameInfo* zfi, int outputID)
     return ZL_returnValue(zfi->numElts[outputID]);
 }
 
-static ZL_FrameInfo* FrameInfo_clone(const ZL_FrameInfo* src)
+static bool FrameInfo_cloneInto(ZL_FrameInfo* copy, const ZL_FrameInfo* src)
 {
-    ZL_FrameInfo* const copy = ZL_malloc(sizeof(*copy));
-    if (copy == NULL)
-        return NULL;
-
-    *copy                   = *src;
+    memcpy(copy, src, offsetof(struct ZL_FrameInfo, inlineTypes));
     copy->types             = NULL;
     copy->decompressedSizes = NULL;
     copy->numElts           = NULL;
     copy->comment           = NULL;
 
-    copy->types = ZL_malloc(src->nbOutputs * sizeof(*copy->types));
-    copy->decompressedSizes =
-            ZL_malloc(src->nbOutputs * sizeof(*copy->decompressedSizes));
-    copy->numElts = ZL_malloc(src->nbOutputs * sizeof(*copy->numElts));
-    if (copy->types == NULL || copy->decompressedSizes == NULL
-        || copy->numElts == NULL) {
-        ZL_FrameInfo_free(copy);
-        return NULL;
+    if (src->nbOutputs <= ZL_FRAMEINFO_INLINE_OUTPUTS) {
+        copy->types             = copy->inlineTypes;
+        copy->decompressedSizes = copy->inlineDecompressedSizes;
+        copy->numElts           = copy->inlineNumElts;
+    } else {
+        copy->types = ZL_malloc(src->nbOutputs * sizeof(*copy->types));
+        copy->decompressedSizes =
+                ZL_malloc(src->nbOutputs * sizeof(*copy->decompressedSizes));
+        copy->numElts = ZL_malloc(src->nbOutputs * sizeof(*copy->numElts));
+        if (copy->types == NULL || copy->decompressedSizes == NULL
+            || copy->numElts == NULL) {
+            ZL_FrameInfo_freeArrays(copy);
+            return false;
+        }
     }
 
     memcpy(copy->types, src->types, src->nbOutputs * sizeof(*copy->types));
@@ -558,13 +582,35 @@ static ZL_FrameInfo* FrameInfo_clone(const ZL_FrameInfo* src)
     if (src->commentSize != 0) {
         copy->comment = ZL_malloc(src->commentSize);
         if (copy->comment == NULL) {
-            ZL_FrameInfo_free(copy);
-            return NULL;
+            ZL_FrameInfo_freeArrays(copy);
+            return false;
         }
         memcpy(copy->comment, src->comment, src->commentSize);
     }
 
-    return copy;
+    return true;
+}
+
+static ZL_FrameInfo* DFH_inlineFrameInfo(DFH_Struct* dfh)
+{
+    return &dfh->inlineFrameInfo;
+}
+
+static const ZL_FrameInfo* DFH_inlineFrameInfoConst(const DFH_Struct* dfh)
+{
+    return &dfh->inlineFrameInfo;
+}
+
+static void DFH_releaseFrameInfo(DFH_Struct* dfh)
+{
+    if (dfh->frameinfo == NULL)
+        return;
+    if (dfh->frameinfo == DFH_inlineFrameInfo(dfh)) {
+        ZL_FrameInfo_freeArrays(dfh->frameinfo);
+    } else {
+        ZL_FrameInfo_free(dfh->frameinfo);
+    }
+    dfh->frameinfo = NULL;
 }
 
 ZL_Report DFH_setFrameInfo(
@@ -576,12 +622,11 @@ ZL_Report DFH_setFrameInfo(
     ZL_ASSERT_NN(dfh);
     ZL_ASSERT_NN(frameInfo);
 
-    ZL_FrameInfo* const copy = FrameInfo_clone(frameInfo);
-    ZL_ERR_IF_NULL(copy, allocation);
-
-    ZL_FrameInfo_free(dfh->frameinfo);
-    dfh->frameinfo     = copy;
-    dfh->formatVersion = (uint32_t)copy->formatVersion;
+    DFH_releaseFrameInfo(dfh);
+    ZL_FrameInfo* const dst = DFH_inlineFrameInfo(dfh);
+    ZL_ERR_IF_NOT(FrameInfo_cloneInto(dst, frameInfo), allocation);
+    dfh->frameinfo     = dst;
+    dfh->formatVersion = (uint32_t)dst->formatVersion;
     return ZL_returnSuccess();
 }
 
@@ -657,15 +702,158 @@ typedef struct DFH_Interface_s {
  */
 DFH_Interface DFH_getFrameHeaderDecoder(uint32_t formatVersion);
 
+#if !ZL_POISON_SUPPORTED
+typedef struct {
+    size_t size;
+} DFH_BlockHdr;
+
+static bool DFH_InlineArena_inBuf(const DFH_InlineArena* ia, const void* ptr)
+{
+    const uint8_t* const base = (const uint8_t*)ia->buf;
+    const uint8_t* const p    = (const uint8_t*)ptr;
+    return p >= base && p < base + ia->capacityBytes;
+}
+
+static void* DFH_InlineArena_malloc(Arena* arena, size_t size)
+{
+    DFH_InlineArena* const ia = ZL_CONTAINER_OF(arena, DFH_InlineArena, base);
+    size_t const aligned      = (ZL_MAX(size, (size_t)1) + 7u) & ~(size_t)7u;
+    size_t const needed       = sizeof(DFH_BlockHdr) + aligned;
+    if (needed <= ia->capacityBytes - ia->used) {
+        DFH_BlockHdr* const hdr =
+                (DFH_BlockHdr*)((uint8_t*)ia->buf + ia->used);
+        hdr->size = size;
+        ia->used += needed;
+        return (void*)(hdr + 1);
+    }
+    DFH_BlockHdr* const hdr =
+            (DFH_BlockHdr*)ZL_malloc(sizeof(DFH_BlockHdr) + size);
+    if (hdr == NULL)
+        return NULL;
+    hdr->size = size;
+    ia->heapAllocated += sizeof(DFH_BlockHdr) + size;
+    return (void*)(hdr + 1);
+}
+
+static void* DFH_InlineArena_calloc(Arena* arena, size_t size)
+{
+    void* const p = DFH_InlineArena_malloc(arena, size);
+    if (p != NULL && size > 0)
+        memset(p, 0, size);
+    return p;
+}
+
+static void DFH_InlineArena_free(Arena* arena, void* ptr)
+{
+    if (ptr == NULL)
+        return;
+    DFH_InlineArena* const ia = ZL_CONTAINER_OF(arena, DFH_InlineArena, base);
+    if (DFH_InlineArena_inBuf(ia, ptr))
+        return;
+    DFH_BlockHdr* const hdr = ((DFH_BlockHdr*)ptr) - 1;
+    ia->heapAllocated -= sizeof(DFH_BlockHdr) + hdr->size;
+    ZL_free(hdr);
+}
+
+static void* DFH_InlineArena_realloc(Arena* arena, void* ptr, size_t newSize)
+{
+    if (ptr == NULL)
+        return DFH_InlineArena_malloc(arena, newSize);
+    DFH_InlineArena* const ia = ZL_CONTAINER_OF(arena, DFH_InlineArena, base);
+    DFH_BlockHdr* const oldH  = ((DFH_BlockHdr*)ptr) - 1;
+    size_t const oldSize      = oldH->size;
+    if (!DFH_InlineArena_inBuf(ia, ptr)) {
+        DFH_BlockHdr* const newH = (DFH_BlockHdr*)ZL_realloc(
+                oldH, sizeof(DFH_BlockHdr) + newSize);
+        if (newH == NULL)
+            return NULL;
+        ia->heapAllocated = ia->heapAllocated - oldSize + newSize;
+        newH->size        = newSize;
+        return (void*)(newH + 1);
+    }
+    if (newSize <= oldSize)
+        return ptr;
+    void* const newPtr = DFH_InlineArena_malloc(arena, newSize);
+    if (newPtr == NULL)
+        return NULL;
+    if (oldSize > 0)
+        memcpy(newPtr, ptr, oldSize);
+    return newPtr;
+}
+
+static void DFH_InlineArena_freeAll(Arena* arena)
+{
+    DFH_InlineArena* const ia = ZL_CONTAINER_OF(arena, DFH_InlineArena, base);
+    ia->used                  = 0;
+}
+
+static void DFH_InlineArena_freeArena(Arena* arena)
+{
+    DFH_InlineArena_freeAll(arena);
+}
+
+static size_t DFH_InlineArena_memAllocated(const Arena* arena)
+{
+    const DFH_InlineArena* const ia =
+            ZL_CONST_CONTAINER_OF(arena, DFH_InlineArena, base);
+    return ia->heapAllocated;
+}
+
+static size_t DFH_InlineArena_memUsed(const Arena* arena)
+{
+    const DFH_InlineArena* const ia =
+            ZL_CONST_CONTAINER_OF(arena, DFH_InlineArena, base);
+    return ia->used + ia->heapAllocated;
+}
+
+static void DFH_InlineArena_init(
+        DFH_InlineArena* ia,
+        uint64_t* buf,
+        size_t capacityBytes)
+{
+    ia->base = (Arena){
+        .malloc       = DFH_InlineArena_malloc,
+        .calloc       = DFH_InlineArena_calloc,
+        .realloc      = DFH_InlineArena_realloc,
+        .free         = DFH_InlineArena_free,
+        .freeAll      = DFH_InlineArena_freeAll,
+        .freeArena    = DFH_InlineArena_freeArena,
+        .memAllocated = DFH_InlineArena_memAllocated,
+        .memUsed      = DFH_InlineArena_memUsed,
+    };
+    ia->used          = 0;
+    ia->heapAllocated = 0;
+    ia->buf           = buf;
+    ia->capacityBytes = capacityBytes;
+}
+#endif
+
 void DFH_init(DFH_Struct* dfh)
 {
-    memset(dfh, 0, sizeof(DFH_Struct));
+    memset(dfh, 0, offsetof(DFH_Struct, inlineFrameInfo));
+#if !ZL_POISON_SUPPORTED
+    DFH_InlineArena_init(
+            &dfh->inlineArena, dfh->inlineBuf, sizeof(dfh->inlineBuf));
+    VECTOR_INIT_IN_ARENA(
+            dfh->storedStreamSizes,
+            &dfh->inlineArena.base,
+            ZL_runtimeStreamLimit(ZL_MAX_FORMAT_VERSION));
+    VECTOR_INIT_IN_ARENA(
+            dfh->nodes,
+            &dfh->inlineArena.base,
+            ZL_runtimeNodeLimit(ZL_MAX_FORMAT_VERSION));
+    VECTOR_INIT_IN_ARENA(
+            dfh->regenDistances,
+            &dfh->inlineArena.base,
+            ZL_runtimeStreamLimit(ZL_MAX_FORMAT_VERSION));
+#else
     VECTOR_INIT(
             dfh->storedStreamSizes,
             ZL_runtimeStreamLimit(ZL_MAX_FORMAT_VERSION));
     VECTOR_INIT(dfh->nodes, ZL_runtimeNodeLimit(ZL_MAX_FORMAT_VERSION));
     VECTOR_INIT(
             dfh->regenDistances, ZL_runtimeStreamLimit(ZL_MAX_FORMAT_VERSION));
+#endif
 }
 
 void DFH_destroy(DFH_Struct* dfh)
@@ -675,8 +863,7 @@ void DFH_destroy(DFH_Struct* dfh)
     VECTOR_DESTROY(dfh->storedStreamSizes);
     VECTOR_DESTROY(dfh->nodes);
     VECTOR_DESTROY(dfh->regenDistances);
-    ZL_FrameInfo_free(dfh->frameinfo);
-    dfh->frameinfo = NULL;
+    DFH_releaseFrameInfo(dfh);
 }
 
 size_t DFH_sizeof(const DFH_Struct* dfh)
@@ -684,9 +871,18 @@ size_t DFH_sizeof(const DFH_Struct* dfh)
     if (dfh == NULL) {
         return 0;
     }
-    return VECTOR_SIZEOF(dfh->storedStreamSizes)
-            + VECTOR_SIZEOF(dfh->regenDistances) + VECTOR_SIZEOF(dfh->nodes)
-            + ZL_FrameInfo_sizeof(dfh->frameinfo);
+    size_t total = ZL_FrameInfo_heapArraysSize(dfh->frameinfo);
+    if (dfh->frameinfo != NULL
+        && dfh->frameinfo != DFH_inlineFrameInfoConst(dfh)) {
+        total += sizeof(*dfh->frameinfo);
+    }
+#if !ZL_POISON_SUPPORTED
+    total += dfh->inlineArena.heapAllocated;
+#else
+    total += VECTOR_SIZEOF(dfh->storedStreamSizes)
+            + VECTOR_SIZEOF(dfh->regenDistances) + VECTOR_SIZEOF(dfh->nodes);
+#endif
+    return total;
 }
 
 // Public Symbol
@@ -702,9 +898,12 @@ ZL_Report ZL_getDecompressedSize(const void* cSrc, size_t cSize)
 
 ZL_Report ZL_getNumOutputs(const void* cSrc, size_t cSize)
 {
-    ZL_FrameInfo* fi = ZL_FrameInfo_create(cSrc, cSize);
-    ZL_Report ret    = ZL_FrameInfo_getNumOutputs(fi);
-    ZL_FrameInfo_free(fi);
+    struct ZL_FrameInfo fi;
+    ZL_Report const decReport = DFH_FrameInfo_decodeFrameHeader(&fi, cSrc, cSize);
+    ZL_Report const ret       = ZL_isError(decReport)
+                  ? ZL_FrameInfo_getNumOutputs(NULL)
+                  : ZL_FrameInfo_getNumOutputs(&fi);
+    ZL_FrameInfo_freeArrays(&fi);
     return ret;
 }
 
@@ -819,11 +1018,47 @@ checkedBitpackDecode32(uint32_t* dst, size_t nbElts, ZL_RC* src, int nbBits)
     return ZL_returnValue(srcSize);
 }
 
+static ZL_Report readBitmap64(ZL_RC* src, size_t nbElts, uint64_t* bitmapOut)
+{
+    ZL_RESULT_DECLARE_SCOPE_REPORT(NULL);
+    ZL_ASSERT_LE(nbElts, 64);
+    size_t const nBytes = (nbElts + 7) >> 3;
+    ZL_ERR_IF_GT(nBytes, ZL_RC_avail(src), internalBuffer_tooSmall);
+    uint64_t bm = 0;
+    if (nBytes == 1) {
+        bm = *(const uint8_t*)ZL_RC_ptr(src);
+    } else if (nBytes > 0) {
+        const uint8_t* const p = (const uint8_t*)ZL_RC_ptr(src);
+        for (size_t b = 0; b < nBytes; b++) {
+            bm |= (uint64_t)p[b] << (b * 8);
+        }
+    }
+    if (nbElts < 64) {
+        bm &= (nbElts == 0) ? 0ULL : ((1ULL << nbElts) - 1ULL);
+    }
+    ZL_RC_advance(src, nBytes);
+    *bitmapOut = bm;
+    return ZL_returnSuccess();
+}
+
 // Decompress Decoder Types
 // Simple bit packing, 1 bit per transform (for the time being)
 static ZL_Report decompressTrt(uint8_t array8[], size_t nbFlags, ZL_RC* src)
 {
     ZL_RESULT_DECLARE_SCOPE_REPORT(NULL);
+    if (nbFlags <= 64) {
+        uint64_t bm = 0;
+        ZL_ERR_IF_ERR(readBitmap64(src, nbFlags, &bm));
+        if (bm == 0) {
+            if (nbFlags > 0)
+                memset(array8, 0, nbFlags);
+        } else {
+            for (size_t u = 0; u < nbFlags; u++) {
+                array8[u] = (uint8_t)((bm >> u) & 1u);
+            }
+        }
+        return ZL_returnSuccess();
+    }
     ZL_TRY_LET(size_t, r, checkedBitpackDecode8(array8, nbFlags, src, 1));
     ZL_DLOG(BLOCK, "Decoding %zu codec types, using %zu bytes", nbFlags, r);
     return ZL_returnSuccess();
@@ -842,32 +1077,25 @@ static ZL_Report decompressTrID(
     if (!nbTransforms)
         return ZL_returnSuccess();
 
-    // separate standard TrIDs from custom ones
-    // encode them separately
-    // standard TrIDs use bitpack
-    // custom TrIDs use varint
-
-    unsigned nbTrs[2];
-    unsigned maxTrtValue = 1;
-    unsigned cardinality = 0;
-    size_t const r       = HIST_count_simple(
-            nbTrs, &maxTrtValue, &cardinality, trt8, nbTransforms);
-    ZL_ERR_IF(
-            HIST_isError(r),
-            corruption,
-            "histogram error: %s",
-            FSE_getErrorName(r));
-    ZL_ASSERT_LE(maxTrtValue, 1);
-    ZL_ASSERT_EQ(nbTrs[0] + nbTrs[1], nbTransforms);
-
-    // start decoding standard nodes
-    uint32_t* snodeids = scratch;
+    size_t nbCustom = 0;
+    for (size_t u = 0; u < nbTransforms; u++) {
+        ZL_ERR_IF_GT(trt8[u], 1, corruption, "invalid transform type");
+        nbCustom += trt8[u];
+    }
+    size_t const nbStd = nbTransforms - nbCustom;
     int const nbBits   = ZL_StandardTransformID_numBits(formatVersion);
-    ZL_ERR_IF_ERR(checkedBitpackDecode32(snodeids, nbTrs[0], src, nbBits));
 
-    // then decode custom nodes
-    uint32_t* cnodeids = scratch + nbTrs[0];
-    for (size_t u = 0; u < nbTrs[1]; u++) {
+    if (nbCustom == 0) {
+        ZL_ERR_IF_ERR(
+                checkedBitpackDecode32(transformIDs, nbTransforms, src, nbBits));
+        return ZL_returnSuccess();
+    }
+
+    uint32_t* const snodeids = scratch;
+    ZL_ERR_IF_ERR(checkedBitpackDecode32(snodeids, nbStd, src, nbBits));
+
+    uint32_t* const cnodeids = scratch + nbStd;
+    for (size_t u = 0; u < nbCustom; u++) {
         ZL_RESULT_OF(uint64_t) const res = ZL_RC_popVarint(src);
         ZL_ERR_IF_ERR(res);
         uint64_t const trid64 = ZL_RES_value(res);
@@ -875,20 +1103,14 @@ static ZL_Report decompressTrID(
         cnodeids[u] = (uint32_t)trid64;
     }
 
-    // then combine
-    const void* srcs[2]    = { snodeids, cnodeids };
-    const size_t nbElts[2] = { nbTrs[0], nbTrs[1] };
-    ZL_ASSERT_EQ(nbElts[0] + nbElts[1], nbTransforms);
-    ZS_DispatchByTag_decode(
-            transformIDs,
-            nbTransforms * sizeof(transformIDs[0]),
-            srcs,
-            nbElts,
-            2,
-            4,
-            trt8);
+    size_t sIdx = 0;
+    size_t cIdx = 0;
+    for (size_t u = 0; u < nbTransforms; u++) {
+        transformIDs[u] = trt8[u] ? cnodeids[cIdx++] : snodeids[sIdx++];
+    }
+    ZL_ASSERT_EQ(sIdx, nbStd);
+    ZL_ASSERT_EQ(cIdx, nbCustom);
 
-    // return distance consumed from @src
     return ZL_returnSuccess();
 }
 
@@ -899,14 +1121,35 @@ static ZL_Report
 decompressTrHSize(uint32_t trhSizes[], size_t nbTransforms, ZL_RC* src)
 {
     ZL_RESULT_DECLARE_SCOPE_REPORT(NULL);
-    // Store 0-size flags in trhSizes temporarily
-    // 1s will be replaced by the header size
+    if (nbTransforms <= 64) {
+        uint64_t bm = 0;
+        ZL_ERR_IF_ERR(readBitmap64(src, nbTransforms, &bm));
+        if (bm == 0) {
+            if (nbTransforms > 0)
+                memset(trhSizes, 0, nbTransforms * sizeof(uint32_t));
+            return ZL_returnSuccess();
+        }
+        for (size_t u = 0; u < nbTransforms; u++) {
+            if ((bm >> u) & 1u) {
+                ZL_RESULT_OF(uint64_t) const res = ZL_RC_popVarint(src);
+                ZL_ERR_IF_ERR(res);
+                uint64_t const trhSize64 = ZL_RES_value(res);
+                ZL_ERR_IF_GE(
+                        trhSize64,
+                        UINT32_MAX - 1,
+                        corruption,
+                        "Transform header size too large");
+                trhSizes[u] = (uint32_t)trhSize64 + 1;
+            } else {
+                trhSizes[u] = 0;
+            }
+        }
+        return ZL_returnSuccess();
+    }
     ZL_ERR_IF_ERR(checkedBitpackDecode32(trhSizes, nbTransforms, src, 1));
 
-    // decode non-zero private header sizes
     for (size_t u = 0; u < nbTransforms; u++) {
         if (trhSizes[u] != 0) {
-            // varint decoded
             ZL_RESULT_OF(uint64_t) const res = ZL_RC_popVarint(src);
             ZL_ERR_IF_ERR(res);
             uint64_t const trhSize64 = ZL_RES_value(res);
@@ -929,16 +1172,29 @@ static ZL_Report
 decompressNbVOs(uint32_t nbVOs[], size_t nbTransforms, ZL_RC* src)
 {
     ZL_RESULT_DECLARE_SCOPE_REPORT(NULL);
-    // Store 0-size flags in nbVOs temporarily
-    // 1s will be replaced later by actual nbVOs
+    if (nbTransforms <= 64) {
+        uint64_t bm = 0;
+        ZL_ERR_IF_ERR(readBitmap64(src, nbTransforms, &bm));
+        if (bm == 0) {
+            if (nbTransforms > 0)
+                memset(nbVOs, 0, nbTransforms * sizeof(uint32_t));
+            return ZL_returnSuccess();
+        }
+        for (size_t u = 0; u < nbTransforms; u++) {
+            if ((bm >> u) & 1u) {
+                ZL_ASSERT_LT(ZL_transformOutStreamsLimit(8), 128);
+                ZL_TRY_LET(uint64_t, nbVOsMinus1, ZL_RC_popVarint(src));
+                nbVOs[u] = (uint32_t)nbVOsMinus1 + 1;
+            } else {
+                nbVOs[u] = 0;
+            }
+        }
+        return ZL_returnSuccess();
+    }
     ZL_ERR_IF_ERR(checkedBitpackDecode32(nbVOs, nbTransforms, src, 1));
 
-    // decode non-zero nbVOs (8-bit encoded, shifted by 1)
     for (size_t u = 0; u < nbTransforms; u++) {
         if (nbVOs[u] != 0) {
-            // Format versions < 9 used byte encoding, but the maximum valid
-            // value was < 128. In this case varint is exactly equivalent to
-            // byte encoding.
             ZL_ASSERT_LT(ZL_transformOutStreamsLimit(8), 128);
             ZL_TRY_LET(uint64_t, nbVOsMinus1, ZL_RC_popVarint(src));
             nbVOs[u] = (uint32_t)nbVOsMinus1 + 1;
@@ -960,11 +1216,31 @@ static ZL_Report decompressNbRegens(
     ZL_RESULT_DECLARE_SCOPE_REPORT(NULL);
     ZL_DLOG(SEQ, "decompressNbRegens (nbTransforms = %zu)", nbTransforms);
     ZL_ASSERT_GE(formatVersion, 16);
-    // Store 1-size flags in nbRegens temporarily
-    // 1s will be replaced later by actual nbRegens
+    if (nbTransforms <= 64) {
+        uint64_t bm = 0;
+        ZL_ERR_IF_ERR(readBitmap64(src, nbTransforms, &bm));
+        if (bm == 0) {
+            for (size_t u = 0; u < nbTransforms; u++) {
+                nbRegens[u] = 1;
+            }
+            return ZL_returnSuccess();
+        }
+        for (size_t u = 0; u < nbTransforms; u++) {
+            if ((bm >> u) & 1u) {
+                ZL_TRY_LET(uint64_t, nbRegensMinus2, ZL_RC_popVarint(src));
+                nbRegens[u] = (uint32_t)nbRegensMinus2 + 2;
+                ZL_ERR_IF_GT(
+                        nbRegens[u],
+                        ZL_runtimeNodeInputLimit(formatVersion),
+                        corruption);
+            } else {
+                nbRegens[u] = 1;
+            }
+        }
+        return ZL_returnSuccess();
+    }
     ZL_ERR_IF_ERR(checkedBitpackDecode32(nbRegens, nbTransforms, src, 1));
 
-    // decode non-1 nbRegens (varint encoded, shifted by 2)
     for (size_t u = 0; u < nbTransforms; u++) {
         if (nbRegens[u] != 0) {
             ZL_TRY_LET(uint64_t, nbRegensMinus2, ZL_RC_popVarint(src));
@@ -992,14 +1268,27 @@ static ZL_Report decompressDictIdxs(
         uint32_t* valuesWksp)
 {
     ZL_RESULT_DECLARE_SCOPE_REPORT(NULL);
-    // Decode bitmap into dictIdxs (0 = no dict, 1 = has dict)
-    ZL_ERR_IF_ERR(checkedBitpackDecode32(dictIdxs, nbTransforms, src, 1));
-
-    // Count non-zero entries
     size_t nbNonZero = 0;
-    for (size_t u = 0; u < nbTransforms; u++) {
-        if (dictIdxs[u] != 0)
-            nbNonZero++;
+    if (nbTransforms <= 64) {
+        uint64_t bm = 0;
+        ZL_ERR_IF_ERR(readBitmap64(src, nbTransforms, &bm));
+        if (bm == 0) {
+            for (size_t u = 0; u < nbTransforms; u++) {
+                dictIdxs[u] = ZL_DICT_INDEX_NONE;
+            }
+            return ZL_returnSuccess();
+        }
+        for (size_t u = 0; u < nbTransforms; u++) {
+            uint32_t const has = (uint32_t)((bm >> u) & 1u);
+            dictIdxs[u]        = has;
+            nbNonZero += has;
+        }
+    } else {
+        ZL_ERR_IF_ERR(checkedBitpackDecode32(dictIdxs, nbTransforms, src, 1));
+        for (size_t u = 0; u < nbTransforms; u++) {
+            if (dictIdxs[u] != 0)
+                nbNonZero++;
+        }
     }
 
     if (nbNonZero > 0) {
@@ -1102,21 +1391,30 @@ static size_t DFH_scratchSize(unsigned nbTransforms)
     return allocationSize;
 }
 
+#define DFH_STACK_SCRATCH_U32S (64 * 3)
+
 static ZL_Report DFH_Workspace_init(
         DFH_Workspace* wksp,
         unsigned nbTransforms,
+        uint32_t stackScratch[DFH_STACK_SCRATCH_U32S],
         VECTOR(uint32_t) * scratch)
 {
     ZL_RESULT_DECLARE_SCOPE_REPORT(NULL);
     size_t const allocationSize = DFH_scratchSize(nbTransforms);
-    ZL_ASSERT_EQ(VECTOR_MAX_CAPACITY(*scratch), 0);
-    VECTOR_INIT(*scratch, allocationSize);
-    ZL_ERR_IF_NE(
-            allocationSize,
-            VECTOR_RESIZE(*scratch, allocationSize),
-            allocation);
+    uint32_t* basePtr;
+    if (allocationSize <= DFH_STACK_SCRATCH_U32S) {
+        basePtr = stackScratch;
+    } else {
+        ZL_ASSERT_EQ(VECTOR_MAX_CAPACITY(*scratch), 0);
+        VECTOR_INIT(*scratch, allocationSize);
+        ZL_ERR_IF_NE(
+                allocationSize,
+                VECTOR_RESIZE(*scratch, allocationSize),
+                allocation);
+        basePtr = VECTOR_DATA(*scratch);
+    }
 
-    wksp->scratch0 = VECTOR_DATA(*scratch);
+    wksp->scratch0 = basePtr;
     wksp->scratch1 =
             nbTransforms ? wksp->scratch0 + nbTransforms : wksp->scratch0;
     wksp->scratch2 = nbTransforms ? (uint8_t*)(wksp->scratch1 + nbTransforms)
@@ -1125,7 +1423,7 @@ static ZL_Report DFH_Workspace_init(
     if (nbTransforms) {
         ZL_ASSERT_LE(
                 wksp->scratch2 + nbTransforms,
-                (uint8_t*)(VECTOR_DATA(*scratch) + VECTOR_SIZE(*scratch)));
+                (uint8_t*)(basePtr + allocationSize));
     }
 
     return ZL_returnSuccess();
@@ -1144,15 +1442,14 @@ static ZL_Report DFH_decodeFrameHeader_V3orMore(
     ZL_ASSERT_GE(formatVersion, 3);
     dfh->formatVersion = formatVersion;
 
-    if (dfh->frameinfo)
-        ZL_FrameInfo_free(dfh->frameinfo);
-    dfh->frameinfo = ZL_malloc(sizeof(*(dfh->frameinfo)));
-    ZL_ERR_IF_NULL(dfh->frameinfo, allocation);
-    const ZL_Report report =
-            DFH_FrameInfo_decodeFrameHeader(dfh->frameinfo, src, srcSize);
+    DFH_releaseFrameInfo(dfh);
+    ZL_FrameInfo* const zfi = DFH_inlineFrameInfo(dfh);
+    const ZL_Report report  = DFH_FrameInfo_decodeFrameHeader(zfi, src, srcSize);
     if (ZL_isError(report)) {
-        ZL_FrameInfo_free(dfh->frameinfo);
+        ZL_FrameInfo_freeArrays(zfi);
         dfh->frameinfo = NULL;
+    } else {
+        dfh->frameinfo = zfi;
     }
     return report;
 }
@@ -1163,6 +1460,7 @@ static ZL_Report decodeChunkHeader_internal(
         const void* src,
         size_t srcSize,
         const DFH_Interface* decoder,
+        uint32_t stackScratch[DFH_STACK_SCRATCH_U32S],
         VECTOR(uint32_t) * scratch)
 {
     ZL_RESULT_DECLARE_SCOPE_REPORT(NULL);
@@ -1217,7 +1515,8 @@ static ZL_Report decodeChunkHeader_internal(
             allocation);
 
     DFH_Workspace wksp = { 0 };
-    ZL_ERR_IF_ERR(DFH_Workspace_init(&wksp, (unsigned)nbDecoders, scratch));
+    ZL_ERR_IF_ERR(DFH_Workspace_init(
+            &wksp, (unsigned)nbDecoders, stackScratch, scratch));
 
     DFH_NodeInfo* const nodes = VECTOR_DATA(dfh->nodes);
 
@@ -1373,15 +1672,13 @@ static ZL_Report decodeChunkHeaderV3orMore(
         const void* src,
         size_t srcSize)
 {
-    // The vector lives here so it can be destroyed after
-    // `decodeFrameHeader_internal` finishes. However, it's only initialized and
-    // used in `decodeFrameHeader_internal`. For that reason we assign a max
-    // capacity of 0 here to enforce the fact that it's re-initialized before
-    // used.
+    uint32_t stackScratch[DFH_STACK_SCRATCH_U32S];
     VECTOR(uint32_t) scratch = VECTOR_EMPTY(0);
-    ZL_Report const ret =
-            decodeChunkHeader_internal(dfh, src, srcSize, decoder, &scratch);
-    VECTOR_DESTROY(scratch);
+    ZL_Report const ret      = decodeChunkHeader_internal(
+            dfh, src, srcSize, decoder, stackScratch, &scratch);
+    if (VECTOR_DATA(scratch) != NULL) {
+        VECTOR_DESTROY(scratch);
+    }
     return ret;
 }
 
@@ -1515,7 +1812,7 @@ static ZL_Report getCompressedSizeV3orMore(
         size_t srcSize)
 {
     ZL_DLOG(SEQ, "getCompressedSizeV3orMore (srcSize=%zu)", srcSize);
-    DFH_Struct dfh = { 0 };
+    DFH_Struct dfh;
     DFH_init(&dfh);
     ZL_Report report =
             getCompressedSizeV3orMore_inner(decoder, src, srcSize, &dfh);
@@ -1528,7 +1825,7 @@ static ZL_Report getHeaderSizeV3orV4(
         const void* src,
         size_t srcSize)
 {
-    DFH_Struct dfh_unused = { 0 };
+    DFH_Struct dfh_unused;
     DFH_init(&dfh_unused);
     ZL_Report ret = decoder->decodeFrameHeader(
             &dfh_unused, src, srcSize, decoder->formatVersion);

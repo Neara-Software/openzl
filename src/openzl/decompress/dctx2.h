@@ -137,6 +137,10 @@ int DCtx_getAppliedGParam(const ZL_DCtx* dctx, ZL_DParam gdparam);
 /// produced by a decoder node.
 #define ZL_PRODUCER_STORE ((ZL_IDType)(-1))
 
+typedef struct Arena_s Arena;
+Arena* DCTX_ensureDecoderWkspArena(ZL_DCtx* dctx);
+Arena* DCTX_ensureFusionWkspArena(ZL_DCtx* dctx);
+
 typedef struct ZL_AppendToOutputOptimization_s ZL_AppendToOutputOptimization;
 
 typedef struct ZL_DecoderFusionDesc_s ZL_DecoderFusionDesc;

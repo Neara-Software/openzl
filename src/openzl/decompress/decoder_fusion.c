@@ -125,34 +125,39 @@ static ZL_Report ZL_DecoderFusionState_buildMap(ZL_DecoderFusionState* state)
 
 ZL_Report ZL_DecoderFusionState_init(ZL_DecoderFusionState* state)
 {
-    ZL_RESULT_DECLARE_SCOPE_REPORT(NULL);
     memset(state, 0, sizeof(*state));
-
-    state->arena = ALLOC_HeapArena_create();
-    ZL_ERR_IF_NULL(state->arena, allocation);
-
-    state->codecFusionMap = ZL_DecoderFusionMap_createInArena(
-            state->arena, ZL_CUSTOM_TRANSFORM_LIMIT);
     state->codecFusions    = ZL_DecoderFusion_array;
     state->numCodecFusions = ZL_DecoderFusionID_end;
-
-    return ZL_DecoderFusionState_buildMap(state);
+    state->useCustomMap    = false;
+    return ZL_returnSuccess();
 }
 
 void ZL_DecoderFusionState_destroy(ZL_DecoderFusionState* state)
 {
     if (state->arena) {
         ALLOC_Arena_freeArena(state->arena);
+        state->arena = NULL;
     }
+}
+
+size_t ZL_DecoderFusionState_sizeof(const ZL_DecoderFusionState* state)
+{
+    if (state == NULL || state->arena == NULL) {
+        return 0;
+    }
+    return ALLOC_Arena_memAllocated(state->arena);
 }
 
 void ZL_DecoderFusionState_clearFusions(ZL_DecoderFusionState* state)
 {
-    ZL_DecoderFusionMap_clear(&state->codecFusionMap);
-    state->codecFusions    = NULL;
-    state->numCodecFusions = 0;
-    ALLOC_Arena_free(state->arena, state->codecFusionStorage);
+    if (state->arena != NULL) {
+        ZL_DecoderFusionMap_clear(&state->codecFusionMap);
+        ALLOC_Arena_free(state->arena, state->codecFusionStorage);
+    }
+    state->codecFusions       = NULL;
+    state->numCodecFusions    = 0;
     state->codecFusionStorage = NULL;
+    state->useCustomMap       = false;
 }
 
 ZL_Report ZL_DecoderFusionState_registerFusion(
@@ -162,6 +167,13 @@ ZL_Report ZL_DecoderFusionState_registerFusion(
     ZL_RESULT_DECLARE_SCOPE_REPORT(NULL);
 
     ZL_ERR_IF_ERR(ZL_DecoderFusionDesc_validate(fusion));
+
+    if (state->arena == NULL) {
+        state->arena = ALLOC_HeapArena_create();
+        ZL_ERR_IF_NULL(state->arena, allocation);
+        state->codecFusionMap = ZL_DecoderFusionMap_createInArena(
+                state->arena, ZL_CUSTOM_TRANSFORM_LIMIT);
+    }
 
     const bool firstDynamicAlloc =
             state->codecFusionStorage == NULL && state->numCodecFusions > 0;
@@ -210,14 +222,27 @@ ZL_Report ZL_DecoderFusionState_registerFusion(
 
     state->codecFusions = codecFusions;
     ++state->numCodecFusions;
+    state->useCustomMap = true;
 
     // Rebuild the map
     return ZL_DecoderFusionState_buildMap(state);
 }
 
+static Arena* ZL_DecoderFusion_ensureArena(ZL_DecoderFusion* state)
+{
+    if (state->workspaceArena == NULL) {
+        state->workspaceArena = DCTX_ensureFusionWkspArena(state->dctx);
+    }
+    return state->workspaceArena;
+}
+
 void* ZL_DecoderFusion_getScratchSpace(ZL_DecoderFusion* state, size_t size)
 {
-    return ALLOC_Arena_malloc(state->workspaceArena, size);
+    Arena* const arena = ZL_DecoderFusion_ensureArena(state);
+    if (arena == NULL) {
+        return NULL;
+    }
+    return ALLOC_Arena_malloc(arena, size);
 }
 
 ZL_Output* ZL_DecoderFusion_createTypedStream(
@@ -310,11 +335,13 @@ ZL_DecoderFusion_runCodec(ZL_DecoderFusion* state, size_t idx)
     const ZL_IDType inputEndIdx =
             nodeInfo->inputStreamBaseIdx + nodeInfo->numInputStreams;
     // Collect outputs
+    Arena* const wkspArena = ZL_DecoderFusion_ensureArena(state);
+    ZL_ERR_IF_NULL(wkspArena, allocation);
     ALLOC_ARENA_MALLOC_CHECKED(
             const ZL_Input*,
             outputs,
             nodeInfo->nbRegens,
-            state->workspaceArena);
+            wkspArena);
     for (size_t n = 0; n < nodeInfo->nbRegens; n++) {
         const ZL_IDType regenIdx = inputEndIdx + nodeInfo->regenDistances[n];
         const ZL_Data* data = ZL_DCtx_getConstStream(state->dctx, regenIdx);

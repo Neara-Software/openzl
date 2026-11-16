@@ -3,11 +3,13 @@
 #ifndef ZSTRONG_DECOMPRESS_DECODE_FRAME_HEADER_H
 #define ZSTRONG_DECOMPRESS_DECODE_FRAME_HEADER_H
 
+#include "openzl/common/allocation.h"
 #include "openzl/common/vector.h"
 #include "openzl/common/wire_format.h" // PublicTransformInfo, ZL_FrameHeaderInfo
 #include "openzl/shared/portability.h"
 #include "openzl/zl_decompress.h" // ZL_FrameInfo
 #include "openzl/zl_errors.h"     // ZL_Report
+#include "openzl/zl_unique_id.h"  // ZL_BundleID
 
 ZL_BEGIN_C_DECLS
 
@@ -57,6 +59,33 @@ DECLARE_VECTOR_TYPE(DFH_NodeInfo)
 /// It must be initialized by DFH_init(), and is filled by
 /// DFH_decodeFrameHeader().
 /// At end of life, it must be destroyed by DFH_destroy().
+#define ZL_FRAMEINFO_INLINE_OUTPUTS 4
+#define DFH_INLINE_BUF_U64S 192
+
+struct ZL_FrameInfo {
+    size_t formatVersion;
+    ZL_FrameProperties properties;
+    size_t nbOutputs;
+    ZL_Type* types;
+    uint64_t* decompressedSizes;
+    uint64_t* numElts;
+    size_t frameHeaderSize;
+    void* comment;
+    size_t commentSize;
+    ZL_BundleID bundleID; // v25+: dict bundle ID
+    ZL_Type inlineTypes[ZL_FRAMEINFO_INLINE_OUTPUTS];
+    uint64_t inlineDecompressedSizes[ZL_FRAMEINFO_INLINE_OUTPUTS];
+    uint64_t inlineNumElts[ZL_FRAMEINFO_INLINE_OUTPUTS];
+};
+
+typedef struct {
+    Arena base;
+    size_t used;
+    size_t heapAllocated;
+    uint64_t* buf;
+    size_t capacityBytes;
+} DFH_InlineArena;
+
 typedef struct {
     ZL_FrameInfo* frameinfo; // Holds information about the final regenerated
                              // streams presented to the user, such as their
@@ -71,6 +100,9 @@ typedef struct {
     VECTOR(DFH_NodeInfo) nodes; // info about each decoder transform
     size_t totalTHSize;     // Size of all private transform headers combined
     uint32_t formatVersion; // Format version of the frame
+    DFH_InlineArena inlineArena;
+    struct ZL_FrameInfo inlineFrameInfo;
+    uint64_t inlineBuf[DFH_INLINE_BUF_U64S];
 } DFH_Struct;
 
 /// Init the @p dfh

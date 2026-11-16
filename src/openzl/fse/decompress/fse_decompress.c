@@ -132,12 +132,11 @@ static size_t FSE_buildDTable_internal(FSE_DTable* dt, const short* normalizedCo
          * The benefit of doing it in two stages is that we avoid the
          * variable size inner loop, which caused lots of branch misses.
          * Now we can run through all the positions without any branch misses.
-         * We unroll the loop twice, since that is what empirically worked best.
          */
         {
             size_t position = 0;
             size_t s;
-            size_t const unroll = 2;
+            size_t const unroll = 4;
             assert(tableSize % unroll == 0); /* FSE_MIN_TABLELOG is 5 */
             for (s = 0; s < (size_t)tableSize; s += unroll) {
                 size_t u;
@@ -222,9 +221,12 @@ size_t FSE_buildDTable_raw (FSE_DTable* dt, unsigned nbBits)
     DTableH->tableLog = (U16)nbBits;
     DTableH->fastMode = 1;
     for (s=0; s<maxSV1; s++) {
-        dinfo[s].newState = 0;
-        dinfo[s].symbol = (BYTE)s;
-        dinfo[s].nbBits = (BYTE)nbBits;
+        FSE_decode_t const cell = {
+            .nbBits   = (BYTE)nbBits,
+            .symbol   = (BYTE)s,
+            .newState = 0,
+        };
+        dinfo[s] = cell;
     }
 
     return 0;
@@ -237,19 +239,19 @@ FORCE_INLINE_TEMPLATE BYTE FSE_getSymbol(FSE_DState_t* state, BIT_DStream_t* bit
     return FSE_decodeSymbol(state, bitD);
 }
 
-// Reloads bitD bitstream and decodes 4 symbols from bitStream.
-// If bitD stream doesn't contain enough bits to safely decode 4 symbols returns 1.
-// Returns 0 on success.
-FORCE_INLINE_TEMPLATE int FSE_decompress_usingDTable_internal_x4(BYTE *op, FSE_DState_t* state1, FSE_DState_t* state2,
-                FSE_DState_t* state3, FSE_DState_t* state4, BIT_DStream_t* bitD, const unsigned fast) {
-    if(BIT_reloadDStreamFast(bitD) != BIT_DStream_unfinished) {
-        return 1;
-    }
-    op[0] = FSE_getSymbol(state1, bitD, fast);
-    op[1] = FSE_getSymbol(state2, bitD, fast);
-    op[2] = FSE_getSymbol(state3, bitD, fast);
-    op[3] = FSE_getSymbol(state4, bitD, fast);
-    return 0;
+FORCE_INLINE_TEMPLATE BYTE FSE_decodeSymReg(
+        size_t* statePtr,
+        const FSE_decode_t* restrict table,
+        BIT_DStream_t* bitD,
+        const unsigned fast)
+{
+    FSE_decode_t const DInfo = table[*statePtr];
+    U32 const nbBits = DInfo.nbBits;
+    BYTE const symbol = DInfo.symbol;
+    size_t const lowBits = fast ? BIT_readBitsFast(bitD, nbBits)
+                                : BIT_readBits(bitD, nbBits);
+    *statePtr = DInfo.newState + lowBits;
+    return symbol;
 }
 
 FORCE_INLINE_TEMPLATE size_t FSE_decompress_usingDTable_generic(
@@ -268,7 +270,6 @@ FORCE_INLINE_TEMPLATE size_t FSE_decompress_usingDTable_generic(
 
     BIT_DStream_t bitD;
     FSE_DState_t state1, state2, state3, state4;
-    FSE_DState_t* states[4] = {&state1, &state2, &state1, &state2};
 
     /* Init */
     CHECK_F(BIT_initDStream(&bitD, cSrc, cSrcSize));
@@ -279,16 +280,55 @@ FORCE_INLINE_TEMPLATE size_t FSE_decompress_usingDTable_generic(
     if(nbStates == 4) {
         FSE_initDState(&state3, &bitD, dt);
         FSE_initDState(&state4, &bitD, dt);
-        states[2] = &state3;
-        states[3] = &state4;
     }
 
-
-    /* 4 symbols per loop */
-    for ( ; op<olimit ; op+=4) {
-        if(FSE_decompress_usingDTable_internal_x4(op, states[0], states[1], states[2], states[3], &bitD, fast)) {
-            break;
+    /* Main loop: 4 symbols per iteration with restrict-disambiguated loads */
+    {
+        const void* const tPtr = dt + 1;
+        const FSE_decode_t* restrict const table = (const FSE_decode_t*)tPtr;
+        BYTE* restrict outPtr = op;
+        BIT_DStream_t bitLocal = bitD;
+        if (nbStates == 4) {
+            size_t s1 = state1.state;
+            size_t s2 = state2.state;
+            size_t s3 = state3.state;
+            size_t s4 = state4.state;
+            for (; outPtr < olimit; outPtr += 4) {
+                if (BIT_reloadDStreamFast(&bitLocal) != BIT_DStream_unfinished) {
+                    break;
+                }
+                outPtr[0] = FSE_decodeSymReg(&s1, table, &bitLocal, fast);
+                outPtr[1] = FSE_decodeSymReg(&s2, table, &bitLocal, fast);
+                outPtr[2] = FSE_decodeSymReg(&s3, table, &bitLocal, fast);
+                outPtr[3] = FSE_decodeSymReg(&s4, table, &bitLocal, fast);
+            }
+            state1.state = s1;
+            state2.state = s2;
+            state3.state = s3;
+            state4.state = s4;
+        } else {
+            size_t s1 = state1.state;
+            size_t s2 = state2.state;
+            for (; outPtr < olimit; outPtr += 4) {
+                if (BIT_reloadDStreamFast(&bitLocal) != BIT_DStream_unfinished) {
+                    break;
+                }
+                outPtr[0] = FSE_decodeSymReg(&s1, table, &bitLocal, fast);
+                outPtr[1] = FSE_decodeSymReg(&s2, table, &bitLocal, fast);
+                outPtr[2] = FSE_decodeSymReg(&s1, table, &bitLocal, fast);
+                outPtr[3] = FSE_decodeSymReg(&s2, table, &bitLocal, fast);
+            }
+            state1.state = s1;
+            state2.state = s2;
         }
+        op = outPtr;
+        bitD = bitLocal;
+    }
+
+    FSE_DState_t* states[4] = {&state1, &state2, &state1, &state2};
+    if (nbStates == 4) {
+        states[2] = &state3;
+        states[3] = &state4;
     }
 
     /* Process the tail -
@@ -325,7 +365,7 @@ FORCE_INLINE_TEMPLATE size_t FSE_decompress_usingDTable_generic(
         if(!FSE_decodeTailSymbol(states[(i++)%4], op++))
             break;
     }
-    if(omax-op < nbStates-1) {
+    if(omax - op < (ptrdiff_t)(nbStates - 1)) {
         return ERROR(dstSize_tooSmall);
     }
     // Flush last symbol in each remaining state
@@ -336,7 +376,6 @@ FORCE_INLINE_TEMPLATE size_t FSE_decompress_usingDTable_generic(
 
     return (size_t)(op-ostart);
 }
-
 static size_t FSE_decompress_usingDTable_slow(
     void* dst, size_t maxDstSize,
     const void* cSrc, size_t cSrcSize,

@@ -179,7 +179,7 @@ ZL_DECLARE_MAP_TYPE(ZL_DecoderFusionMap, ZL_IDType, ZL_IndexRange);
 /// Manages the set of registered decoder fusions and provides lookup by
 /// parent codec ID.
 typedef struct {
-    /// Arena for all dynamic allocations owned by this state.
+    /// Arena for all dynamic allocations owned by this state (lazy).
     Arena* arena;
     /// Map from parent codec ID to the range of fusions in @p codecFusions.
     ZL_DecoderFusionMap codecFusionMap;
@@ -190,6 +190,8 @@ typedef struct {
     /// Owned storage for dynamically registered fusions (NULL if only
     /// using the static ZL_DecoderFusion_array).
     ZL_DecoderFusionDesc* codecFusionStorage;
+    /// True once dynamic fusions have been registered into codecFusionMap.
+    bool useCustomMap;
 } ZL_DecoderFusionState;
 
 /// Initialize the fusion state with the built-in fusions from the registry.
@@ -207,6 +209,9 @@ ZL_Report ZL_DecoderFusionState_registerFusion(
 
 /// Destroy the fusion state and free all associated memory.
 void ZL_DecoderFusionState_destroy(ZL_DecoderFusionState* state);
+
+/// Return heap memory currently retained by @p state.
+size_t ZL_DecoderFusionState_sizeof(const ZL_DecoderFusionState* state);
 
 /**
  * Check if @p fusion matches the codec graph rooted at @p parentNodeIndex.
@@ -231,7 +236,20 @@ static inline bool ZL_DecoderFusionState_maybeFuse(
         size_t parentNodeIndex)
 {
     PublicTransformInfo codecInfo = nodeInfo[parentNodeIndex].trpid;
-    if (codecInfo.trt != trt_standard) {
+    if (codecInfo.trt != trt_standard || state->numCodecFusions == 0) {
+        return false;
+    }
+    if (!state->useCustomMap) {
+        for (size_t i = 0; i < state->numCodecFusions; ++i) {
+            if (state->codecFusions[i].pattern.parentCodec == codecInfo.trid
+                && ZL_DecoderFusionDesc_fuseIfMatches(
+                        &state->codecFusions[i],
+                        nodeInfo,
+                        dataInfo,
+                        parentNodeIndex)) {
+                return true;
+            }
+        }
         return false;
     }
     const ZL_DecoderFusionMap_Entry* entry =
