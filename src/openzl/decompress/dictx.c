@@ -224,5 +224,11 @@ const void* ZL_Decoder_getMaterializedDict(const ZL_Decoder* dictx)
 
 void* ZL_Decoder_getScratchSpace(ZL_Decoder* di, size_t size)
 {
+    if (di->workspaceArena == NULL) {
+        di->workspaceArena = DCTX_ensureDecoderWkspArena(di->dctx);
+        if (di->workspaceArena == NULL) {
+            return NULL;
+        }
+    }
     return ALLOC_Arena_malloc(di->workspaceArena, size);
 }

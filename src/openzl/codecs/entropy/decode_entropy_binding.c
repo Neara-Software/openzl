@@ -20,8 +20,10 @@
 #    include <emmintrin.h>
 #endif
 
-static FSE_DTable const*
-buildFSEDTable(ZL_Decoder* dictx, int16_t const* norm, size_t nbSymbols)
+static FSE_DTable const* buildFSEDTable(
+        FSE_DTable* stackDTable,
+        int16_t const* norm,
+        size_t nbSymbols)
 {
     if (nbSymbols < 2) {
         // Can't encode empty or constant data
@@ -48,17 +50,18 @@ buildFSEDTable(ZL_Decoder* dictx, int16_t const* norm, size_t nbSymbols)
     if (tableLog < FSE_MIN_TABLELOG || tableLog > FSE_MAX_TABLELOG) {
         return NULL;
     }
-    FSE_DTable* const dtable =
-            ZL_Decoder_getScratchSpace(dictx, FSE_DTABLE_SIZE(tableLog));
-    if (dtable == NULL) {
-        return NULL;
-    }
-    size_t const ret = FSE_buildDTable(
-            dtable, norm, (unsigned)nbSymbols - 1, (unsigned)tableLog);
+    uint32_t wksp[FSE_BUILD_DTABLE_WKSP_SIZE_U32(FSE_MAX_TABLELOG, 255)];
+    size_t const ret = FSE_buildDTable_wksp(
+            stackDTable,
+            norm,
+            (unsigned)nbSymbols - 1,
+            (unsigned)tableLog,
+            wksp,
+            sizeof(wksp));
     if (FSE_isError(ret)) {
         return NULL;
     }
-    return dtable;
+    return stackDTable;
 }
 
 ZL_Report DI_fse_v2(ZL_Decoder* dictx, const ZL_Input* in[])
@@ -72,8 +75,9 @@ ZL_Report DI_fse_v2(ZL_Decoder* dictx, const ZL_Input* in[])
 
     ZL_ERR_IF_NE(ZL_Input_eltWidth(normStream), 2, corruption);
 
+    FSE_DTable stackDTable[FSE_DTABLE_SIZE_U32(FSE_MAX_TABLELOG)];
     FSE_DTable const* dtable = buildFSEDTable(
-            dictx,
+            stackDTable,
             (int16_t const*)ZL_Input_ptr(normStream),
             ZL_Input_numElts(normStream));
     ZL_ERR_IF_NULL(dtable, corruption);
@@ -205,7 +209,7 @@ ZL_FORCE_INLINE void countWeights(
 }
 
 static HUF_DTable const* buildHUFDTable(
-        ZL_Decoder* dictx,
+        HUF_DTable* dtable,
         uint8_t const* weights,
         size_t nbWeights,
         bool x2)
@@ -240,14 +244,7 @@ static HUF_DTable const* buildHUFDTable(
     }
 
     unsigned const maxTableLog = ZL_MAX(tableLog, HUF_TABLELOG_DEFAULT);
-    HUF_DTable* const dtable   = ZL_Decoder_getScratchSpace(
-            dictx,
-            (size_t)HUF_DTABLE_SIZE(x2 ? maxTableLog : maxTableLog - 1)
-                    * sizeof(HUF_DTable));
-    if (dtable == NULL) {
-        return NULL;
-    }
-    dtable[0] = (unsigned)maxTableLog * 0x01000001;
+    dtable[0]                  = (unsigned)maxTableLog * 0x01000001;
     ZL_ASSERT_EQ(*((uint8_t*)dtable), maxTableLog);
 
     uint8_t mutWeights[256];
@@ -315,8 +312,9 @@ ZL_Report DI_huffman_v2(ZL_Decoder* dictx, const ZL_Input* in[])
             ? HUF_selectDecoder(dstSize, ZL_Input_numElts(bitsStream))
             : false;
 
+    HUF_DTable stackDTable[HUF_DTABLE_SIZE(HUF_TABLELOG_MAX)];
     HUF_DTable const* dtable = buildHUFDTable(
-            dictx,
+            stackDTable,
             (uint8_t const*)ZL_Input_ptr(weightsStream),
             ZL_Input_numElts(weightsStream),
             x2);
@@ -349,8 +347,12 @@ ZL_Report DI_huffman_v2(ZL_Decoder* dictx, const ZL_Input* in[])
     return ZL_returnSuccess();
 }
 
+#define DI_HUF16_STACK_TABLELOG 12
+
 static ZS_Huf16DElt const* buildHUF16DTable(
         ZL_Decoder* dictx,
+        ZS_Huf16DElt* stackDTable,
+        size_t stackDTableElts,
         uint8_t const* weights,
         size_t nbWeights,
         int* tableLogPtr)
@@ -359,32 +361,32 @@ static ZS_Huf16DElt const* buildHUF16DTable(
         return NULL;
     }
 
-    // Ensure there are at least 2 non-zero weights
-    size_t firstNonZeroWeight = 0;
-    for (; firstNonZeroWeight < nbWeights; ++firstNonZeroWeight) {
-        if (weights[firstNonZeroWeight] != 0) {
-            break;
+    bool invalid     = false;
+    uint64_t sum     = 0;
+    size_t nbNonZero = 0;
+    size_t i         = 0;
+    while (i + 8 <= nbWeights) {
+        if (ZL_read64(weights + i) == 0) {
+            i += 8;
+            continue;
         }
+        for (size_t k = 0; k < 8; ++k) {
+            uint8_t const w = weights[i + k];
+            nbNonZero += (w != 0);
+            invalid |= (w > ZS_kLargeHuffmanMaxNbBits);
+            sum += (((uint64_t)1) << (w & 63)) >> 1;
+        }
+        i += 8;
     }
-    {
-        size_t secondNonZeroWeight = firstNonZeroWeight + 1;
-        for (; secondNonZeroWeight < nbWeights; ++secondNonZeroWeight) {
-            if (weights[secondNonZeroWeight] != 0) {
-                break;
-            }
-        }
-        if (secondNonZeroWeight >= nbWeights) {
-            ZL_LOG(ERROR, "Must have at least 2 non-zero weights");
-            return NULL;
-        }
-    }
-
-    bool invalid = false;
-    uint64_t sum = 0;
-    for (size_t i = firstNonZeroWeight; i < nbWeights; ++i) {
+    for (; i < nbWeights; ++i) {
         uint8_t const w = weights[i];
+        nbNonZero += (w != 0);
         invalid |= (w > ZS_kLargeHuffmanMaxNbBits);
         sum += (((uint64_t)1) << (w & 63)) >> 1;
+    }
+    if (nbNonZero < 2) {
+        ZL_LOG(ERROR, "Must have at least 2 non-zero weights");
+        return NULL;
     }
     if (invalid) {
         ZL_LOG(ERROR, "Invalid weight > %u", ZS_kLargeHuffmanMaxNbBits);
@@ -404,8 +406,11 @@ static ZS_Huf16DElt const* buildHUF16DTable(
         return NULL;
     }
 
-    ZS_Huf16DElt* const dtable = ZL_Decoder_getScratchSpace(
-            dictx, ((size_t)1 << tableLog) * sizeof(ZS_Huf16DElt));
+    size_t const tableElts = (size_t)1 << tableLog;
+    ZS_Huf16DElt* const dtable = (tableElts <= stackDTableElts)
+            ? stackDTable
+            : ZL_Decoder_getScratchSpace(
+                      dictx, tableElts * sizeof(ZS_Huf16DElt));
     if (dtable == NULL) {
         return NULL;
     }
@@ -442,8 +447,11 @@ ZL_Report DI_huffman_struct_v2(ZL_Decoder* dictx, const ZL_Input* in[])
     }
 
     int tableLog;
+    ZS_Huf16DElt stackDTable[1u << DI_HUF16_STACK_TABLELOG];
     ZS_Huf16DElt const* dtable = buildHUF16DTable(
             dictx,
+            stackDTable,
+            ZL_ARRAY_SIZE(stackDTable),
             (uint8_t const*)ZL_Input_ptr(weightsStream),
             ZL_Input_numElts(weightsStream),
             &tableLog);

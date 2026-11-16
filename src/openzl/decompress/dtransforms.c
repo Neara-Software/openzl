@@ -14,42 +14,60 @@
 typedef ZL_Type* ZL_Type_p;
 ZL_RESULT_DECLARE_TYPE(ZL_Type_p);
 
+static ZL_Report DTM_ensureAllocator(DTransforms_manager* dtm)
+{
+    ZL_RESULT_DECLARE_SCOPE_REPORT(dtm->opCtx);
+    if (dtm->allocator == NULL) {
+        dtm->allocator = ALLOC_HeapArena_create();
+        ZL_ERR_IF_NULL(
+                dtm->allocator,
+                allocation,
+                "DTM_ensureAllocator: failed creating allocator");
+    }
+    return ZL_returnSuccess();
+}
+
 ZL_Report DTM_init(
         DTransforms_manager* dtm,
         ZL_OperationContext* opCtx,
         uint32_t maxNbTransforms)
 {
-    ZL_RESULT_DECLARE_SCOPE_REPORT(opCtx);
-
-    dtm->opCtx = opCtx;
+    dtm->opCtx             = opCtx;
+    dtm->allocator         = NULL;
+    dtm->hasStandardStates = false;
 
     ZL_OpaquePtrRegistry_init(&dtm->opaquePtrs);
-    dtm->dtmap     = DTransformMap_create(maxNbTransforms);
-    dtm->allocator = ALLOC_HeapArena_create();
-    ZL_ERR_IF_NULL(
-            dtm->allocator, allocation, "DTM_init: failed creating allocator");
+    dtm->dtmap = DTransformMap_create(maxNbTransforms);
     return ZL_returnSuccess();
 }
 
 static void DTM_statesDestroy(DTransforms_manager* dtm)
 {
     ZL_ASSERT_NN(dtm);
-    for (size_t u = 0; u < ZL_StandardTransformID_end; u++) {
-        if (dtm->states[u] != NULL) {
-            ZL_CodecStateFree freeState =
-                    DT_getTransformStateMgr(&SDecoders_array[u].dtr)->stateFree;
-            ZL_ASSERT_NN(freeState);
-            freeState(dtm->states[u]);
+    if (dtm->hasStandardStates) {
+        for (size_t u = 0; u < ZL_StandardTransformID_end; u++) {
+            if (dtm->states[u] != NULL) {
+                ZL_CodecStateFree freeState =
+                        DT_getTransformStateMgr(&SDecoders_array[u].dtr)
+                                ->stateFree;
+                ZL_ASSERT_NN(freeState);
+                freeState(dtm->states[u]);
+                dtm->states[u] = NULL;
+            }
         }
+        dtm->hasStandardStates = false;
     }
-    DTransformMap_IterMut iter = DTransformMap_iterMut(&dtm->dtmap);
-    for (DTransformMap_Entry* entry;
-         (entry = DTransformMap_IterMut_next(&iter));) {
-        if (entry->val.state != NULL) {
-            ZL_CodecStateFree freeState =
-                    DT_getTransformStateMgr(&entry->val)->stateFree;
-            ZL_ASSERT_NN(freeState);
-            freeState(entry->val.state);
+    if (DTransformMap_size(&dtm->dtmap) > 0) {
+        DTransformMap_IterMut iter = DTransformMap_iterMut(&dtm->dtmap);
+        for (DTransformMap_Entry* entry;
+             (entry = DTransformMap_IterMut_next(&iter));) {
+            if (entry->val.state != NULL) {
+                ZL_CodecStateFree freeState =
+                        DT_getTransformStateMgr(&entry->val)->stateFree;
+                ZL_ASSERT_NN(freeState);
+                freeState(entry->val.state);
+                entry->val.state = NULL;
+            }
         }
     }
 }
@@ -93,6 +111,7 @@ static ZL_Report DTM_storeTransformName(
 
     const char* name = *namePtr;
     if (name != NULL) {
+        ZL_ERR_IF_ERR(DTM_ensureAllocator(dtm));
         const size_t len = strlen(name) + 1;
         ALLOC_ARENA_MALLOC_CHECKED(char, nameCopy, len, dtm->allocator);
         memcpy(nameCopy, name, len);
@@ -108,6 +127,7 @@ static ZL_RESULT_OF(ZL_Type_p) DTM_storeStreamTypes(
 {
     ZL_RESULT_DECLARE_SCOPE(ZL_Type_p, dtm->opCtx);
 
+    ZL_ERR_IF_ERR(DTM_ensureAllocator(dtm));
     const ZL_Type_p result =
             ALLOC_Arena_malloc(dtm->allocator, sizeof(ZL_Type) * nbTypes);
     ZL_ERR_IF_NULL(
@@ -126,6 +146,7 @@ static ZL_RESULT_OF(ZL_Type_p) DTM_setOutStreamTypes(
 {
     ZL_RESULT_DECLARE_SCOPE(ZL_Type_p, dtm->opCtx);
 
+    ZL_ERR_IF_ERR(DTM_ensureAllocator(dtm));
     const ZL_Type_p result =
             ALLOC_Arena_malloc(dtm->allocator, sizeof(ZL_Type) * nbTypes);
     ZL_ERR_IF_NULL(
@@ -683,6 +704,7 @@ void** DTM_getStatePtr(DTransforms_manager* dtm, PublicTransformInfo trid)
     ZL_IDType const id = trid.trid;
     if (trid.trt == trt_standard) {
         ZL_ASSERT_LT(id, ZL_StandardTransformID_end);
+        dtm->hasStandardStates = true;
         return &dtm->states[id];
     }
     ZL_ASSERT_EQ(trid.trt, trt_custom);
