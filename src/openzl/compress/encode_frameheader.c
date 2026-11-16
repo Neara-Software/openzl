@@ -729,10 +729,13 @@ static ZL_Report writeFrameHeaderV3orMore(
         const EFH_FrameInfo* fip)
 {
     ZL_RESULT_DECLARE_SCOPE_REPORT(NULL);
-    size_t extraBound = fip->comment.size ? 4 + fip->comment.size : 0;
-    if (encoder->formatVersion >= ZL_MATERIALIZED_DICT_VERSION_MIN
-        && fip->fprop->hasBundleID) {
-        extraBound += 1 + ZL_UNIQUE_ID_SIZE;
+    size_t extraBound = 0;
+    if (dst == NULL) {
+        extraBound = fip->comment.size ? 4 + fip->comment.size : 0;
+        if (encoder->formatVersion >= ZL_MATERIALIZED_DICT_VERSION_MIN
+            && fip->fprop->hasBundleID) {
+            extraBound += 1 + ZL_UNIQUE_ID_SIZE;
+        }
     }
     EFH_Workspace wksp;
     ZL_ERR_IF_ERR(EFH_Workspace_init(
