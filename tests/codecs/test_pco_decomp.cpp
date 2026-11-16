@@ -138,6 +138,104 @@ TEST_F(PcoDecompTest, PcoBinSplitCompressesBimodalAndPreservesFloatBits)
             nodes::PcoBinSplit::LatentMode::Float, edgeFloats, 0.35);
 }
 
+TEST_F(PcoDecompTest, PcoBinSplitWidthsModesAndBatchBoundaries)
+{
+    const std::vector<size_t> lengths = {
+        0, 1, 7, 8, 9, 255, 256, 257, 511, 512, 513, 1000
+    };
+    auto testType = [&](auto tag, nodes::PcoBinSplit::LatentMode mode) {
+        using T = decltype(tag);
+        for (size_t len : lengths) {
+            compressor_.setParameter(
+                    CParam::FormatVersion, ZL_MAX_FORMAT_VERSION);
+            auto graph = nodes::PcoBinSplit{ mode }(
+                    compressor_, graphs::Entropy{}(), graphs::Store{}());
+            compressor_.selectStartingGraph(graph);
+
+            // Multi-bin with ob==0 and ob>0 bins
+            std::vector<T> multi(len);
+            for (size_t i = 0; i < len; ++i) {
+                if (i % 7 == 0) {
+                    multi[i] = static_cast<T>(42);
+                } else if (i % 3 == 0) {
+                    multi[i] = static_cast<T>(100 + (i & 31));
+                } else {
+                    multi[i] = static_cast<T>((i * 13) & 0x7f);
+                }
+            }
+            testRoundTrip(Input::refNumeric(poly::span<const T>{ multi }));
+
+            // Constant (singleBin, ob==0)
+            std::vector<T> constant(len, static_cast<T>(77));
+            testRoundTrip(Input::refNumeric(poly::span<const T>{ constant }));
+
+            // All-zero offsets across multiple exact bins
+            std::vector<T> allZero(len);
+            for (size_t i = 0; i < len; ++i) {
+                allZero[i] = static_cast<T>((i % 4) * 33 + 11);
+            }
+            testRoundTrip(Input::refNumeric(poly::span<const T>{ allZero }));
+        }
+    };
+
+    testType(uint8_t{}, nodes::PcoBinSplit::LatentMode::Unsigned);
+    testType(int8_t{}, nodes::PcoBinSplit::LatentMode::Signed);
+    testType(uint16_t{}, nodes::PcoBinSplit::LatentMode::Unsigned);
+    testType(int16_t{}, nodes::PcoBinSplit::LatentMode::Signed);
+    testType(uint32_t{}, nodes::PcoBinSplit::LatentMode::Unsigned);
+    testType(int32_t{}, nodes::PcoBinSplit::LatentMode::Signed);
+    testType(uint64_t{}, nodes::PcoBinSplit::LatentMode::Unsigned);
+    testType(int64_t{}, nodes::PcoBinSplit::LatentMode::Signed);
+
+    // Float widths (32-bit and 64-bit)
+    for (size_t len : lengths) {
+        compressor_.setParameter(CParam::FormatVersion, ZL_MAX_FORMAT_VERSION);
+        auto graph = nodes::PcoBinSplit{ nodes::PcoBinSplit::LatentMode::Float }(
+                compressor_, graphs::Entropy{}(), graphs::Store{}());
+        compressor_.selectStartingGraph(graph);
+        std::vector<float> f32(len);
+        std::vector<double> f64(len);
+        for (size_t i = 0; i < len; ++i) {
+            f32[i] = (i % 5 == 0) ? 1.5f : static_cast<float>(i % 19) * 0.25f - 2.0f;
+            f64[i] = (i % 5 == 0) ? -3.5 : static_cast<double>(i % 23) * 0.125 - 1.0;
+        }
+        testRoundTrip(Input::refNumeric(poly::span<const float>{ f32 }));
+        testRoundTrip(Input::refNumeric(poly::span<const double>{ f64 }));
+    }
+}
+
+TEST_F(PcoDecompTest, PcoBinSplitWideOffsetsAbove57Bits)
+{
+    for (size_t len : { size_t(1), size_t(17), size_t(255), size_t(256), size_t(520) }) {
+        compressor_.setParameter(CParam::FormatVersion, ZL_MAX_FORMAT_VERSION);
+        auto graph = nodes::PcoBinSplit{ nodes::PcoBinSplit::LatentMode::Unsigned }(
+                compressor_, graphs::Entropy{}(), graphs::Store{}());
+        compressor_.selectStartingGraph(graph);
+
+        // Single-bin wide offsets (ob == 64)
+        std::vector<uint64_t> wideSingle(len);
+        for (size_t i = 0; i < len; ++i) {
+            wideSingle[i] = (i * 0x9E3779B97F4A7C15ULL) ^ 0xA5A5A5A5A5A5A5A5ULL;
+        }
+        testRoundTrip(Input::refNumeric(poly::span<const uint64_t>{ wideSingle }));
+
+        // Mixed ob==0, small ob, and ob >= 59 bins in the same stream
+        std::vector<uint64_t> wideMixed(len);
+        for (size_t i = 0; i < len; ++i) {
+            if (i % 4 == 0) {
+                wideMixed[i] = 12345ULL; // ob == 0 bin
+            } else if (i % 4 == 1) {
+                wideMixed[i] = 100000ULL + (i & 31); // small ob bin
+            } else {
+                // High-entropy 62-bit span in high range
+                wideMixed[i] = 0x8000000000000000ULL
+                        | ((i * 0x123456789ABCDEFULL) & 0x3FFFFFFFFFFFFFFFULL);
+            }
+        }
+        testRoundTrip(Input::refNumeric(poly::span<const uint64_t>{ wideMixed }));
+    }
+}
+
 } // namespace
 } // namespace tests
 } // namespace openzl
