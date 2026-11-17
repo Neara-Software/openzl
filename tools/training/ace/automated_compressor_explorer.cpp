@@ -56,13 +56,26 @@ namespace {
 /// Put small evolutionary pressure on the results to be simpler.
 /// Adjusts cSize on the scale of 0.1%, and times on the scale of 1%, given a
 /// typical number of components of ~10.
+double parsimonyScale()
+{
+    static const double s = [] {
+        const char* p = std::getenv("ACE_PARSIMONY_SCALE");
+        return p ? std::strtod(p, nullptr) : 1.0;
+    }();
+    return s;
+}
+
 void adjustResults(const ACECompressor& gene, std::vector<float>& results)
 {
+    const double ps = parsimonyScale();
+    if (ps <= 0.0) {
+        return;
+    }
     std::array<float, 3> scale = { 0.0001, 0.001, 0.001 };
     const size_t numComponents = gene.numComponents();
     for (size_t i = 0; i < results.size(); ++i) {
         const auto delta = results[i] * scale[i] * numComponents;
-        results[i] += std::max<float>(numComponents, delta);
+        results[i] += static_cast<float>(ps) * std::max<float>(numComponents, delta);
     }
 }
 
@@ -75,8 +88,9 @@ std::vector<float> fitnessFromResult(
     }
     auto fitness = result->asFloatVector();
     adjustResults(gene, fitness);
-    fitness[0] *= (float)transformerSizePenalty(gene)
-            * (1.0f + 1e-5f * static_cast<float>(gene.numComponents()));
+    const float compPenalty = static_cast<float>(
+            1.0 + parsimonyScale() * 1e-5 * static_cast<double>(gene.numComponents()));
+    fitness[0] *= (float)transformerSizePenalty(gene) * compPenalty;
     // ACE_SIZE_ONLY: time axes stay constant so dominance and crowding use
     // size alone. ACE_NO_CTIME: drop only the compression-time objective, so
     // the front trades size against decompression time.

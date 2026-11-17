@@ -400,34 +400,37 @@ std::vector<ACECompressor> pickComplementary(
         const std::vector<ACECompressor>& extra,
         std::vector<int>& rates)
 {
-    auto solutions = ace.solution();
+    std::vector<ACECompressor> candidates;
     if (const char* tol = std::getenv("ACE_BRUTE_TOL")) {
         const double t = std::strtod(tol, nullptr);
         float best     = std::numeric_limits<float>::infinity();
         for (const auto& f : ace.fitness()) {
             best = std::min(best, f[0]);
         }
-        solutions.clear();
         for (size_t i = 0; i < ace.population().size(); ++i) {
             if (ace.fitness()[i][0] <= best * (1 + t)) {
-                solutions.emplace_back(ace.population()[i], ace.fitness()[i]);
+                candidates.push_back(ace.population()[i]);
             }
+        }
+    } else {
+        for (auto& sol : ace.solution()) {
+            candidates.push_back(std::move(sol.first));
         }
     }
     for (const auto& e : extra) {
-        solutions.emplace_back(e, ace.fitness()[0]);
+        candidates.push_back(e);
     }
     {
         std::unordered_set<uint64_t> seen;
-        seen.reserve(solutions.size());
-        decltype(solutions) dedup;
-        dedup.reserve(solutions.size());
-        for (auto& sol : solutions) {
-            if (seen.insert(sol.first.hash()).second) {
-                dedup.push_back(std::move(sol));
+        seen.reserve(candidates.size());
+        std::vector<ACECompressor> dedup;
+        dedup.reserve(candidates.size());
+        for (auto& cand : candidates) {
+            if (seen.insert(cand.hash()).second) {
+                dedup.push_back(std::move(cand));
             }
         }
-        solutions = std::move(dedup);
+        candidates = std::move(dedup);
     }
     const auto inputs = ace.inputs();
     const size_t n    = inputs.size();
@@ -435,40 +438,81 @@ std::vector<ACECompressor> pickComplementary(
         return c.benchmark(
                 inputs.subspan(i, 1), ace.formatVersion(), ace.compressionLevel());
     };
+    const char* lambdaEnv = std::getenv("ACE_BRUTE_LAMBDA");
+    const double lambda   = lambdaEnv ? std::strtod(lambdaEnv, nullptr) : 0.0;
+    const int benchReps   = lambdaEnv != nullptr ? 3 : 1;
     std::vector<std::vector<double>> sizes;
     std::vector<double> dtime;
+    std::vector<int> candRates;
     std::vector<ACECompressor> cands;
-    using Result = poly::optional<ACECompressionResult>;
-    std::vector<std::vector<std::future<Result>>> futures(solutions.size());
-    for (size_t c = 0; c < solutions.size(); ++c) {
+    struct BenchSummary {
+        bool ok{ false };
+        double size{ 0.0 };
+        double minDtimeNs{ 0.0 };
+    };
+    std::vector<std::vector<std::future<BenchSummary>>> futures(
+            candidates.size());
+    for (size_t c = 0; c < candidates.size(); ++c) {
         for (size_t i = 0; i < n; ++i) {
             futures[c].push_back(ace.threadPool().run(
-                    [&benchmarkOne, &cand = solutions[c].first, i] {
-                        return benchmarkOne(cand, i);
+                    [&benchmarkOne, &cand = candidates[c], i, benchReps] {
+                        BenchSummary sum;
+                        double minDns = std::numeric_limits<double>::infinity();
+                        for (int rep = 0; rep < benchReps; ++rep) {
+                            auto r = benchmarkOne(cand, i);
+                            if (!r.has_value()) {
+                                sum.ok = false;
+                                return sum;
+                            }
+                            sum.ok   = true;
+                            sum.size = (double)r->compressedSize
+                                    * transformerSizePenalty(cand);
+                            minDns = std::min(
+                                    minDns,
+                                    (double)r->decompressionTime.count());
+                        }
+                        sum.minDtimeNs = std::isfinite(minDns) ? minDns : 0.0;
+                        return sum;
                     }));
         }
     }
-    for (size_t c = 0; c < solutions.size(); ++c) {
-        const auto& cand = solutions[c].first;
+    double totalInputBytes = 0;
+    for (size_t i = 0; i < n; ++i) {
+        totalInputBytes += (double)inputs[i].contentSize();
+    }
+    for (size_t c = 0; c < candidates.size(); ++c) {
+        const auto& cand = candidates[c];
         std::vector<double> s(n);
         double dns = 0;
         bool ok    = true;
         for (size_t i = 0; i < n; ++i) {
             auto r = futures[c][i].get();
-            ok     = ok && r.has_value();
+            ok     = ok && r.ok;
             if (ok) {
-                s[i] = (double)r->compressedSize * transformerSizePenalty(cand);
-                dns += (double)r->decompressionTime.count();
+                s[i] = r.size;
+                dns += r.minDtimeNs;
             }
         }
         if (ok) {
+            const int rate = totalInputBytes > 0
+                    ? (int)std::lround(dns / totalInputBytes * 1024.0)
+                    : 0;
+            if (lambda > 0) {
+                for (size_t i = 0; i < n; ++i) {
+                    const double kib = (double)inputs[i].contentSize() / 1024.0;
+                    s[i] += lambda * (double)rate * kib * 1e-6;
+                }
+            }
             sizes.push_back(std::move(s));
             dtime.push_back(dns);
+            candRates.push_back(rate);
             cands.push_back(cand);
         }
     }
     std::vector<ACECompressor> picked;
     std::vector<double> pickedDtime;
+    std::vector<int> pickedRates;
+    std::vector<size_t> pickedIdx;
     if (cands.empty()) {
         return picked;
     }
@@ -584,6 +628,53 @@ std::vector<ACECompressor> pickComplementary(
         total = bestTot;
         picked.push_back(cands[bestIdx]);
         pickedDtime.push_back(dtime[bestIdx]);
+        pickedRates.push_back(candRates[bestIdx]);
+        pickedIdx.push_back(bestIdx);
+    }
+    // 1-swap local search refinement over pickedIdx to fix early greedy choices.
+    if (pickedIdx.size() > 1 && decCap <= 0 && decEps <= 0) {
+        auto evalSubset = [&](const std::vector<size_t>& idxs) {
+            double t = 0;
+            for (size_t i = 0; i < n; ++i) {
+                double m = std::numeric_limits<double>::infinity();
+                for (size_t idx : idxs) {
+                    m = std::min(m, sizes[idx][i]);
+                }
+                t += m;
+            }
+            return t;
+        };
+        bool improved = true;
+        while (improved) {
+            improved = false;
+            for (size_t slot = 0; slot < pickedIdx.size(); ++slot) {
+                const size_t orig = pickedIdx[slot];
+                size_t bestCand   = orig;
+                double bestScore  = total;
+                for (size_t c = 0; c < cands.size(); ++c) {
+                    if (used[c]) {
+                        continue;
+                    }
+                    pickedIdx[slot] = c;
+                    const double s  = evalSubset(pickedIdx);
+                    if (s + 1e-6 < bestScore) {
+                        bestScore = s;
+                        bestCand  = c;
+                    }
+                }
+                pickedIdx[slot] = orig;
+                if (bestCand != orig) {
+                    used[orig]         = false;
+                    used[bestCand]     = true;
+                    pickedIdx[slot]    = bestCand;
+                    picked[slot]       = cands[bestCand];
+                    pickedDtime[slot]  = dtime[bestCand];
+                    pickedRates[slot]  = candRates[bestCand];
+                    total              = bestScore;
+                    improved           = true;
+                }
+            }
+        }
     }
     // If every picked pipeline contains a partial-domain codec (such as
     // zl.constant or zl.bitunpack) and there is room, append universal fallback
@@ -628,14 +719,37 @@ std::vector<ACECompressor> pickComplementary(
                 continue;
             }
             double fbDtime = pickedDtime.back();
+            int fbRate     = pickedRates.back();
+            bool foundCand = false;
             for (size_t c = 0; c < cands.size(); ++c) {
                 if (cands[c].hash() == fb.hash()) {
-                    fbDtime = dtime[c];
+                    fbDtime   = dtime[c];
+                    fbRate    = candRates[c];
+                    foundCand = true;
                     break;
                 }
             }
+            if (!foundCand && lambdaEnv != nullptr && totalInputBytes > 0) {
+                double dns = 0.0;
+                for (size_t i = 0; i < n; ++i) {
+                    double m = std::numeric_limits<double>::infinity();
+                    for (int rep = 0; rep < 3; ++rep) {
+                        auto r = benchmarkOne(fb, i);
+                        if (r.has_value()) {
+                            m = std::min(
+                                    m, (double)r->decompressionTime.count());
+                        }
+                    }
+                    if (std::isfinite(m)) {
+                        dns += m;
+                    }
+                }
+                fbDtime = dns;
+                fbRate  = (int)std::lround(dns / totalInputBytes * 1024.0);
+            }
             picked.push_back(fb);
             pickedDtime.push_back(fbDtime);
+            pickedRates.push_back(fbRate);
         }
     }
     // ACE_BRUTE_SLACK: the selector takes the first successor within the slack
@@ -649,46 +763,16 @@ std::vector<ACECompressor> pickComplementary(
             return pickedDtime[x] < pickedDtime[y];
         });
         std::vector<ACECompressor> sorted;
+        std::vector<int> sortedRates;
         for (auto k : order) {
             sorted.push_back(picked[k]);
+            sortedRates.push_back(pickedRates[k]);
         }
-        picked = std::move(sorted);
+        picked      = std::move(sorted);
+        pickedRates = std::move(sortedRates);
     }
-    // ACE_BRUTE_LAMBDA: the selector needs each pick's decode cost per input
-    // byte. Training-time decode timings are noisy under load, so take the min
-    // of 3 timings per input.
-    if (std::getenv("ACE_BRUTE_LAMBDA") != nullptr) {
-        double bytes = 0;
-        for (size_t i = 0; i < n; ++i) {
-            bytes += (double)inputs[i].contentSize();
-        }
-        // Each input of each pick is timed as its own pool task.
-        std::vector<std::vector<std::future<double>>> timings(picked.size());
-        for (size_t k = 0; k < picked.size(); ++k) {
-            for (size_t i = 0; i < n; ++i) {
-                timings[k].push_back(ace.threadPool().run(
-                        [&benchmarkOne, &p = picked[k], i] {
-                            double m = std::numeric_limits<double>::infinity();
-                            for (int rep = 0; rep < 3; ++rep) {
-                                auto r = benchmarkOne(p, i);
-                                if (r.has_value()) {
-                                    m = std::min(
-                                            m,
-                                            (double)r->decompressionTime
-                                                    .count());
-                                }
-                            }
-                            return std::isfinite(m) ? m : 0;
-                        }));
-            }
-        }
-        for (auto& perInput : timings) {
-            double ns = 0;
-            for (auto& t : perInput) {
-                ns += t.get();
-            }
-            rates.push_back((int)std::lround(ns / bytes * 1024.0));
-        }
+    if (lambdaEnv != nullptr) {
+        rates = std::move(pickedRates);
     }
     return picked;
 }

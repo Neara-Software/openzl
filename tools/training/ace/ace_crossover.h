@@ -13,8 +13,15 @@ namespace training {
 /// a comination of their traits.
 class ACECrossover {
    public:
-    ACECrossover(std::mt19937_64& rng, Type inputType, uint32_t formatVersion)
-            : rng_(rng), inputType_(inputType), formatVersion_(formatVersion)
+    ACECrossover(
+            std::mt19937_64& rng,
+            Type inputType,
+            uint32_t formatVersion,
+            size_t maxDepth = kDefaultMaxDepth)
+            : rng_(rng),
+              inputType_(inputType),
+              formatVersion_(formatVersion),
+              maxDepth_(maxDepth)
     {
     }
 
@@ -44,7 +51,7 @@ class ACECrossover {
                 return std::move(*child);
             }
         }
-        return ACEMutate(rng_, inputType_, formatVersion_)(recipient);
+        return ACEMutate(rng_, inputType_, formatVersion_, maxDepth_)(recipient);
     }
 
     static bool isProtectedPort(const ACENodeCompressor& node, size_t port)
@@ -147,6 +154,7 @@ class ACECrossover {
     std::mt19937_64& rng_;
     Type inputType_;
     uint32_t formatVersion_;
+    size_t maxDepth_;
 };
 
 } // namespace training

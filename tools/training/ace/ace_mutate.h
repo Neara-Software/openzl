@@ -39,11 +39,14 @@ class ACEMutate {
                 parent,
                 inputType_,
                 0,
+                0,
                 [&](const auto& component,
                     auto inputType,
+                    uint32_t inputWidth,
                     size_t depth) -> poly::optional<ACECompressor> {
                     if (&component == sampler.get()) {
-                        return replace(component, inputType, depth);
+                        return replace(
+                                component, inputType, inputWidth, depth);
                     } else {
                         return poly::nullopt;
                     }
@@ -77,10 +80,11 @@ class ACEMutate {
     static ACECompressor replaceMutable(
             const ACECompressor& comp,
             Type inputType,
+            uint32_t inputWidth,
             size_t depth,
             ReplaceFn&& replaceFn)
     {
-        auto replacement = replaceFn(comp, inputType, depth);
+        auto replacement = replaceFn(comp, inputType, inputWidth, depth);
         if (replacement.has_value()) {
             return std::move(*replacement);
         }
@@ -96,9 +100,12 @@ class ACEMutate {
                     successors.push_back(
                             std::make_unique<ACECompressor>(*node.successors[i]));
                 } else {
+                    const uint32_t outWidth =
+                            inferNodeOutputWidth(node.node, i, inputWidth);
                     auto s = replaceMutable(
                             *node.successors[i],
                             node.node.outputTypes[i],
+                            outWidth,
                             depth + 1,
                             replaceFn);
                     successors.push_back(
@@ -111,21 +118,25 @@ class ACEMutate {
         }
     }
 
-    ACECompressor
-    replace(const ACECompressor& component, Type inputType, size_t depth)
+    ACECompressor replace(
+            const ACECompressor& component,
+            Type inputType,
+            uint32_t inputWidth,
+            size_t depth)
     {
         std::uniform_int_distribution<int> dist(0, 4);
         auto choice = dist(rng_);
         if (choice == 0) {
             return randomSimpleCompressor(inputType);
         } else if (choice == 1) {
-            return randomCompressor(inputType, depth);
+            return randomCompressor(inputType, inputWidth, depth);
         } else if (choice == 2) {
-            return deleteRandomPipelinePrefix(component, inputType, depth);
+            return deleteRandomPipelinePrefix(
+                    component, inputType, inputWidth, depth);
         } else if (choice == 3) {
-            return addRandomPipeline(component, inputType, depth);
+            return addRandomPipeline(component, inputType, inputWidth, depth);
         } else {
-            return mutateParameters(component, inputType, depth);
+            return mutateParameters(component, inputType, inputWidth, depth);
         }
     }
 
@@ -134,19 +145,25 @@ class ACEMutate {
         return randomChoice(rng_, getPrebuiltCompressors(inputType));
     }
 
-    ACECompressor randomCompressor(Type inputType, size_t depth)
+    ACECompressor
+    randomCompressor(Type inputType, uint32_t inputWidth, size_t depth)
     {
         if (depth >= maxDepth_) {
             return buildRandomGraphCompressor(rng_, inputType);
         } else {
             return buildRandomCompressor(
-                    rng_, inputType, formatVersion_, maxDepth_ - depth);
+                    rng_,
+                    inputType,
+                    formatVersion_,
+                    maxDepth_ - depth,
+                    inputWidth);
         }
     }
 
     ACECompressor mutateParameters(
             const ACECompressor& component,
             Type inputType,
+            uint32_t inputWidth,
             size_t depth)
     {
         if (component.isGraph()) {
@@ -164,7 +181,7 @@ class ACEMutate {
                         poly::span<const ACEGraph>(
                                 variants.data(), variants.size())));
             }
-            return addRandomPipeline(component, inputType, depth);
+            return addRandomPipeline(component, inputType, inputWidth, depth);
         }
 
         const auto& nc = component.asNode();
@@ -206,17 +223,21 @@ class ACEMutate {
         } else if (nc.node.name == "zl.int_mult_split") {
             std::bernoulli_distribution flipAdj(0.5);
             if (flipAdj(rng_)) {
+                static const std::array<ACEGraph, 5> adjGraphs = {
+                    ACEGraph(graphs::Store{}),
+                    ACEGraph(graphs::Compress{}),
+                    ACEGraph(graphs::Entropy{}),
+                    ACEGraph(graphs::Bitpack{}),
+                    ACEGraph(graphs::Constant{}),
+                };
                 std::vector<std::unique_ptr<ACECompressor>> succs;
                 succs.push_back(
                         std::make_unique<ACECompressor>(*nc.successors[0]));
-                const bool currentlyStore =
-                        nc.successors[1]->isGraph()
-                        && nc.successors[1]->asGraph().graph.name == "zl.store";
+                std::uniform_int_distribution<size_t> adjDist(
+                        0, adjGraphs.size() - 1);
                 succs.push_back(
                         std::make_unique<ACECompressor>(
-                                currentlyStore ? ACECompressor(ACEGraph(
-                                                         graphs::Compress{}))
-                                               : buildStoreCompressor()));
+                                ACEGraphCompressor(adjGraphs[adjDist(rng_)])));
                 return ACENodeCompressor(nc.node, std::move(succs));
             }
             const auto compatible =
@@ -264,12 +285,16 @@ class ACEMutate {
             return ACENodeCompressor(nc.node, std::move(succs));
         } else if (
                 nc.node.name == "zl.tokenize_numeric"
-                || nc.node.name == "zl.lookback_delta") {
+                || nc.node.name == "zl.lookback_delta"
+                || nc.node.name == "zl.partition"
+                || nc.node.name == "zl.sparse_num"
+                || nc.node.name == "zl.bitunpack") {
             const auto compatible =
                     getNodesComptabileWith(inputType, formatVersion_);
             std::vector<ACENode> variants;
             for (const auto& cand : compatible) {
-                if (cand.name == nc.node.name) {
+                if (cand.name == nc.node.name
+                    && nodeAcceptsWidth(cand, inputWidth)) {
                     variants.push_back(cand);
                 }
             }
@@ -285,12 +310,13 @@ class ACEMutate {
                 return ACENodeCompressor(std::move(nextNode), std::move(succs));
             }
         }
-        return addRandomPipeline(component, inputType, depth);
+        return addRandomPipeline(component, inputType, inputWidth, depth);
     }
 
     ACECompressor deleteRandomPipelinePrefix(
             const ACECompressor& compressor,
             Type inputType,
+            uint32_t inputWidth,
             size_t depth)
     {
         const ACECompressor* pipeline = &compressor;
@@ -310,7 +336,7 @@ class ACEMutate {
             pipeline = node.successors[0].get();
         }
         if (sampler.get() == nullptr) {
-            return randomCompressor(inputType, depth);
+            return randomCompressor(inputType, inputWidth, depth);
         }
         auto replacement = *sampler.get()->asNode().successors[0];
         assert(replacement.acceptsInputType(inputType));
@@ -320,6 +346,7 @@ class ACEMutate {
     ACECompressor addRandomPipeline(
             const ACECompressor& compressor,
             Type inputType,
+            uint32_t inputWidth,
             size_t depth)
     {
         if (depth >= maxDepth_) {
@@ -331,6 +358,9 @@ class ACEMutate {
                 compressor.isNode() ? compressor.asNode().node.name : "";
         std::vector<ACENode> accepted;
         for (const auto& node : compatibleNodes) {
+            if (!nodeAcceptsWidth(node, inputWidth)) {
+                continue;
+            }
             if ((node.name == "zl.zigzag" && childNodeName == "zl.zigzag")
                 || (node.name == "zl.range_pack"
                     && childNodeName == "zl.range_pack")
@@ -373,11 +403,17 @@ class ACEMutate {
                                 ? buildStoreCompressor()
                                 : ACECompressor(ACEGraph(graphs::Entropy{})));
             } else if (node.name == "zl.int_mult_split" && i == 1) {
-                std::bernoulli_distribution useCompress(0.5);
-                successors.push_back(
-                        useCompress(rng_)
-                                ? ACECompressor(ACEGraph(graphs::Compress{}))
-                                : buildStoreCompressor());
+                static const std::array<ACEGraph, 5> adjGraphs = {
+                    ACEGraph(graphs::Store{}),
+                    ACEGraph(graphs::Compress{}),
+                    ACEGraph(graphs::Entropy{}),
+                    ACEGraph(graphs::Bitpack{}),
+                    ACEGraph(graphs::Constant{}),
+                };
+                std::uniform_int_distribution<size_t> adjDist(
+                        0, adjGraphs.size() - 1);
+                successors.push_back(ACECompressor(
+                        ACEGraphCompressor(adjGraphs[adjDist(rng_)])));
             } else if (node.name == "zl.float_mult_split" && i == 1) {
                 std::uniform_int_distribution<int> adjChoice(0, 2);
                 const int choice = adjChoice(rng_);
@@ -394,11 +430,14 @@ class ACEMutate {
                     successors.push_back(buildStoreCompressor());
                 }
             } else {
+                const uint32_t outWidth =
+                        inferNodeOutputWidth(node, i, inputWidth);
                 successors.push_back(buildRandomCompressor(
                         rng_,
                         node.outputTypes[i],
                         formatVersion_,
-                        childBudget));
+                        childBudget,
+                        outWidth));
             }
         }
         return ACECompressor(std::move(node), std::move(successors));

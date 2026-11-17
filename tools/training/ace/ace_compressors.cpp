@@ -13,6 +13,8 @@
 #include "openzl/cpp/codecs/Bitsplit.hpp"
 #include "openzl/cpp/codecs/FloatMultSplit.hpp"
 #include "openzl/cpp/codecs/IntMultSplit.hpp"
+#include "openzl/cpp/codecs/Partition.hpp"
+#include "openzl/cpp/codecs/SparseNum.hpp"
 
 namespace openzl {
 namespace training {
@@ -54,6 +56,14 @@ std::vector<ACENode> makeAllNodes()
     n.push_back(buildNode(nodes::Prefix{}));
     n.push_back(buildNode(nodes::QuantizeOffsets{}));
     n.push_back(buildNode(nodes::QuantizeLengths{}));
+    n.push_back(buildNode(nodes::Partition{
+            ZL_PartitionParamsPreset_quantizeOffsets }));
+    n.push_back(buildNode(nodes::Partition{
+            ZL_PartitionParamsPreset_quantizeLengths }));
+    n.push_back(buildNode(nodes::Partition{
+            ZL_PartitionParamsPreset_varbyte16 }));
+    n.push_back(buildNode(nodes::SparseNum{}));
+    n.push_back(buildNode(nodes::SparseNumAuto{}));
     n.push_back(buildNode(nodes::LookbackDelta{}));
     n.push_back(buildNode(
             nodes::IntMultSplit{ nodes::IntMultSplit::Mode::Unsigned }));
@@ -108,6 +118,9 @@ std::vector<ACEGraph> makeAllGraphs()
         g.push_back(buildGraph(graphs::TransformerNumeric{}));
     }
     g.push_back(buildGraph(graphs::Entropy{}));
+    g.push_back(buildGraph(graphs::Fse{}));
+    g.push_back(buildGraph(graphs::Huffman{}));
+    g.push_back(buildGraph(graphs::HuffmanPivCo{}));
     g.push_back(buildGraph(graphs::Bitpack{}));
     g.push_back(buildGraph(graphs::Constant{}));
     for (int level = 0; level < 10; ++level) {
@@ -711,13 +724,127 @@ const ACENode& pickRandomNode(
     return *variants[varDist(rng)];
 }
 
+bool nodeAcceptsWidth(const ACENode& node, uint32_t inputWidth)
+{
+    if (inputWidth == 0) {
+        return true;
+    }
+    const auto& nm = node.name;
+    if (nm == "zl.hilbert3_u16" || nm == "zl.morton3_u16") {
+        return inputWidth == 6;
+    }
+    if (nm == "zl.hilbert3_i32" || nm == "zl.morton3_i32") {
+        return inputWidth == 12;
+    }
+    if (nm == "zl.float32_deconstruct" || nm == "zl.bitsplit_fp") {
+        return inputWidth == 4;
+    }
+    if (nm == "zl.float16_deconstruct" || nm == "zl.bfloat16_deconstruct"
+        || nm == "zl.bitsplit_bf16") {
+        return inputWidth == 2;
+    }
+    if (nm == "zl.convert_struct_to_num_le"
+        || nm == "zl.convert_struct_to_num_be") {
+        return inputWidth == 1 || inputWidth == 2 || inputWidth == 4
+                || inputWidth == 8;
+    }
+    if (nm == "zl.bitsplit_top8") {
+        return inputWidth >= 2;
+    }
+    return true;
+}
+
+uint32_t inferNodeOutputWidth(
+        const ACENode& node,
+        size_t port,
+        uint32_t inputWidth)
+{
+    const auto& nm = node.name;
+    if (nm == "zl.hilbert3_u16" || nm == "zl.hilbert3_i32"
+        || nm == "zl.morton3_u16" || nm == "zl.morton3_i32") {
+        return 8;
+    }
+    if (nm == "zl.convert_serial_to_num8") {
+        return 1;
+    }
+    if (nm == "zl.convert_serial_to_num_le16"
+        || nm == "zl.convert_serial_to_num_be16") {
+        return 2;
+    }
+    if (nm == "zl.convert_serial_to_num_le32"
+        || nm == "zl.convert_serial_to_num_be32") {
+        return 4;
+    }
+    if (nm == "zl.convert_serial_to_num_le64"
+        || nm == "zl.convert_serial_to_num_be64") {
+        return 8;
+    }
+    if (nm == "zl.convert_serial_to_struct" && node.params.has_value()
+        && node.params->localParams.has_value()) {
+        for (const auto& p : node.params->localParams->getIntParams()) {
+            if (p.paramId == ZL_trlip_tokenSize && p.paramValue > 0) {
+                return static_cast<uint32_t>(p.paramValue);
+            }
+        }
+    }
+    if (nm == "zl.bitunpack" && node.params.has_value()
+        && node.params->localParams.has_value()) {
+        for (const auto& p : node.params->localParams->getIntParams()) {
+            if (p.paramId == ZL_Bitunpack_numBits && p.paramValue > 0) {
+                if (p.paramValue <= 8) return 1;
+                if (p.paramValue <= 16) return 2;
+                if (p.paramValue <= 32) return 4;
+                return 8;
+            }
+        }
+    }
+    if (nm == "zl.convert_struct_to_num_le"
+        || nm == "zl.convert_struct_to_num_be"
+        || nm == "zl.convert_num_to_struct_le"
+        || nm == "zl.convert_num_to_struct_be") {
+        return inputWidth;
+    }
+    if (nm == "zl.float32_deconstruct") {
+        return port == 0 ? 3 : 0;
+    }
+    if (nm == "zl.float16_deconstruct" || nm == "zl.bfloat16_deconstruct") {
+        return port == 0 ? 2 : 0;
+    }
+    if (nm == "zl.pco_bin_split" || nm == "zl.partition") {
+        return port == 0 ? 1 : 0;
+    }
+    if (nm == "zl.lookback_delta") {
+        return port == 0 ? inputWidth : 2;
+    }
+    if (nm == "zl.sparse_num" || nm == "zl.sparse_num_auto") {
+        return port == 0 ? 4 : inputWidth;
+    }
+    if (nm == "zl.separate_string_components") {
+        return port == 1 ? 4 : 0;
+    }
+    if (nm == "zl.delta_int" || nm == "zl.zigzag" || nm == "zl.range_pack"
+        || nm == "zl.divide_by" || nm == "zl.int_mult_split"
+        || nm == "zl.float_mult_split" || nm == "zl.merge_sorted") {
+        return inputWidth;
+    }
+    if (nm == "zl.tokenize_numeric") {
+        return port == 1 ? inputWidth : 0;
+    }
+    return 0;
+}
+
 poly::span<const ACEGraph> getPolishBackends()
 {
     static auto graphs = new std::vector<ACEGraph>{
-        buildGraph(graphs::Entropy{}),  buildGraph(graphs::Huffman{}),
-        buildGraph(graphs::Fse{}),      buildGraph(graphs::FieldLz{}),
-        buildGraph(graphs::Zstd{}),     buildGraph(graphs::Bitpack{}),
-        buildGraph(graphs::Constant{}), buildGraph(graphs::Store{}),
+        buildGraph(graphs::Entropy{}),
+        buildGraph(graphs::Huffman{}),
+        buildGraph(graphs::HuffmanPivCo{}),
+        buildGraph(graphs::Fse{}),
+        buildGraph(graphs::FieldLz{}),
+        buildGraph(graphs::Zstd{}),
+        buildGraph(graphs::Bitpack{}),
+        buildGraph(graphs::Constant{}),
+        buildGraph(graphs::Store{}),
         buildGraph(graphs::Flatpack{}),
     };
     return *graphs;
@@ -725,23 +852,48 @@ poly::span<const ACEGraph> getPolishBackends()
 
 ACECompressor buildRandomGraphCompressor(std::mt19937_64& rng, Type inputType)
 {
-    return ACEGraphCompressor(
-            randomChoice(rng, getGraphsComptabileWith(inputType)));
+    const auto graphs = getGraphsComptabileWith(inputType);
+    std::vector<std::string_view> families;
+    families.reserve(graphs.size());
+    for (const auto& g : graphs) {
+        if (std::find(families.begin(), families.end(), g.name)
+            == families.end()) {
+            families.push_back(g.name);
+        }
+    }
+    std::uniform_int_distribution<size_t> famDist(0, families.size() - 1);
+    const auto fam = families[famDist(rng)];
+    std::vector<const ACEGraph*> variants;
+    for (const auto& g : graphs) {
+        if (g.name == fam) {
+            variants.push_back(&g);
+        }
+    }
+    std::uniform_int_distribution<size_t> varDist(0, variants.size() - 1);
+    return ACEGraphCompressor(*variants[varDist(rng)]);
 }
 
 ACECompressor buildRandomNodeCompressor(
         std::mt19937_64& rng,
         Type inputType,
         uint32_t formatVersion,
-        size_t maxDepth)
+        size_t maxDepth,
+        uint32_t inputWidth)
 {
     if (maxDepth == 0) {
         return buildRandomGraphCompressor(rng, inputType);
     }
-    const auto compatible = getNodesComptabileWith(inputType, formatVersion);
+    const auto allCompatible = getNodesComptabileWith(inputType, formatVersion);
+    std::vector<ACENode> compatible;
+    compatible.reserve(allCompatible.size());
+    for (const auto& cand : allCompatible) {
+        if (nodeAcceptsWidth(cand, inputWidth)) {
+            compatible.push_back(cand);
+        }
+    }
     if (compatible.empty()) {
-        // No node is available at the target format version; fall back to a
-        // single graph.
+        // No node is available at the target format version/width; fall back to
+        // a single graph.
         return buildRandomGraphCompressor(rng, inputType);
     }
     auto node = pickRandomNodeForType(
@@ -758,11 +910,17 @@ ACECompressor buildRandomNodeCompressor(
                     useStore(rng) ? ACEGraphCompressor(buildGraph(graphs::Store{}))
                                   : ACEGraphCompressor(buildGraph(graphs::Entropy{}))));
         } else if (node.name == "zl.int_mult_split" && i == 1) {
-            std::bernoulli_distribution useCompress(0.5);
+            static const std::array<ACEGraph, 5> adjGraphs = {
+                buildGraph(graphs::Store{}),
+                buildGraph(graphs::Compress{}),
+                buildGraph(graphs::Entropy{}),
+                buildGraph(graphs::Bitpack{}),
+                buildGraph(graphs::Constant{}),
+            };
+            std::uniform_int_distribution<size_t> adjDist(
+                    0, adjGraphs.size() - 1);
             successors.push_back(std::make_unique<ACECompressor>(
-                    useCompress(rng)
-                            ? ACEGraphCompressor(buildGraph(graphs::Compress{}))
-                            : ACEGraphCompressor(buildGraph(graphs::Store{}))));
+                    ACEGraphCompressor(adjGraphs[adjDist(rng)])));
         } else if (node.name == "zl.float_mult_split" && i == 1) {
             std::uniform_int_distribution<int> adjChoice(0, 2);
             const int choice = adjChoice(rng);
@@ -781,12 +939,15 @@ ACECompressor buildRandomNodeCompressor(
                         ACEGraphCompressor(buildGraph(graphs::Store{}))));
             }
         } else {
+            const uint32_t outWidth =
+                    inferNodeOutputWidth(node, i, inputWidth);
             successors.push_back(
                     std::make_unique<ACECompressor>(buildRandomCompressor(
                             rng,
                             node.outputTypes[i],
                             formatVersion,
-                            maxDepth - 1)));
+                            maxDepth - 1,
+                            outWidth)));
         }
     }
     if ((node.name == "zl.zigzag" || node.name == "zl.range_pack"
@@ -805,7 +966,8 @@ ACECompressor buildRandomCompressor(
         std::mt19937_64& rng,
         Type inputType,
         uint32_t formatVersion,
-        size_t maxDepth)
+        size_t maxDepth,
+        uint32_t inputWidth)
 {
     if (maxDepth == 0) {
         return buildRandomGraphCompressor(rng, inputType);
@@ -817,7 +979,7 @@ ACECompressor buildRandomCompressor(
         return compressor;
     } else {
         auto compressor = buildRandomNodeCompressor(
-                rng, inputType, formatVersion, maxDepth);
+                rng, inputType, formatVersion, maxDepth, inputWidth);
         assert(compressor.acceptsInputType(inputType));
         return compressor;
     }

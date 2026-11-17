@@ -61,6 +61,17 @@ poly::span<const ACECompressor> getPrebuiltCompressors(Type inputType);
 /// that is a single graph.
 ACECompressor buildRandomGraphCompressor(std::mt19937_64& rng, Type inputType);
 
+/// @returns true if @p node can accept an input element width of
+/// @p inputWidth (0 means unknown/unconstrained).
+bool nodeAcceptsWidth(const ACENode& node, uint32_t inputWidth);
+
+/// @returns The expected element width of @p node's @p port-th output given
+/// @p inputWidth (0 if unknown or variable).
+uint32_t inferNodeOutputWidth(
+        const ACENode& node,
+        size_t port,
+        uint32_t inputWidth);
+
 /// @returns A random compressor that is compatible with the given @p inputType
 /// that is a single node followed by ACECompressor successors. Only nodes
 /// usable at @p formatVersion are considered.
@@ -68,7 +79,8 @@ ACECompressor buildRandomNodeCompressor(
         std::mt19937_64& rng,
         Type inputType,
         uint32_t formatVersion,
-        size_t maxDepth = kDefaultMaxDepth);
+        size_t maxDepth = kDefaultMaxDepth,
+        uint32_t inputWidth = 0);
 
 /// @returns A random compressor that is compatible with the given @p inputType.
 /// Only nodes usable at @p formatVersion are considered.
@@ -76,7 +88,8 @@ ACECompressor buildRandomCompressor(
         std::mt19937_64& rng,
         Type inputType,
         uint32_t formatVersion,
-        size_t maxDepth = kDefaultMaxDepth);
+        size_t maxDepth = kDefaultMaxDepth,
+        uint32_t inputWidth = 0);
 
 ACECompressor buildStoreCompressor();
 
