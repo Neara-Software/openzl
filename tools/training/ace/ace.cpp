@@ -417,20 +417,44 @@ std::vector<ACECompressor> pickComplementary(
             candidates.push_back(std::move(sol.first));
         }
     }
+    auto archived               = ace.archivedWinners();
+    const size_t archiveBegin   = candidates.size();
+    const size_t numArchivedRaw = archived.size();
+    for (auto& a : archived) {
+        candidates.push_back(std::move(a));
+    }
+    const size_t archiveEnd = candidates.size();
     for (const auto& e : extra) {
         candidates.push_back(e);
     }
+    size_t uniqueFromArchive = 0;
     {
         std::unordered_set<uint64_t> seen;
         seen.reserve(candidates.size());
         std::vector<ACECompressor> dedup;
         dedup.reserve(candidates.size());
-        for (auto& cand : candidates) {
-            if (seen.insert(cand.hash()).second) {
-                dedup.push_back(std::move(cand));
+        for (size_t idx = 0; idx < candidates.size(); ++idx) {
+            if (seen.insert(candidates[idx].hash()).second) {
+                if (idx >= archiveBegin && idx < archiveEnd) {
+                    ++uniqueFromArchive;
+                }
+                dedup.push_back(std::move(candidates[idx]));
             }
         }
         candidates = std::move(dedup);
+    }
+    if (numArchivedRaw > 0) {
+        Logger::log(
+                INFO,
+                "ACE_BRUTE ",
+                backendGraph,
+                " archive: ",
+                numArchivedRaw,
+                " archived winners (",
+                uniqueFromArchive,
+                " new), ",
+                candidates.size(),
+                " total candidates");
     }
     const auto inputs = ace.inputs();
     const size_t n    = inputs.size();

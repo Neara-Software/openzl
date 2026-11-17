@@ -113,6 +113,7 @@ class AutomatedCompressorExplorer : public GeneticAlgorithm<ACECompressor> {
             }
         }
         inputBatches_ = splitInputs(inputs_, threadPool_->numThreads);
+        batchArchive_.resize(inputBatches_.size());
     }
 
     AutomatedCompressorExplorer(
@@ -208,6 +209,11 @@ class AutomatedCompressorExplorer : public GeneticAlgorithm<ACECompressor> {
 
     void step() override;
 
+    /// Returns deduplicated MAP-Elites per-batch winners retained across all
+    /// full batch evaluations so far.
+    std::vector<ACECompressor> archivedWinners() const;
+
+    static constexpr size_t kArchivePerBatch = 3;
     static constexpr size_t kAceStateParamId = 592;
 
    private:
@@ -231,6 +237,9 @@ class AutomatedCompressorExplorer : public GeneticAlgorithm<ACECompressor> {
     size_t selectBanditOp();
     ACECompressor graftMotif(const ACECompressor& parent);
     void mineMotifs();
+    void updateBatchArchive(
+            const ACECompressor& gene,
+            const std::vector<float>& batchSizes);
 
     /// One coordinate-descent pass over the leaf graphs of @p gene: each leaf
     /// in turn is set to the backend that gives the smallest total size.
@@ -238,6 +247,7 @@ class AutomatedCompressorExplorer : public GeneticAlgorithm<ACECompressor> {
 
     std::unordered_set<uint64_t> polished_;
     std::unordered_map<uint64_t, std::vector<float>> perBatchSizes_;
+    std::vector<std::vector<std::pair<float, ACECompressor>>> batchArchive_;
     std::unordered_map<uint64_t, PendingChildInfo> pendingOps_;
     std::array<BanditOpStats, kNumBanditOps> opStats_{};
     std::vector<MinedMotif> motifs_;

@@ -16,6 +16,7 @@
 #include "tools/training/ace/ace.h"
 #include "tools/training/ace/ace_compressor.h"
 #include "tools/training/ace/ace_compressors.h"
+#include "tools/training/ace/ace_features.h"
 #include "tools/training/ace/ace_mutate.h"
 #include "tools/training/ace/ace_sampling.h"
 #include "tools/training/ace/automated_compressor_explorer.h"
@@ -474,6 +475,200 @@ TEST(ACETrainerTest, MaxTimeSecsIsSharedAcrossAceGraphs)
             << "ACE training over " << kNumGraphs << " graphs took "
             << allGraphs.count() << "ms, against " << oneGraph.count()
             << "ms for one graph, for a budget of " << kMaxTimeSecs << "s";
+}
+
+TEST_F(ACETest, ArchiveRetainsBatchWinners)
+{
+    // Two ~1.2 MiB inputs (> kMinBatchBytes each) with very different structure
+    // so splitInputs creates 2 separate batches with distinct batch winners.
+    constexpr size_t kEltsPerRegime = 150000;
+    std::vector<uint64_t> polyRegime(kEltsPerRegime, 1);
+    undelta(polyRegime);
+    undelta(polyRegime);
+    undelta(polyRegime);
+
+    std::mt19937_64 gen(0x12345678);
+    const std::array<uint64_t, 4> dict = {
+        0x1111111111111111ULL,
+        0x2222222222222222ULL,
+        0x3333333333333333ULL,
+        0x4444444444444444ULL,
+    };
+    std::vector<uint64_t> lowCardRegime(kEltsPerRegime);
+    for (size_t i = 0; i < kEltsPerRegime; ++i) {
+        lowCardRegime[i] = dict[gen() & 3];
+    }
+
+    std::vector<Input> inputs;
+    inputs.push_back(
+            Input::refNumeric(poly::span<const uint64_t>(polyRegime)));
+    inputs.push_back(
+            Input::refNumeric(poly::span<const uint64_t>(lowCardRegime)));
+
+    params.numThreads     = 2;
+    params.populationSize = 8;
+    params.maxGenerations = 1;
+    AutomatedCompressorExplorer explorer(inputs, params);
+
+    const ACECompressor bitpackGraph(ACEGraph(graphs::Bitpack{}));
+    const ACECompressor fseGraph(ACEGraph(graphs::Fse{}));
+    const ACECompressor polySpecialist(
+            ACENode(nodes::DeltaInt{}),
+            std::vector<ACECompressor>{ ACECompressor(
+                    ACENode(nodes::DeltaInt{}),
+                    std::vector<ACECompressor>{ ACECompressor(
+                            ACENode(nodes::DeltaInt{}),
+                            std::vector<ACECompressor>{ bitpackGraph }) }) });
+    const ACECompressor lowCardSpecialist(
+            ACENode(nodes::TokenizeNumeric{ true }),
+            std::vector<ACECompressor>{ bitpackGraph, fseGraph });
+    const ACECompressor genericFallback = buildCompressGenericCompressor();
+
+    explorer.extendPopulation(std::vector<ACECompressor>{
+            genericFallback, polySpecialist, lowCardSpecialist });
+
+    // Evict both specialists from the active population to verify the archive
+    // still retains per-batch winners across history.
+    explorer.subsetPopulation(std::vector<size_t>{ 0 });
+    ASSERT_EQ(explorer.population().size(), 1u);
+
+    const auto winners = explorer.archivedWinners();
+    ASSERT_FALSE(winners.empty());
+    EXPECT_LE(
+            winners.size(),
+            2 * AutomatedCompressorExplorer::kArchivePerBatch);
+
+    std::unordered_set<uint64_t> winnerHashes;
+    for (const auto& w : winners) {
+        EXPECT_TRUE(winnerHashes.insert(w.hash()).second);
+    }
+    EXPECT_GT(winnerHashes.count(polySpecialist.hash()), 0u);
+    EXPECT_GT(winnerHashes.count(lowCardSpecialist.hash()), 0u);
+}
+
+TEST_F(ACETest, FeatureGuidedSeedsAreValid)
+{
+    auto verifySeeds = [](poly::span<const Input> ins,
+                          Type type,
+                          uint32_t fmtVersion) {
+        const auto seeds = buildFeatureGuidedSeeds(ins, type, fmtVersion);
+        ASSERT_FALSE(seeds.empty());
+        for (const auto& seed : seeds) {
+            EXPECT_TRUE(seed.acceptsInputType(type)) << seed.prettyPrint();
+            const auto serialized = seed.serialize();
+            ACECompressor roundTripped(serialized);
+            EXPECT_EQ(seed, roundTripped);
+            const auto bench = seed.benchmark(ins, fmtVersion, 0);
+            ASSERT_TRUE(bench.has_value()) << seed.prettyPrint();
+            EXPECT_GT(bench->compressedSize, 0u);
+        }
+    };
+
+    // 1. Monotonic + common GCD > 1 numeric input
+    std::vector<uint32_t> monoData(2048);
+    for (size_t i = 0; i < monoData.size(); ++i) {
+        monoData[i] = static_cast<uint32_t>(i * 25);
+    }
+    Input monoIn = Input::refNumeric(poly::span<const uint32_t>(monoData));
+    const auto monoFeat =
+            extractACEInputFeatures({ &monoIn, 1 }, Type::Numeric);
+    EXPECT_EQ(monoFeat.eltWidth, 4u);
+    EXPECT_GT(monoFeat.sortedFraction, 0.99);
+    EXPECT_EQ(monoFeat.commonGcd, 25u);
+    verifySeeds({ &monoIn, 1 }, Type::Numeric, ZL_MAX_FORMAT_VERSION);
+
+    // 2. Constant-run numeric input (tested at both v26 and max format version)
+    std::vector<uint32_t> runData(2048);
+    for (size_t i = 0; i < runData.size(); ++i) {
+        runData[i] = static_cast<uint32_t>(((i / 32) * 97) ^ 0x5a);
+    }
+    Input runIn        = Input::refNumeric(poly::span<const uint32_t>(runData));
+    const auto runFeat = extractACEInputFeatures({ &runIn, 1 }, Type::Numeric);
+    EXPECT_GT(runFeat.zeroDiffFraction, 0.90);
+    verifySeeds({ &runIn, 1 }, Type::Numeric, 26);
+    verifySeeds({ &runIn, 1 }, Type::Numeric, ZL_MAX_FORMAT_VERSION);
+
+    // 3. Unsorted low-cardinality numeric input
+    std::mt19937_64 lcRng(0x98765432ULL);
+    std::vector<uint64_t> lowCardData(2048);
+    for (size_t i = 0; i < lowCardData.size(); ++i) {
+        lowCardData[i] = (lcRng() % 12) * 1009 + 7;
+    }
+    Input lowCardIn =
+            Input::refNumeric(poly::span<const uint64_t>(lowCardData));
+    const auto lowCardFeat =
+            extractACEInputFeatures({ &lowCardIn, 1 }, Type::Numeric);
+    EXPECT_TRUE(lowCardFeat.lowCardinality);
+    EXPECT_LT(lowCardFeat.sortedFraction, 0.7);
+    EXPECT_LT(lowCardFeat.zeroDiffFraction, 0.5);
+    verifySeeds({ &lowCardIn, 1 }, Type::Numeric, ZL_MAX_FORMAT_VERSION);
+
+    // 4. 6-byte struct input (xyz u16 points)
+    struct Point3U16 {
+        uint16_t x;
+        uint16_t y;
+        uint16_t z;
+    };
+    static_assert(sizeof(Point3U16) == 6, "Expected 6-byte struct");
+    std::vector<Point3U16> pts(1024);
+    for (size_t i = 0; i < pts.size(); ++i) {
+        pts[i] = Point3U16{
+            static_cast<uint16_t>(i * 3),
+            static_cast<uint16_t>(i * 5 + 1),
+            static_cast<uint16_t>(i * 7 + 2),
+        };
+    }
+    Input structIn = Input::refStruct(pts.data(), sizeof(Point3U16), pts.size());
+    const auto structFeat =
+            extractACEInputFeatures({ &structIn, 1 }, Type::Struct);
+    EXPECT_EQ(structFeat.eltWidth, 6u);
+    verifySeeds({ &structIn, 1 }, Type::Struct, ZL_MAX_FORMAT_VERSION);
+}
+
+TEST_F(ACETest, WeightedMutateRoundTrips)
+{
+    std::mt19937_64 rng(0xc0ffee1234ULL);
+    for (auto type : { Type::Serial, Type::Numeric, Type::Struct }) {
+        ACEMutate mutator(rng, type, ZL_MAX_FORMAT_VERSION);
+        ACECompressor chained = buildRandomCompressor(
+                rng, type, ZL_MAX_FORMAT_VERSION, kDefaultMaxDepth);
+        ASSERT_TRUE(chained.acceptsInputType(type));
+
+        for (size_t iter = 0; iter < 50; ++iter) {
+            chained = mutator(chained);
+            EXPECT_TRUE(chained.acceptsInputType(type))
+                    << chained.prettyPrint();
+            const auto serialized = chained.serialize();
+            ACECompressor rt(serialized);
+            EXPECT_EQ(chained, rt);
+        }
+    }
+
+    // Exercise multi-port sibling-port copy directly on a 2-port Numeric node
+    ACEMutate numMutator(rng, Type::Numeric, ZL_MAX_FORMAT_VERSION);
+    const ACECompressor leftSub(
+            ACENode(nodes::DeltaInt{}),
+            std::vector<ACECompressor>{
+                    ACECompressor(ACEGraph(graphs::Bitpack{})) });
+    const ACECompressor rightSub(ACEGraph(graphs::Entropy{}));
+    const ACECompressor multiPort(
+            ACENode(nodes::TokenizeNumeric{ true }),
+            std::vector<ACECompressor>{ leftSub, rightSub });
+    bool sawSiblingCopy = false;
+    for (size_t iter = 0; iter < 200; ++iter) {
+        auto mutated = numMutator(multiPort);
+        EXPECT_TRUE(mutated.acceptsInputType(Type::Numeric));
+        ACECompressor rt(mutated.serialize());
+        EXPECT_EQ(mutated, rt);
+        if (mutated.isNode()
+            && mutated.asNode().node.name == "zl.tokenize_numeric"
+            && mutated.asNode().successors.size() == 2
+            && *mutated.asNode().successors[0]
+                    == *mutated.asNode().successors[1]) {
+            sawSiblingCopy = true;
+        }
+    }
+    EXPECT_TRUE(sawSiblingCopy);
 }
 
 } // namespace tests

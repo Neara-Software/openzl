@@ -14,6 +14,7 @@
 #include "openzl/common/a1cbor_helpers.h"
 #include "openzl/common/allocation.h"
 #include "openzl/shared/a1cbor.h"
+#include "tools/training/ace/ace_features.h"
 
 namespace openzl {
 namespace training {
@@ -45,6 +46,14 @@ std::vector<ACECompressor> AutomatedCompressorExplorer::initialPopulation()
     auto prebuilt = getPrebuiltCompressors(inputType());
     std::vector<ACECompressor> population;
     population.insert(population.end(), prebuilt.begin(), prebuilt.end());
+
+    // Append targeted feature-guided seeds before extendPopulation deduplicates
+    auto featureSeeds =
+            buildFeatureGuidedSeeds(inputs_, inputType(), formatVersion_);
+    population.insert(
+            population.end(),
+            std::make_move_iterator(featureSeeds.begin()),
+            std::make_move_iterator(featureSeeds.end()));
 
     // Use populationSize() random compressors
     for (size_t i = 0; i < populationSize(); ++i) {
@@ -364,6 +373,7 @@ std::vector<std::vector<float>> AutomatedCompressorExplorer::computeFitness(
                 }
             }
             if (total.has_value()) {
+                updateBatchArchive(eval.gene.get(), batchSizes);
                 perBatchSizes_[h] = std::move(batchSizes);
                 if (numBatches >= 4) {
                     double psize = static_cast<double>(
@@ -774,6 +784,64 @@ std::unordered_set<ACECompressor> AutomatedCompressorExplorer::reproduce(
         }
     }
     return children;
+}
+
+void AutomatedCompressorExplorer::updateBatchArchive(
+        const ACECompressor& gene,
+        const std::vector<float>& batchSizes)
+{
+    if (batchArchive_.size() < batchSizes.size()) {
+        batchArchive_.resize(batchSizes.size());
+    }
+    const uint64_t h = gene.hash();
+    auto bySize      = [](const auto& a, const auto& b) {
+        return a.first < b.first;
+    };
+    for (size_t b = 0; b < batchSizes.size(); ++b) {
+        const float sz = batchSizes[b];
+        if (!std::isfinite(sz)) {
+            continue;
+        }
+        auto& slot   = batchArchive_[b];
+        bool updated = false;
+        for (auto& entry : slot) {
+            if (entry.second.hash() == h) {
+                if (sz < entry.first) {
+                    entry.first = sz;
+                    std::sort(slot.begin(), slot.end(), bySize);
+                }
+                updated = true;
+                break;
+            }
+        }
+        if (updated) {
+            continue;
+        }
+        if (slot.size() < kArchivePerBatch) {
+            slot.emplace_back(sz, gene);
+            std::sort(slot.begin(), slot.end(), bySize);
+        } else if (sz < slot.back().first) {
+            slot.back() = std::make_pair(sz, gene);
+            std::sort(slot.begin(), slot.end(), bySize);
+        }
+    }
+}
+
+std::vector<ACECompressor> AutomatedCompressorExplorer::archivedWinners() const
+{
+    std::vector<ACECompressor> winners;
+    std::unordered_set<uint64_t> seen;
+    for (size_t rankIdx = 0; rankIdx < kArchivePerBatch; ++rankIdx) {
+        for (const auto& slot : batchArchive_) {
+            if (rankIdx < slot.size()) {
+                const auto& comp = slot[rankIdx].second;
+                if (seen.insert(comp.hash()).second) {
+                    winners.push_back(comp);
+                }
+            }
+        }
+    }
+    return winners;
 }
 
 void AutomatedCompressorExplorer::step()

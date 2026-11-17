@@ -21,6 +21,7 @@ cpp_library(
         "ace_compressor.h",
         "ace_compressors.h",
         "ace_crossover.h",
+        "ace_features.h",
         "ace_mutate.h",
         "ace_sampling.h",
         "ace_utils.h",
@@ -32,6 +33,7 @@ cpp_library(
             "ace.h",
             "ace_compressor.h",
             "ace_compressors.h",
+            "ace_features.h",
             "ace_utils.h",
             "automated_compressor_explorer.h",
         ]

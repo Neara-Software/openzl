@@ -54,6 +54,40 @@ class ACEMutate {
     }
 
    private:
+    static bool isProtectedPort(const ACENode& node, size_t port)
+    {
+        return port == 1
+                && (node.name == "zl.pco_bin_split"
+                    || node.name == "zl.int_mult_split"
+                    || node.name == "zl.float_mult_split");
+    }
+
+    static bool subtreeValidForWidthAndVersion(
+            const ACECompressor& sub,
+            uint32_t width,
+            uint32_t fmtVersion)
+    {
+        if (!sub.isNode()) {
+            return true;
+        }
+        const auto& nc = sub.asNode();
+        if (nc.node.minFormatVersion != 0
+            && nc.node.minFormatVersion > fmtVersion) {
+            return false;
+        }
+        if (!nodeAcceptsWidth(nc.node, width)) {
+            return false;
+        }
+        for (size_t i = 0; i < nc.successors.size(); ++i) {
+            const uint32_t outW = inferNodeOutputWidth(nc.node, i, width);
+            if (!subtreeValidForWidthAndVersion(
+                        *nc.successors[i], outW, fmtVersion)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     template <typename VisitorFn>
     static void visitMutable(
             const ACECompressor& comp,
@@ -64,10 +98,7 @@ class ACEMutate {
         if (comp.isNode()) {
             const auto& node = comp.asNode();
             for (size_t i = 0; i < node.successors.size(); ++i) {
-                if ((node.node.name == "zl.pco_bin_split"
-                     || node.node.name == "zl.int_mult_split"
-                     || node.node.name == "zl.float_mult_split")
-                    && i == 1) {
+                if (isProtectedPort(node.node, i)) {
                     continue;
                 }
                 visitMutable(
@@ -93,10 +124,7 @@ class ACEMutate {
             std::vector<std::unique_ptr<ACECompressor>> successors;
             successors.reserve(node.successors.size());
             for (size_t i = 0; i < node.successors.size(); ++i) {
-                if ((node.node.name == "zl.pco_bin_split"
-                     || node.node.name == "zl.int_mult_split"
-                     || node.node.name == "zl.float_mult_split")
-                    && i == 1) {
+                if (isProtectedPort(node.node, i)) {
                     successors.push_back(
                             std::make_unique<ACECompressor>(*node.successors[i]));
                 } else {
@@ -124,25 +152,107 @@ class ACEMutate {
             uint32_t inputWidth,
             size_t depth)
     {
-        std::uniform_int_distribution<int> dist(0, 4);
-        auto choice = dist(rng_);
-        if (choice == 0) {
-            return randomSimpleCompressor(inputType);
-        } else if (choice == 1) {
-            return randomCompressor(inputType, inputWidth, depth);
-        } else if (choice == 2) {
+        std::uniform_int_distribution<int> dist(0, 99);
+        const int roll = dist(rng_);
+        if (roll < 35) {
+            if (component.isGraph()) {
+                return buildRandomGraphCompressor(rng_, inputType);
+            }
+            return mutateParameters(component, inputType, inputWidth, depth);
+        } else if (roll < 55) {
+            return mutateParameters(component, inputType, inputWidth, depth);
+        } else if (roll < 75) {
+            return addRandomPipeline(component, inputType, inputWidth, depth);
+        } else if (roll < 85) {
             return deleteRandomPipelinePrefix(
                     component, inputType, inputWidth, depth);
-        } else if (choice == 3) {
-            return addRandomPipeline(component, inputType, inputWidth, depth);
+        } else if (roll < 95) {
+            return copySiblingPort(component, inputType, inputWidth, depth);
         } else {
-            return mutateParameters(component, inputType, inputWidth, depth);
+            std::bernoulli_distribution useSimple(0.5);
+            if (useSimple(rng_)) {
+                return randomSimpleCompressor(inputType, inputWidth);
+            }
+            return randomCompressor(inputType, inputWidth, depth);
         }
     }
 
-    ACECompressor randomSimpleCompressor(Type inputType)
+    ACECompressor copySiblingPort(
+            const ACECompressor& component,
+            Type inputType,
+            uint32_t inputWidth,
+            size_t depth)
     {
-        return randomChoice(rng_, getPrebuiltCompressors(inputType));
+        if (!component.isNode()) {
+            return mutateParameters(component, inputType, inputWidth, depth);
+        }
+        const auto& nc      = component.asNode();
+        const size_t nPorts = nc.successors.size();
+        if (nPorts < 2 || nc.node.outputTypes.size() != nPorts) {
+            return mutateParameters(component, inputType, inputWidth, depth);
+        }
+        std::vector<std::pair<size_t, size_t>> distinctPairs;
+        for (size_t src = 0; src < nPorts; ++src) {
+            if (isProtectedPort(nc.node, src)) {
+                continue;
+            }
+            for (size_t dst = 0; dst < nPorts; ++dst) {
+                if (src == dst || isProtectedPort(nc.node, dst)) {
+                    continue;
+                }
+                if (nc.node.outputTypes[src] != nc.node.outputTypes[dst]) {
+                    continue;
+                }
+                const uint32_t dstWidth =
+                        inferNodeOutputWidth(nc.node, dst, inputWidth);
+                if (!subtreeValidForWidthAndVersion(
+                            *nc.successors[src], dstWidth, formatVersion_)) {
+                    continue;
+                }
+                if (*nc.successors[src] != *nc.successors[dst]) {
+                    distinctPairs.emplace_back(src, dst);
+                }
+            }
+        }
+        if (distinctPairs.empty()) {
+            return mutateParameters(component, inputType, inputWidth, depth);
+        }
+        std::uniform_int_distribution<size_t> pairDist(
+                0, distinctPairs.size() - 1);
+        const auto [srcPort, dstPort] = distinctPairs[pairDist(rng_)];
+        std::vector<std::unique_ptr<ACECompressor>> succs;
+        succs.reserve(nPorts);
+        for (size_t i = 0; i < nPorts; ++i) {
+            if (i == dstPort) {
+                succs.push_back(std::make_unique<ACECompressor>(
+                        *nc.successors[srcPort]));
+            } else {
+                succs.push_back(
+                        std::make_unique<ACECompressor>(*nc.successors[i]));
+            }
+        }
+        return ACENodeCompressor(nc.node, std::move(succs));
+    }
+
+    ACECompressor randomSimpleCompressor(
+            Type inputType,
+            uint32_t inputWidth = 0)
+    {
+        const auto prebuilt = getPrebuiltCompressors(inputType);
+        std::vector<const ACECompressor*> valid;
+        valid.reserve(prebuilt.size());
+        for (const auto& c : prebuilt) {
+            if (c.acceptsInputType(inputType)
+                && subtreeValidForWidthAndVersion(
+                        c, inputWidth, formatVersion_)) {
+                valid.push_back(&c);
+            }
+        }
+        if (valid.empty()) {
+            return buildRandomGraphCompressor(rng_, inputType);
+        }
+        std::uniform_int_distribution<size_t> dist(0, valid.size() - 1);
+        return *valid[dist(rng_)];
     }
 
     ACECompressor
@@ -350,7 +460,7 @@ class ACEMutate {
             size_t depth)
     {
         if (depth >= maxDepth_) {
-            return randomSimpleCompressor(inputType);
+            return randomSimpleCompressor(inputType, inputWidth);
         }
         const auto compatibleNodes =
                 getNodesComptabileWith(inputType, formatVersion_);
@@ -384,7 +494,7 @@ class ACEMutate {
             }
         }
         if (accepted.empty()) {
-            return randomSimpleCompressor(inputType);
+            return randomSimpleCompressor(inputType, inputWidth);
         }
         auto node = pickRandomNodeForType(
                 rng_,
