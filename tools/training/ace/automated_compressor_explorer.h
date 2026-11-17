@@ -2,8 +2,11 @@
 
 #pragma once
 
+#include <array>
+#include <limits>
 #include <memory>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -98,8 +101,8 @@ class AutomatedCompressorExplorer : public GeneticAlgorithm<ACECompressor> {
                       params.threadPool
                               ? params.threadPool
                               : std::make_shared<ThreadPool>(params.numThreads)),
-              crossover_(rng(), inputType(), formatVersion_),
-              mutate_(rng(), inputType(), formatVersion_)
+              crossover_(rng(), inputType(), formatVersion_, kDefaultMaxDepth),
+              mutate_(rng(), inputType(), formatVersion_, kDefaultMaxDepth)
     {
         if (formatVersion_ == 0) {
             throw Exception("Format version must be set in the parameters");
@@ -197,20 +200,48 @@ class AutomatedCompressorExplorer : public GeneticAlgorithm<ACECompressor> {
     std::vector<std::vector<float>> computeFitness(
             poly::span<const ACECompressor> genes) override;
 
+    const ACECompressor& selectParent() override;
+
     /// With ACE_POLISH=N, also adds backend-polished copies of the N smallest
     /// not-yet-polished front-0 genes to the children (see polishBackends).
     std::unordered_set<ACECompressor> reproduce(size_t numChildren) override;
+
+    void step() override;
 
     static constexpr size_t kAceStateParamId = 592;
 
    private:
     using Base::reproduce;
 
+    static constexpr size_t kNumBanditOps = 4;
+    struct BanditOpStats {
+        double pulls{ 0.0 };
+        double rewardSum{ 0.0 };
+    };
+    struct PendingChildInfo {
+        size_t op{ 0 };
+        float parentFitness0{ std::numeric_limits<float>::infinity() };
+    };
+    struct MinedMotif {
+        Type inputType;
+        ACECompressor compressor;
+    };
+
+    size_t selectParentIndex();
+    size_t selectBanditOp();
+    ACECompressor graftMotif(const ACECompressor& parent);
+    void mineMotifs();
+
     /// One coordinate-descent pass over the leaf graphs of @p gene: each leaf
     /// in turn is set to the backend that gives the smallest total size.
     ACECompressor polishBackends(const ACECompressor& gene, float size);
 
     std::unordered_set<uint64_t> polished_;
+    std::unordered_map<uint64_t, std::vector<float>> perBatchSizes_;
+    std::unordered_map<uint64_t, PendingChildInfo> pendingOps_;
+    std::array<BanditOpStats, kNumBanditOps> opStats_{};
+    std::vector<MinedMotif> motifs_;
+    double bestProbeSoFar_{ std::numeric_limits<double>::infinity() };
 
     static std::vector<float> computeFitness(
             const ACECompressor& compressor,

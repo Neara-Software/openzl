@@ -4,8 +4,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <functional>
+#include <map>
 #include <memory>
 #include <vector>
 
@@ -184,19 +186,59 @@ std::vector<float> AutomatedCompressorExplorer::computeFitness(
 std::vector<std::vector<float>> AutomatedCompressorExplorer::computeFitness(
         poly::span<const ACECompressor> genes)
 {
+    static const int probeEnv = [] {
+        const char* p = std::getenv("ACE_PROBE_PRUNE");
+        if (!p) {
+            return -1;
+        }
+        return std::atoi(p) != 0 ? 1 : 0;
+    }();
+    static const double probeMargin = [] {
+        const char* p = std::getenv("ACE_PROBE_MARGIN");
+        return p ? std::strtod(p, nullptr) : 2.0;
+    }();
+    const size_t numBatches = inputBatches_.size();
+    const bool probeEnabled = generation() > 0 && numBatches >= 4
+            && (probeEnv == 1 || (probeEnv != 0 && inputs_.size() >= 16));
+    const size_t probeIdx0 = 0;
+    const size_t probeIdx1 = numBatches / 2;
+
+    double totalAllBytes = 0.0;
+    for (const auto& input : inputs_) {
+        totalAllBytes += static_cast<double>(benchmarkBytes(input));
+    }
+    double probeInputBytes = 0.0;
+    if (numBatches >= 2) {
+        for (const auto& in : inputBatches_[probeIdx0]) {
+            probeInputBytes += static_cast<double>(benchmarkBytes(in));
+        }
+        if (probeIdx1 != probeIdx0) {
+            for (const auto& in : inputBatches_[probeIdx1]) {
+                probeInputBytes += static_cast<double>(benchmarkBytes(in));
+            }
+        }
+    }
+
     struct GeneEval {
         std::reference_wrapper<const ACECompressor> gene;
         poly::optional<std::vector<float>> cachedFitness;
+        std::shared_ptr<const Compressor> compressor;
         std::vector<std::future<poly::optional<ACECompressionResult>>>
                 batchResults;
+        poly::optional<ACECompressionResult> probeRes0;
+        poly::optional<ACECompressionResult> probeRes1;
+        double probeSize{ std::numeric_limits<double>::infinity() };
+        bool probeOk{ false };
+        bool pruned{ false };
     };
-    // A gene that reuses its cached fitness gets no tasks. An uncached gene,
-    // or a cached gene picked to run again, gets one task per input batch.
+    // A gene that reuses its cached fitness gets no tasks. When probe pruning is
+    // enabled, uncached genes first evaluate two representative batches; genes
+    // far worse than bestProbeSoFar_ skip the remaining batches.
     std::vector<GeneEval> evals;
     evals.reserve(genes.size());
     for (const auto& gene : genes) {
         auto& eval = evals.emplace_back(
-                GeneEval{ std::cref(gene), poly::nullopt, {} });
+                GeneEval{ std::cref(gene), poly::nullopt, nullptr, {} });
         auto cache = cachedFitness_.find(gene.hash());
         if (cache != cachedFitness_.end()) {
             std::uniform_int_distribution<size_t> dist(0, cache->second.first);
@@ -205,16 +247,78 @@ std::vector<std::vector<float>> AutomatedCompressorExplorer::computeFitness(
                 continue;
             }
         }
-        // The gene's batch tasks share one compressor. Each task holds a
-        // reference, so the compressor outlives this call if it throws.
-        const std::shared_ptr<const Compressor> compressor =
-                std::make_shared<Compressor>(gene.buildBenchmarkCompressor(
+        eval.compressor = std::make_shared<Compressor>(
+                gene.buildBenchmarkCompressor(
                         formatVersion_, compressionLevel_));
-        eval.batchResults.reserve(inputBatches_.size());
-        for (const auto& batch : inputBatches_) {
-            eval.batchResults.emplace_back(threadPool_->run([compressor, batch] {
-                return benchmarkOnThreadContexts(*compressor, batch);
-            }));
+        eval.batchResults.resize(numBatches);
+        if (probeEnabled) {
+            eval.batchResults[probeIdx0] = threadPool_->run(
+                    [c = eval.compressor, b = inputBatches_[probeIdx0]] {
+                        return benchmarkOnThreadContexts(*c, b);
+                    });
+            if (probeIdx1 != probeIdx0) {
+                eval.batchResults[probeIdx1] = threadPool_->run(
+                        [c = eval.compressor, b = inputBatches_[probeIdx1]] {
+                            return benchmarkOnThreadContexts(*c, b);
+                        });
+            }
+        } else {
+            for (size_t b = 0; b < numBatches; ++b) {
+                eval.batchResults[b] = threadPool_->run(
+                        [c = eval.compressor, batch = inputBatches_[b]] {
+                            return benchmarkOnThreadContexts(*c, batch);
+                        });
+            }
+        }
+    }
+
+    if (probeEnabled) {
+        double minProbeThisBatch = bestProbeSoFar_;
+        for (auto& eval : evals) {
+            if (eval.cachedFitness.has_value()) {
+                continue;
+            }
+            eval.probeRes0 = eval.batchResults[probeIdx0].get();
+            bool ok        = eval.probeRes0.has_value();
+            double psize   = ok ? static_cast<double>(
+                                        eval.probeRes0->compressedSize)
+                                : std::numeric_limits<double>::infinity();
+            if (probeIdx1 != probeIdx0) {
+                eval.probeRes1 = eval.batchResults[probeIdx1].get();
+                if (!eval.probeRes1.has_value()) {
+                    ok = false;
+                } else if (ok) {
+                    psize += static_cast<double>(
+                            eval.probeRes1->compressedSize);
+                }
+            }
+            eval.probeOk = ok;
+            if (ok) {
+                psize *= transformerSizePenalty(eval.gene.get());
+                eval.probeSize    = psize;
+                minProbeThisBatch = std::min(minProbeThisBatch, psize);
+            }
+        }
+        bestProbeSoFar_ = minProbeThisBatch;
+        for (auto& eval : evals) {
+            if (eval.cachedFitness.has_value()) {
+                continue;
+            }
+            if (!eval.probeOk
+                || (std::isfinite(bestProbeSoFar_)
+                    && eval.probeSize > bestProbeSoFar_ * probeMargin)) {
+                eval.pruned = true;
+                continue;
+            }
+            for (size_t b = 0; b < numBatches; ++b) {
+                if (b == probeIdx0 || b == probeIdx1) {
+                    continue;
+                }
+                eval.batchResults[b] = threadPool_->run(
+                        [c = eval.compressor, batch = inputBatches_[b]] {
+                            return benchmarkOnThreadContexts(*c, batch);
+                        });
+            }
         }
     }
 
@@ -222,31 +326,86 @@ std::vector<std::vector<float>> AutomatedCompressorExplorer::computeFitness(
     results.reserve(genes.size());
     for (auto& eval : evals) {
         std::vector<float> result;
+        const uint64_t h = eval.gene.get().hash();
         if (eval.cachedFitness.has_value()) {
             result = std::move(*eval.cachedFitness);
+        } else if (eval.pruned) {
+            if (!eval.probeOk || probeInputBytes <= 0.0) {
+                result = std::vector<float>(
+                        3, std::numeric_limits<float>::infinity());
+            } else {
+                const float est = static_cast<float>(
+                        eval.probeSize * (totalAllBytes / probeInputBytes)
+                        * 2.0);
+                result = { est, 1e9f, 1e9f };
+            }
         } else {
             poly::optional<ACECompressionResult> total = ACECompressionResult{};
-            for (auto& future : eval.batchResults) {
-                auto batchResult = future.get();
+            std::vector<float> batchSizes(numBatches, 0.0f);
+            for (size_t b = 0; b < numBatches; ++b) {
+                poly::optional<ACECompressionResult> batchResult;
+                if (probeEnabled && b == probeIdx0) {
+                    batchResult = std::move(eval.probeRes0);
+                } else if (probeEnabled && b == probeIdx1) {
+                    batchResult = std::move(eval.probeRes1);
+                } else {
+                    batchResult = eval.batchResults[b].get();
+                }
                 if (!batchResult.has_value()) {
                     total = poly::nullopt;
-                } else if (total.has_value()) {
-                    *total += *batchResult;
+                } else {
+                    batchSizes[b] = static_cast<float>(
+                                            batchResult->compressedSize)
+                            * static_cast<float>(
+                                    transformerSizePenalty(eval.gene.get()));
+                    if (total.has_value()) {
+                        *total += *batchResult;
+                    }
+                }
+            }
+            if (total.has_value()) {
+                perBatchSizes_[h] = std::move(batchSizes);
+                if (numBatches >= 4) {
+                    double psize = static_cast<double>(
+                            perBatchSizes_[h][probeIdx0]);
+                    if (probeIdx1 != probeIdx0) {
+                        psize += static_cast<double>(
+                                perBatchSizes_[h][probeIdx1]);
+                    }
+                    bestProbeSoFar_ = std::min(bestProbeSoFar_, psize);
                 }
             }
             result = fitnessFromResult(eval.gene.get(), total);
         }
-        auto [cache, inserted] = cachedFitness_.emplace(
-                eval.gene.get().hash(), std::make_pair(1, result));
-        if (!inserted) {
-            const float n = static_cast<float>(cache->second.first + 1);
-            cache->second.second[0] =
-                    std::min(cache->second.second[0], result[0]);
-            for (size_t j = 1; j < result.size(); ++j) {
-                cache->second.second[j] +=
-                        (result[j] - cache->second.second[j]) / n;
+        if (!eval.pruned) {
+            auto [cache, inserted] =
+                    cachedFitness_.emplace(h, std::make_pair(1, result));
+            if (!inserted) {
+                const float n = static_cast<float>(cache->second.first + 1);
+                cache->second.second[0] =
+                        std::min(cache->second.second[0], result[0]);
+                for (size_t j = 1; j < result.size(); ++j) {
+                    cache->second.second[j] +=
+                            (result[j] - cache->second.second[j]) / n;
+                }
+                ++cache->second.first;
             }
-            ++cache->second.first;
+        }
+        auto opIt = pendingOps_.find(h);
+        if (opIt != pendingOps_.end()) {
+            const auto& info = opIt->second;
+            double reward    = 0.0;
+            if (std::isfinite(result[0]) && std::isfinite(info.parentFitness0)
+                && info.parentFitness0 > 0.0f
+                && result[0] < info.parentFitness0) {
+                const double rel =
+                        static_cast<double>(info.parentFitness0 - result[0])
+                        / static_cast<double>(info.parentFitness0);
+                reward = std::min(1.0, 0.25 + rel * 20.0);
+            }
+            opStats_[info.op].pulls += 1.0;
+            opStats_[info.op].rewardSum += reward;
+            pendingOps_.erase(opIt);
         }
         results.push_back(std::move(result));
     }
@@ -329,14 +488,270 @@ ACECompressor AutomatedCompressorExplorer::polishBackends(
     return best;
 }
 
+size_t AutomatedCompressorExplorer::selectParentIndex()
+{
+    static const int lexEnv = [] {
+        const char* p = std::getenv("ACE_LEXICASE");
+        if (!p) {
+            return -1;
+        }
+        return std::atoi(p) != 0 ? 1 : 0;
+    }();
+    const bool useLexicase = inputBatches_.size() >= 2
+            && (lexEnv == 1 || (lexEnv != 0 && inputBatches_.size() >= 4
+                                && inputs_.size() >= 8));
+    if (useLexicase) {
+        std::bernoulli_distribution pickLex(0.5);
+        if (pickLex(rng())) {
+            const size_t B = inputBatches_.size();
+            std::vector<size_t> pool;
+            pool.reserve(population().size());
+            for (size_t i = 0; i < population().size(); ++i) {
+                if (!std::isfinite(fitness()[i][0])) {
+                    continue;
+                }
+                auto it = perBatchSizes_.find(population()[i].hash());
+                if (it != perBatchSizes_.end() && it->second.size() == B) {
+                    pool.push_back(i);
+                }
+            }
+            if (!pool.empty()) {
+                std::vector<size_t> batchOrder(B);
+                for (size_t b = 0; b < B; ++b) {
+                    batchOrder[b] = b;
+                }
+                std::shuffle(batchOrder.begin(), batchOrder.end(), rng());
+                for (size_t b : batchOrder) {
+                    float minSz = std::numeric_limits<float>::infinity();
+                    for (size_t idx : pool) {
+                        minSz = std::min(
+                                minSz,
+                                perBatchSizes_[population()[idx].hash()][b]);
+                    }
+                    const float thresh = minSz * 1.02f + 1.0f;
+                    std::vector<size_t> nextPool;
+                    nextPool.reserve(pool.size());
+                    for (size_t idx : pool) {
+                        if (perBatchSizes_[population()[idx].hash()][b]
+                            <= thresh) {
+                            nextPool.push_back(idx);
+                        }
+                    }
+                    pool = std::move(nextPool);
+                    if (pool.size() <= 1) {
+                        break;
+                    }
+                }
+                if (pool.size() > 1) {
+                    std::uniform_int_distribution<size_t> tieDist(
+                            0, pool.size() - 1);
+                    return pool[tieDist(rng())];
+                }
+                if (!pool.empty()) {
+                    return pool[0];
+                }
+            }
+        }
+    }
+    return selector().select(rank(), crowdingDistance());
+}
+
+const ACECompressor& AutomatedCompressorExplorer::selectParent()
+{
+    return population()[selectParentIndex()];
+}
+
+size_t AutomatedCompressorExplorer::selectBanditOp()
+{
+    double totalPulls = 0.0;
+    for (size_t op = 0; op < kNumBanditOps; ++op) {
+        if (opStats_[op].pulls < 1.0) {
+            return op;
+        }
+        totalPulls += opStats_[op].pulls;
+    }
+    // Small epsilon-greedy floor ensures every operator keeps getting sampled.
+    std::bernoulli_distribution explore(0.10);
+    if (explore(rng())) {
+        std::uniform_int_distribution<size_t> opDist(0, kNumBanditOps - 1);
+        return opDist(rng());
+    }
+    const double logTotal = std::log(totalPulls + 1.0);
+    size_t bestOp         = 0;
+    double bestScore      = -1.0;
+    for (size_t op = 0; op < kNumBanditOps; ++op) {
+        const double pulls = opStats_[op].pulls;
+        const double mean  = opStats_[op].rewardSum / pulls;
+        const double ucb   = mean + 0.6 * std::sqrt(logTotal / pulls);
+        if (ucb > bestScore) {
+            bestScore = ucb;
+            bestOp    = op;
+        }
+    }
+    return bestOp;
+}
+
+ACECompressor AutomatedCompressorExplorer::graftMotif(
+        const ACECompressor& parent)
+{
+    if (motifs_.empty()) {
+        return mutate(parent);
+    }
+    struct Target {
+        const ACECompressor* ptr;
+        Type type;
+    };
+    std::vector<Target> targets;
+    parent.forEachComponent(inputType(), [&](const ACECompressor& c, Type t) {
+        for (const auto& m : motifs_) {
+            if (m.inputType == t && m.compressor.hash() != c.hash()) {
+                targets.push_back(Target{ &c, t });
+                break;
+            }
+        }
+    });
+    if (targets.empty()) {
+        return mutate(parent);
+    }
+    std::uniform_int_distribution<size_t> tDist(0, targets.size() - 1);
+    const auto target = targets[tDist(rng())];
+    std::vector<const ACECompressor*> matching;
+    for (const auto& m : motifs_) {
+        if (m.inputType == target.type
+            && m.compressor.hash() != target.ptr->hash()) {
+            matching.push_back(&m.compressor);
+        }
+    }
+    std::uniform_int_distribution<size_t> mDist(0, matching.size() - 1);
+    const ACECompressor chosen = *matching[mDist(rng())];
+    return parent.replace(
+            inputType(),
+            [&](const ACECompressor& c,
+                Type,
+                size_t) -> poly::optional<ACECompressor> {
+                if (&c == target.ptr) {
+                    return chosen;
+                }
+                return poly::nullopt;
+            });
+}
+
+void AutomatedCompressorExplorer::mineMotifs()
+{
+    if (population().empty()) {
+        return;
+    }
+    std::vector<size_t> order(population().size());
+    for (size_t i = 0; i < order.size(); ++i) {
+        order[i] = i;
+    }
+    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        return fitness()[a][0] < fitness()[b][0];
+    });
+    const float bestF0 = fitness()[order[0]][0];
+    if (!std::isfinite(bestF0) || bestF0 <= 0.0f) {
+        return;
+    }
+    const size_t topLimit =
+            std::min(order.size(), std::max<size_t>(4, order.size() / 4));
+    std::unordered_set<size_t> selected;
+    for (size_t k = 0; k < topLimit; ++k) {
+        selected.insert(order[k]);
+    }
+    for (size_t i = 0; i < population().size(); ++i) {
+        if (rank()[i] == 0 && std::isfinite(fitness()[i][0])) {
+            selected.insert(i);
+        }
+    }
+    struct MotifAccum {
+        Type inputType;
+        ACECompressor compressor;
+        double score{ 0.0 };
+    };
+    std::unordered_map<uint64_t, MotifAccum> table;
+    for (size_t idx : selected) {
+        const double weight = static_cast<double>(bestF0)
+                / static_cast<double>(std::max(1.0f, fitness()[idx][0]));
+        population()[idx].forEachComponent(
+                inputType(), [&](const ACECompressor& sub, Type t) {
+                    if (!sub.isNode()) {
+                        return;
+                    }
+                    const size_t nc = sub.numComponents();
+                    if (nc < 2 || nc > 12) {
+                        return;
+                    }
+                    const uint64_t h = sub.hash();
+                    auto [it, ins]   = table.emplace(
+                            h, MotifAccum{ t, sub, weight });
+                    if (!ins) {
+                        it->second.score += weight;
+                    }
+                });
+    }
+    std::vector<MotifAccum> ranked;
+    ranked.reserve(table.size());
+    for (auto& kv : table) {
+        ranked.push_back(std::move(kv.second));
+    }
+    std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
+        return a.score > b.score;
+    });
+    constexpr size_t kMaxMotifs = 16;
+    motifs_.clear();
+    for (size_t i = 0; i < std::min(kMaxMotifs, ranked.size()); ++i) {
+        motifs_.push_back(
+                MinedMotif{ ranked[i].inputType,
+                            std::move(ranked[i].compressor) });
+    }
+}
+
 std::unordered_set<ACECompressor> AutomatedCompressorExplorer::reproduce(
         size_t numChildren)
 {
+    static const bool useBandit = [] {
+        const char* p = std::getenv("ACE_BANDIT");
+        return !p || std::atoi(p) != 0;
+    }();
     static const size_t numPolish = [] {
         const char* p = std::getenv("ACE_POLISH");
         return p ? (size_t)std::strtoul(p, nullptr, 10) : 0;
     }();
-    auto children = Base::reproduce(numChildren);
+
+    std::unordered_set<ACECompressor> children;
+    if (!useBandit || generation() == 0) {
+        children = Base::reproduce(numChildren);
+    } else {
+        size_t maxIterations = 2 * numChildren;
+        while (children.size() < numChildren && maxIterations-- > 0) {
+            const size_t op    = selectBanditOp();
+            const size_t p1Idx = selectParentIndex();
+            const float p1Fit  = fitness()[p1Idx][0];
+            ACECompressor child = buildStoreCompressor();
+            float parentFit0    = p1Fit;
+            if (op == 0) {
+                const size_t p2Idx = selectParentIndex();
+                parentFit0         = std::min(p1Fit, fitness()[p2Idx][0]);
+                child = crossover(population()[p1Idx], population()[p2Idx]);
+                std::bernoulli_distribution mutDist(mutationProbability());
+                if (mutDist(rng())) {
+                    child = mutate(child);
+                }
+            } else if (op == 1) {
+                child = mutate(population()[p1Idx]);
+            } else if (op == 2) {
+                child = graftMotif(population()[p1Idx]);
+            } else {
+                child = buildRandomCompressor(
+                        rng(), inputType(), formatVersion_, kDefaultMaxDepth);
+            }
+            if (populationSet().count(child) == 0) {
+                pendingOps_[child.hash()] = PendingChildInfo{ op, parentFit0 };
+                children.insert(std::move(child));
+            }
+        }
+    }
+
     if (numPolish == 0) {
         return children;
     }
@@ -359,6 +774,12 @@ std::unordered_set<ACECompressor> AutomatedCompressorExplorer::reproduce(
         }
     }
     return children;
+}
+
+void AutomatedCompressorExplorer::step()
+{
+    Base::step();
+    mineMotifs();
 }
 
 std::string AutomatedCompressorExplorer::savePopulation() const

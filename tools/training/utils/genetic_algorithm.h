@@ -306,7 +306,7 @@ class GeneticAlgorithm {
     /**
      * Selects a parent for reproduction.
      */
-    const GeneT& selectParent()
+    virtual const GeneT& selectParent()
     {
         auto idx = selector().select(rank(), crowdingDistance());
         return population()[idx];
@@ -354,7 +354,7 @@ class GeneticAlgorithm {
     /**
      * Runs one generation of the genetic algorithm.
      */
-    void step()
+    virtual void step()
     {
         if (generation_ == 0) {
             extendPopulation(initialPopulation());
