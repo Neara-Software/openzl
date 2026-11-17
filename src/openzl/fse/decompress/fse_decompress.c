@@ -87,6 +87,9 @@ static size_t FSE_buildDTable_internal(FSE_DTable* dt, const short* normalizedCo
     if (tableLog > FSE_MAX_TABLELOG) return ERROR(tableLog_tooLarge);
 
     /* Init, lay down lowprob symbols */
+    U32 hasDom = 0;
+    U32 domSym = 0;
+    U16 domNext = 0;
     {   FSE_DTableHeader DTableH;
         DTableH.tableLog = (U16)tableLog;
         DTableH.fastMode = 1;
@@ -97,7 +100,12 @@ static size_t FSE_buildDTable_internal(FSE_DTable* dt, const short* normalizedCo
                     tableDecode[highThreshold--].symbol = (FSE_FUNCTION_TYPE)s;
                     symbolNext[s] = 1;
                 } else {
-                    if (normalizedCounter[s] >= largeLimit) DTableH.fastMode=0;
+                    if (normalizedCounter[s] >= largeLimit) {
+                        DTableH.fastMode=0;
+                        hasDom = 1;
+                        domSym = s;
+                        domNext = (U16)normalizedCounter[s];
+                    }
                     symbolNext[s] = (U16)normalizedCounter[s];
         }   }   }
         ZSTD_memcpy(dt, &DTableH, sizeof(DTableH));
@@ -163,13 +171,35 @@ static size_t FSE_buildDTable_internal(FSE_DTable* dt, const short* normalizedCo
     }
 
     /* Build Decoding table */
-    {   U32 u;
+    if (hasDom) {
+        U32 u;
+        for (u=0; u<tableSize; u++) {
+            FSE_FUNCTION_TYPE const symbol = (FSE_FUNCTION_TYPE)(tableDecode[u].symbol);
+            U32 const isDom = (U32)(symbol == domSym);
+            U32 const memNext = symbolNext[symbol];
+            symbolNext[symbol] = (U16)(memNext + 1u);
+            U32 const nextState = isDom ? (U32)domNext : memNext;
+            domNext = (U16)(domNext + isDom);
+            U32 const nbBits = tableLog - ZSTD_highbit32(nextState);
+            FSE_DECODE_TYPE cell;
+            cell.newState = (U16)((nextState << nbBits) - tableSize);
+            cell.symbol = symbol;
+            cell.nbBits = (BYTE)nbBits;
+            tableDecode[u] = cell;
+        }
+    } else {
+        U32 u;
         for (u=0; u<tableSize; u++) {
             FSE_FUNCTION_TYPE const symbol = (FSE_FUNCTION_TYPE)(tableDecode[u].symbol);
             U32 const nextState = symbolNext[symbol]++;
-            tableDecode[u].nbBits = (BYTE) (tableLog - ZSTD_highbit32(nextState) );
-            tableDecode[u].newState = (U16) ( (nextState << tableDecode[u].nbBits) - tableSize);
-    }   }
+            U32 const nbBits = tableLog - ZSTD_highbit32(nextState);
+            FSE_DECODE_TYPE cell;
+            cell.newState = (U16)((nextState << nbBits) - tableSize);
+            cell.symbol = symbol;
+            cell.nbBits = (BYTE)nbBits;
+            tableDecode[u] = cell;
+        }
+    }
 
     return 0;
 }
@@ -302,6 +332,46 @@ FORCE_INLINE_TEMPLATE size_t FSE_decompress_usingDTable_generic(
                 outPtr[2] = FSE_decodeSymReg(&s3, table, &bitLocal, fast);
                 outPtr[3] = FSE_decodeSymReg(&s4, table, &bitLocal, fast);
             }
+            while (outPtr < olimit) {
+                BIT_DStream_status const st = BIT_reloadDStream(&bitLocal);
+                if (st == BIT_DStream_overflow || st == BIT_DStream_completed) {
+                    break;
+                }
+                if (st == BIT_DStream_endOfBuffer) {
+                    for (; outPtr < olimit; outPtr += 4) {
+                        FSE_decode_t const D1 = table[s1];
+                        FSE_decode_t const D2 = table[s2];
+                        FSE_decode_t const D3 = table[s3];
+                        FSE_decode_t const D4 = table[s4];
+                        U32 const need = (U32)D1.nbBits + D2.nbBits + D3.nbBits + D4.nbBits;
+                        if (bitLocal.bitsConsumed + need >= (U32)(sizeof(bitLocal.bitContainer) * 8)) {
+                            break;
+                        }
+                        outPtr[0] = D1.symbol;
+                        outPtr[1] = D2.symbol;
+                        outPtr[2] = D3.symbol;
+                        outPtr[3] = D4.symbol;
+                        s1 = (size_t)D1.newState + (fast ? BIT_readBitsFast(&bitLocal, D1.nbBits)
+                                                         : BIT_readBits(&bitLocal, D1.nbBits));
+                        s2 = (size_t)D2.newState + (fast ? BIT_readBitsFast(&bitLocal, D2.nbBits)
+                                                         : BIT_readBits(&bitLocal, D2.nbBits));
+                        s3 = (size_t)D3.newState + (fast ? BIT_readBitsFast(&bitLocal, D3.nbBits)
+                                                         : BIT_readBits(&bitLocal, D3.nbBits));
+                        s4 = (size_t)D4.newState + (fast ? BIT_readBitsFast(&bitLocal, D4.nbBits)
+                                                         : BIT_readBits(&bitLocal, D4.nbBits));
+                    }
+                    break;
+                }
+                if (FSE_MAX_TABLELOG * 4 + 7 <= (int)(sizeof(bitLocal.bitContainer) * 8)) {
+                    outPtr[0] = FSE_decodeSymReg(&s1, table, &bitLocal, fast);
+                    outPtr[1] = FSE_decodeSymReg(&s2, table, &bitLocal, fast);
+                    outPtr[2] = FSE_decodeSymReg(&s3, table, &bitLocal, fast);
+                    outPtr[3] = FSE_decodeSymReg(&s4, table, &bitLocal, fast);
+                    outPtr += 4;
+                } else {
+                    break;
+                }
+            }
             state1.state = s1;
             state2.state = s2;
             state3.state = s3;
@@ -317,6 +387,54 @@ FORCE_INLINE_TEMPLATE size_t FSE_decompress_usingDTable_generic(
                 outPtr[1] = FSE_decodeSymReg(&s2, table, &bitLocal, fast);
                 outPtr[2] = FSE_decodeSymReg(&s1, table, &bitLocal, fast);
                 outPtr[3] = FSE_decodeSymReg(&s2, table, &bitLocal, fast);
+            }
+            while (outPtr < olimit) {
+                BIT_DStream_status const st = BIT_reloadDStream(&bitLocal);
+                if (st == BIT_DStream_overflow || st == BIT_DStream_completed) {
+                    break;
+                }
+                if (st == BIT_DStream_endOfBuffer) {
+                    for (; outPtr < olimit; outPtr += 4) {
+                        BIT_DStream_t bitTmp = bitLocal;
+                        FSE_decode_t const D1 = table[s1];
+                        U32 const nb1 = D1.nbBits;
+                        if (bitTmp.bitsConsumed + nb1 >= (U32)(sizeof(bitTmp.bitContainer) * 8)) break;
+                        size_t const ns1 = (size_t)D1.newState + (fast ? BIT_readBitsFast(&bitTmp, nb1)
+                                                                       : BIT_readBits(&bitTmp, nb1));
+                        FSE_decode_t const D2 = table[s2];
+                        U32 const nb2 = D2.nbBits;
+                        if (bitTmp.bitsConsumed + nb2 >= (U32)(sizeof(bitTmp.bitContainer) * 8)) break;
+                        size_t const ns2 = (size_t)D2.newState + (fast ? BIT_readBitsFast(&bitTmp, nb2)
+                                                                       : BIT_readBits(&bitTmp, nb2));
+                        FSE_decode_t const D3 = table[ns1];
+                        U32 const nb3 = D3.nbBits;
+                        if (bitTmp.bitsConsumed + nb3 >= (U32)(sizeof(bitTmp.bitContainer) * 8)) break;
+                        size_t const ns3 = (size_t)D3.newState + (fast ? BIT_readBitsFast(&bitTmp, nb3)
+                                                                       : BIT_readBits(&bitTmp, nb3));
+                        FSE_decode_t const D4 = table[ns2];
+                        U32 const nb4 = D4.nbBits;
+                        if (bitTmp.bitsConsumed + nb4 >= (U32)(sizeof(bitTmp.bitContainer) * 8)) break;
+                        size_t const ns4 = (size_t)D4.newState + (fast ? BIT_readBitsFast(&bitTmp, nb4)
+                                                                       : BIT_readBits(&bitTmp, nb4));
+                        bitLocal = bitTmp;
+                        outPtr[0] = D1.symbol;
+                        outPtr[1] = D2.symbol;
+                        outPtr[2] = D3.symbol;
+                        outPtr[3] = D4.symbol;
+                        s1 = ns3;
+                        s2 = ns4;
+                    }
+                    break;
+                }
+                if (FSE_MAX_TABLELOG * 4 + 7 <= (int)(sizeof(bitLocal.bitContainer) * 8)) {
+                    outPtr[0] = FSE_decodeSymReg(&s1, table, &bitLocal, fast);
+                    outPtr[1] = FSE_decodeSymReg(&s2, table, &bitLocal, fast);
+                    outPtr[2] = FSE_decodeSymReg(&s1, table, &bitLocal, fast);
+                    outPtr[3] = FSE_decodeSymReg(&s2, table, &bitLocal, fast);
+                    outPtr += 4;
+                } else {
+                    break;
+                }
             }
             state1.state = s1;
             state2.state = s2;

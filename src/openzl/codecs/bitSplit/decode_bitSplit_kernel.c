@@ -189,6 +189,18 @@ static inline void decodeU8PairToU16(
         }
     } else {
         __m128i const shCnt = _mm_cvtsi32_si128((int)shift);
+        for (; e + 32 <= nbElts; e += 32) {
+            __m256i const vloRaw = _mm256_loadu_si256((const __m256i*)(const void*)(lo + e));
+            __m256i const vhiRaw = _mm256_loadu_si256((const __m256i*)(const void*)(hi + e));
+            __m256i const vlo0   = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(vloRaw));
+            __m256i const vhi0   = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(vhiRaw));
+            __m256i const vlo1   = _mm256_cvtepu8_epi16(_mm256_extracti128_si256(vloRaw, 1));
+            __m256i const vhi1   = _mm256_cvtepu8_epi16(_mm256_extracti128_si256(vhiRaw, 1));
+            _mm256_storeu_si256((__m256i*)(void*)(dst16 + e),
+                    _mm256_or_si256(vlo0, _mm256_sll_epi16(vhi0, shCnt)));
+            _mm256_storeu_si256((__m256i*)(void*)(dst16 + e + 16),
+                    _mm256_or_si256(vlo1, _mm256_sll_epi16(vhi1, shCnt)));
+        }
         for (; e + 16 <= nbElts; e += 16) {
             __m256i const vlo = _mm256_cvtepu8_epi16(
                     _mm_loadu_si128((const __m128i*)(const void*)(lo + e)));
@@ -374,6 +386,75 @@ void ZL_bitSplitDecode(
     if (nbWidths == 2 && dstEltWidth == 2 && srcEltWidths[0] == 1
         && srcEltWidths[1] == 1 && bitWidths[0] <= 8) {
         decodeU8PairToU16(dst, nbElts, srcPtrs, bitWidths[0]);
+        return;
+    }
+    if (nbWidths == 2 && dstEltWidth == 8 && srcEltWidths[0] == 8
+        && srcEltWidths[1] == 1) {
+        uint64_t* restrict const dst64   = (uint64_t*)dst;
+        const uint64_t* restrict const lo = (const uint64_t*)srcPtrs[0];
+        const uint8_t* restrict const hi  = (const uint8_t*)srcPtrs[1];
+        uint8_t const shift               = bitWidths[0];
+        size_t e                          = 0;
+#if ZL_HAS_AVX2
+        __m128i const shCnt = _mm_cvtsi32_si128((int)shift);
+        for (; e + 8 <= nbElts; e += 8) {
+            __m256i const vlo0 = _mm256_loadu_si256((const __m256i*)(const void*)(lo + e));
+            __m256i const vlo1 = _mm256_loadu_si256((const __m256i*)(const void*)(lo + e + 4));
+            __m128i const rawH = _mm_loadl_epi64((const __m128i*)(const void*)(hi + e));
+            __m256i const vhi0 = _mm256_cvtepu8_epi64(rawH);
+            __m256i const vhi1 = _mm256_cvtepu8_epi64(_mm_srli_si128(rawH, 4));
+            _mm256_storeu_si256((__m256i*)(void*)(dst64 + e),
+                    _mm256_or_si256(vlo0, _mm256_sll_epi64(vhi0, shCnt)));
+            _mm256_storeu_si256((__m256i*)(void*)(dst64 + e + 4),
+                    _mm256_or_si256(vlo1, _mm256_sll_epi64(vhi1, shCnt)));
+        }
+#elif ZL_HAS_WASM_SIMD128
+        uint32_t const sh = (uint32_t)shift;
+        for (; e + 4 <= nbElts; e += 4) {
+            v128_t const vlo0 = wasm_v128_load(lo + e);
+            v128_t const vlo1 = wasm_v128_load(lo + e + 2);
+            v128_t const h32  = wasm_v128_load32_zero(hi + e);
+            v128_t const h16  = wasm_u16x8_extend_low_u8x16(h32);
+            v128_t const h32w = wasm_u32x4_extend_low_u16x8(h16);
+            v128_t const vhi0 = wasm_u64x2_extend_low_u32x4(h32w);
+            v128_t const vhi1 = wasm_u64x2_extend_high_u32x4(h32w);
+            wasm_v128_store(dst64 + e, wasm_v128_or(vlo0, wasm_i64x2_shl(vhi0, sh)));
+            wasm_v128_store(dst64 + e + 2, wasm_v128_or(vlo1, wasm_i64x2_shl(vhi1, sh)));
+        }
+#endif
+        for (; e < nbElts; e++) {
+            dst64[e] = lo[e] | ((uint64_t)hi[e] << shift);
+        }
+        return;
+    }
+    if (nbWidths == 2 && dstEltWidth == 4 && srcEltWidths[0] == 4
+        && srcEltWidths[1] == 1) {
+        uint32_t* restrict const dst32    = (uint32_t*)dst;
+        const uint32_t* restrict const lo = (const uint32_t*)srcPtrs[0];
+        const uint8_t* restrict const hi  = (const uint8_t*)srcPtrs[1];
+        uint8_t const shift               = bitWidths[0];
+        size_t e                          = 0;
+#if ZL_HAS_AVX2
+        __m128i const shCnt = _mm_cvtsi32_si128((int)shift);
+        for (; e + 8 <= nbElts; e += 8) {
+            __m256i const vlo = _mm256_loadu_si256((const __m256i*)(const void*)(lo + e));
+            __m256i const vhi = _mm256_cvtepu8_epi32(
+                    _mm_loadl_epi64((const __m128i*)(const void*)(hi + e)));
+            _mm256_storeu_si256((__m256i*)(void*)(dst32 + e),
+                    _mm256_or_si256(vlo, _mm256_sll_epi32(vhi, shCnt)));
+        }
+#elif ZL_HAS_WASM_SIMD128
+        uint32_t const sh = (uint32_t)shift;
+        for (; e + 4 <= nbElts; e += 4) {
+            v128_t const vlo = wasm_v128_load(lo + e);
+            v128_t const h16 = wasm_u16x8_extend_low_u8x16(wasm_v128_load32_zero(hi + e));
+            v128_t const vhi = wasm_u32x4_extend_low_u16x8(h16);
+            wasm_v128_store(dst32 + e, wasm_v128_or(vlo, wasm_i32x4_shl(vhi, sh)));
+        }
+#endif
+        for (; e < nbElts; e++) {
+            dst32[e] = lo[e] | ((uint32_t)hi[e] << shift);
+        }
         return;
     }
 

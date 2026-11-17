@@ -177,66 +177,73 @@ static void hilbert3Decode(uint8_t* dst, const uint64_t* gaps, size_t n)
     uint64_t k = 0;
     size_t i   = 0;
 #if ZL_HAS_AVX2
-    uint64_t top2P = UINT64_MAX;
-    uint64_t top1P = UINT64_MAX;
-    uint32_t top2S = 0, top2X = 0, top2Y = 0, top2Z = 0;
+    uint32_t top1Valid = 0;
     uint32_t top1S = 0, top1X = 0, top1Y = 0, top1Z = 0;
     for (; i + 8 <= n; i += 8) {
-        uint64_t const h0  = k += gaps[i + 0];
-        uint64_t const h1  = k += gaps[i + 1];
-        uint64_t const h2  = k += gaps[i + 2];
-        uint64_t const h3  = k += gaps[i + 3];
-        uint64_t const h4  = k += gaps[i + 4];
-        uint64_t const h5  = k += gaps[i + 5];
-        uint64_t const h6  = k += gaps[i + 6];
-        uint64_t const h7  = k += gaps[i + 7];
-        uint64_t const x07 = (h0 ^ h1) | (h2 ^ h3) | (h4 ^ h5) | (h6 ^ h7)
-                | (h0 ^ h2) | (h4 ^ h6) | (h0 ^ h4);
-        uint32_t s0, s1, s2, s3, s4, s5, s6, s7;
-        __m256i vtx, vty, vtz;
-        if (((x07 >> 27) == 0ULL) && ((h0 >> 27) == top2P)) {
-            s0 = s1 = s2 = s3 = s4 = s5 = s6 = s7 = top2S;
-            vtx = _mm256_set1_epi32((int)top2X);
-            vty = _mm256_set1_epi32((int)top2Y);
-            vtz = _mm256_set1_epi32((int)top2Z);
-        } else if (ZL_LIKELY(((x07 >> 36) == 0ULL) && ((h0 >> 36) == top1P))) {
-            uint32_t const e30 = ZL_hilbert3_T3[top1S | ((uint32_t)(h0 >> 27) & 511u)];
-            uint32_t const e31 = ZL_hilbert3_T3[top1S | ((uint32_t)(h1 >> 27) & 511u)];
-            uint32_t const e32 = ZL_hilbert3_T3[top1S | ((uint32_t)(h2 >> 27) & 511u)];
-            uint32_t const e33 = ZL_hilbert3_T3[top1S | ((uint32_t)(h3 >> 27) & 511u)];
-            uint32_t const e34 = ZL_hilbert3_T3[top1S | ((uint32_t)(h4 >> 27) & 511u)];
-            uint32_t const e35 = ZL_hilbert3_T3[top1S | ((uint32_t)(h5 >> 27) & 511u)];
-            uint32_t const e36 = ZL_hilbert3_T3[top1S | ((uint32_t)(h6 >> 27) & 511u)];
-            uint32_t const e37 = ZL_hilbert3_T3[top1S | ((uint32_t)(h7 >> 27) & 511u)];
-            s0 = e30 & 0xFE00u; s1 = e31 & 0xFE00u; s2 = e32 & 0xFE00u; s3 = e33 & 0xFE00u;
-            s4 = e34 & 0xFE00u; s5 = e35 & 0xFE00u; s6 = e36 & 0xFE00u; s7 = e37 & 0xFE00u;
-            __m256i const ve3 = hilbert3_pack8_u32(e30, e31, e32, e33, e34, e35, e36, e37);
-            vtx = _mm256_or_si256(_mm256_set1_epi32((int)top1X), _mm256_slli_epi32(_mm256_and_si256(ve3, _mm256_set1_epi32(7)), 9));
-            vty = _mm256_or_si256(_mm256_set1_epi32((int)top1Y), _mm256_slli_epi32(_mm256_and_si256(ve3, _mm256_set1_epi32(0x38)), 6));
-            vtz = _mm256_or_si256(_mm256_set1_epi32((int)top1Z), _mm256_slli_epi32(_mm256_and_si256(ve3, _mm256_set1_epi32(0x1C0)), 3));
-            top2P = h7 >> 27;
-            top2S = s7;
-            top2X = top1X | ((e37 & 7u) << 9);
-            top2Y = top1Y | ((e37 & 0x38u) << 6);
-            top2Z = top1Z | ((e37 & 0x1C0u) << 3);
-        } else {
-            uint64_t const hs[8] = { h0, h1, h2, h3, h4, h5, h6, h7 };
-            uint32_t ss[8], e4s[8], e3s[8], ds[8];
+        uint64_t const g0 = gaps[i + 0], g1 = gaps[i + 1], g2 = gaps[i + 2], g3 = gaps[i + 3];
+        uint64_t const g4 = gaps[i + 4], g5 = gaps[i + 5], g6 = gaps[i + 6], g7 = gaps[i + 7];
+        __m256i vtx, vty, vtz, va;
+        if (ZL_LIKELY(top1Valid && (((g0 | g1 | g2 | g3 | g4 | g5 | g6 | g7) >> 36) == 0ULL))) {
+            uint64_t const b  = k & 0xFFFFFFFFFULL;
+            uint64_t const l0 = b + g0, l1 = l0 + g1, l2 = l1 + g2, l3 = l2 + g3;
+            uint64_t const l7 = l3 + g4 + g5 + g6 + g7;
+            if (ZL_LIKELY((l7 >> 36) == 0ULL)) {
+                k = (k & ~0xFFFFFFFFFULL) | l7;
+#define H3_U16_LOW4_ONE(lk, e3o, ao)                                                        uint32_t const e3o     = ZL_hilbert3_T3[top1S | ((uint32_t)((lk) >> 27) & 511u)];   uint32_t const e2_##ao = ZL_hilbert3_T3[(e3o & 0xFE00u) | ((uint32_t)((lk) >> 18) & 511u)];     uint32_t const e1_##ao = ZL_hilbert3_T3[(e2_##ao & 0xFE00u) | ((uint32_t)((lk) >> 9) & 511u)];     uint32_t const e0_##ao = ZL_hilbert3_T3[(e1_##ao & 0xFE00u) | ((uint32_t)(lk) & 511u)];     uint32_t const ao      = ((e2_##ao & 511u) << 18) | ((e1_##ao & 511u) << 9) | (e0_##ao & 511u)
+                __m128i ve3_lo, va_lo, ve3_hi, va_hi;
+                {
+                    H3_U16_LOW4_ONE(l0, e30, a0);
+                    H3_U16_LOW4_ONE(l1, e31, a1);
+                    H3_U16_LOW4_ONE(l2, e32, a2);
+                    H3_U16_LOW4_ONE(l3, e33, a3);
+                    ve3_lo = _mm_set_epi32((int)e33, (int)e32, (int)e31, (int)e30);
+                    va_lo  = _mm_set_epi32((int)a3, (int)a2, (int)a1, (int)a0);
+                }
+                {
+                    uint64_t const l4 = l3 + gaps[i + 4];
+                    uint64_t const l5 = l4 + gaps[i + 5];
+                    uint64_t const l6 = l5 + gaps[i + 6];
+                    H3_U16_LOW4_ONE(l4, e34, a4);
+                    H3_U16_LOW4_ONE(l5, e35, a5);
+                    H3_U16_LOW4_ONE(l6, e36, a6);
+                    H3_U16_LOW4_ONE(l7, e37, a7);
+                    ve3_hi = _mm_set_epi32((int)e37, (int)e36, (int)e35, (int)e34);
+                    va_hi  = _mm_set_epi32((int)a7, (int)a6, (int)a5, (int)a4);
+                }
+#undef H3_U16_LOW4_ONE
+                __m256i const ve3 = _mm256_inserti128_si256(_mm256_castsi128_si256(ve3_lo), ve3_hi, 1);
+                va  = _mm256_inserti128_si256(_mm256_castsi128_si256(va_lo), va_hi, 1);
+                vtx = _mm256_or_si256(_mm256_set1_epi32((int)top1X), _mm256_slli_epi32(_mm256_and_si256(ve3, _mm256_set1_epi32(7)), 9));
+                vty = _mm256_or_si256(_mm256_set1_epi32((int)top1Y), _mm256_slli_epi32(_mm256_and_si256(ve3, _mm256_set1_epi32(0x38)), 6));
+                vtz = _mm256_or_si256(_mm256_set1_epi32((int)top1Z), _mm256_slli_epi32(_mm256_and_si256(ve3, _mm256_set1_epi32(0x1C0)), 3));
+                hilbert3_store8_u16_xyz(
+                        dst + 6 * i,
+                        _mm256_or_si256(vtx, hilbert3_gather9_avx2(va)),
+                        _mm256_or_si256(vty, hilbert3_gather9_avx2(_mm256_srli_epi32(va, 3))),
+                        _mm256_or_si256(vtz, hilbert3_gather9_avx2(_mm256_srli_epi32(va, 6))));
+                continue;
+            }
+        }
+        {
+            uint32_t e4s[8], e3s[8], ds[8], as[8];
             for (int j = 0; j < 8; j++) {
-                uint32_t const d  = (uint32_t)(hs[j] >> 45) & 7u;
-                uint32_t const e4 = ZL_hilbert3_T3[((uint32_t)ZL_hilbert3_topS[d] << 9) | ((uint32_t)(hs[j] >> 36) & 511u)];
-                uint32_t const e3 = ZL_hilbert3_T3[(e4 & 0xFE00u) | ((uint32_t)(hs[j] >> 27) & 511u)];
+                k += gaps[i + (size_t)j];
+                uint32_t const d  = (uint32_t)(k >> 45) & 7u;
+                uint32_t const e4 = ZL_hilbert3_T3[((uint32_t)ZL_hilbert3_topS[d] << 9) | ((uint32_t)(k >> 36) & 511u)];
+                uint32_t const e3 = ZL_hilbert3_T3[(e4 & 0xFE00u) | ((uint32_t)(k >> 27) & 511u)];
+                uint32_t const e2 = ZL_hilbert3_T3[(e3 & 0xFE00u) | ((uint32_t)(k >> 18) & 511u)];
+                uint32_t const e1 = ZL_hilbert3_T3[(e2 & 0xFE00u) | ((uint32_t)(k >> 9) & 511u)];
+                uint32_t const e0 = ZL_hilbert3_T3[(e1 & 0xFE00u) | ((uint32_t)k & 511u)];
                 ds[j]  = d;
                 e4s[j] = e4;
                 e3s[j] = e3;
-                ss[j]  = e3 & 0xFE00u;
+                as[j]  = ((e2 & 511u) << 18) | ((e1 & 511u) << 9) | (e0 & 511u);
             }
-            s0 = ss[0]; s1 = ss[1]; s2 = ss[2]; s3 = ss[3];
-            s4 = ss[4]; s5 = ss[5]; s6 = ss[6]; s7 = ss[7];
             __m256i const lutM = _mm256_setr_epi8(0, 1, 3, 2, 6, 7, 5, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 3, 2, 6, 7, 5, 4, 0, 0, 0, 0, 0, 0, 0, 0);
-            __m256i const vm   = _mm256_shuffle_epi8(lutM, hilbert3_pack8_u32(ds[0], ds[1], ds[2], ds[3], ds[4], ds[5], ds[6], ds[7]));
-            __m256i const ve4  = hilbert3_pack8_u32(e4s[0], e4s[1], e4s[2], e4s[3], e4s[4], e4s[5], e4s[6], e4s[7]);
-            __m256i const ve3  = hilbert3_pack8_u32(e3s[0], e3s[1], e3s[2], e3s[3], e3s[4], e3s[5], e3s[6], e3s[7]);
+            __m256i const vm   = _mm256_shuffle_epi8(lutM, _mm256_loadu_si256((const __m256i_u*)(const void*)ds));
+            __m256i const ve4  = _mm256_loadu_si256((const __m256i_u*)(const void*)e4s);
+            __m256i const ve3  = _mm256_loadu_si256((const __m256i_u*)(const void*)e3s);
+            va                 = _mm256_loadu_si256((const __m256i_u*)(const void*)as);
             __m256i const vx4  = _mm256_or_si256(_mm256_slli_epi32(_mm256_and_si256(vm, _mm256_set1_epi32(1)), 15), _mm256_slli_epi32(_mm256_and_si256(ve4, _mm256_set1_epi32(7)), 12));
             __m256i const vy4  = _mm256_or_si256(_mm256_slli_epi32(_mm256_and_si256(vm, _mm256_set1_epi32(2)), 14), _mm256_slli_epi32(_mm256_and_si256(ve4, _mm256_set1_epi32(0x38)), 9));
             __m256i const vz4  = _mm256_or_si256(_mm256_slli_epi32(_mm256_and_si256(vm, _mm256_set1_epi32(4)), 13), _mm256_slli_epi32(_mm256_and_si256(ve4, _mm256_set1_epi32(0x1C0)), 6));
@@ -244,22 +251,12 @@ static void hilbert3Decode(uint8_t* dst, const uint64_t* gaps, size_t n)
             vty = _mm256_or_si256(vy4, _mm256_slli_epi32(_mm256_and_si256(ve3, _mm256_set1_epi32(0x38)), 6));
             vtz = _mm256_or_si256(vz4, _mm256_slli_epi32(_mm256_and_si256(ve3, _mm256_set1_epi32(0x1C0)), 3));
             uint32_t const m7 = ZL_hilbert3_topM[ds[7]];
-            top1P = h7 >> 36;
+            top1Valid = 1;
             top1S = e4s[7] & 0xFE00u;
             top1X = ((m7 & 1u) << 15) | ((e4s[7] & 7u) << 12);
             top1Y = ((m7 & 2u) << 14) | ((e4s[7] & 0x38u) << 9);
             top1Z = ((m7 & 4u) << 13) | ((e4s[7] & 0x1C0u) << 6);
-            top2P = h7 >> 27;
-            top2S = s7;
-            top2X = top1X | ((e3s[7] & 7u) << 9);
-            top2Y = top1Y | ((e3s[7] & 0x38u) << 6);
-            top2Z = top1Z | ((e3s[7] & 0x1C0u) << 3);
         }
-#define H3_U16_LOW3(hk, sk, ao)                                                            uint32_t const e2_##ao = ZL_hilbert3_T3[(sk) | ((uint32_t)((hk) >> 18) & 511u)];       uint32_t const e1_##ao = ZL_hilbert3_T3[(e2_##ao & 0xFE00u) | ((uint32_t)((hk) >> 9) & 511u)];     uint32_t const e0_##ao = ZL_hilbert3_T3[(e1_##ao & 0xFE00u) | ((uint32_t)(hk) & 511u)];     uint32_t const ao      = ((e2_##ao & 511u) << 18) | ((e1_##ao & 511u) << 9) | (e0_##ao & 511u)
-        H3_U16_LOW3(h0, s0, a0); H3_U16_LOW3(h1, s1, a1); H3_U16_LOW3(h2, s2, a2); H3_U16_LOW3(h3, s3, a3);
-        H3_U16_LOW3(h4, s4, a4); H3_U16_LOW3(h5, s5, a5); H3_U16_LOW3(h6, s6, a6); H3_U16_LOW3(h7, s7, a7);
-#undef H3_U16_LOW3
-        __m256i const va = hilbert3_pack8_u32(a0, a1, a2, a3, a4, a5, a6, a7);
         hilbert3_store8_u16_xyz(
                 dst + 6 * i,
                 _mm256_or_si256(vtx, hilbert3_gather9_avx2(va)),

@@ -350,6 +350,30 @@ ZL_FORCE_INLINE __m256i pbs_avx2_off64_x4(
     __m256i const mask64 = _mm256_sub_epi64(_mm256_sllv_epi64(ones64, ob64), ones64);
     return _mm256_and_si256(_mm256_srlv_epi64(raw64, sh64), mask64);
 }
+
+ZL_FORCE_INLINE __m256i pbs_avx2_off64_x4_wide(
+        const uint8_t* batchOffPtr, const uint16_t* bpPtr, const uint8_t* obPtr)
+{
+    __m256i const ones64    = _mm256_set1_epi64x(1LL);
+    __m256i const bp64      = _mm256_cvtepu16_epi64(_mm_loadl_epi64((const __m128i_u*)(const void*)bpPtr));
+    __m256i const sh64      = _mm256_and_si256(bp64, _mm256_set1_epi64x(7LL));
+    __m256i const rsh64     = _mm256_sub_epi64(_mm256_set1_epi64x(63LL), sh64);
+    const uint8_t* const p0 = batchOffPtr + (bpPtr[0] >> 3);
+    const uint8_t* const p1 = batchOffPtr + (bpPtr[1] >> 3);
+    const uint8_t* const p2 = batchOffPtr + (bpPtr[2] >> 3);
+    const uint8_t* const p3 = batchOffPtr + (bpPtr[3] >> 3);
+    __m256i const raw64     = _mm256_setr_epi64x(
+            (long long)ZL_readLE64(p0), (long long)ZL_readLE64(p1),
+            (long long)ZL_readLE64(p2), (long long)ZL_readLE64(p3));
+    __m256i const hi64      = _mm256_setr_epi64x(
+            (long long)((uint64_t)p0[8] << 1), (long long)((uint64_t)p1[8] << 1),
+            (long long)((uint64_t)p2[8] << 1), (long long)((uint64_t)p3[8] << 1));
+    __m256i const word64    = _mm256_or_si256(
+            _mm256_srlv_epi64(raw64, sh64), _mm256_sllv_epi64(hi64, rsh64));
+    __m256i const ob64      = _mm256_cvtepu8_epi64(_mm_cvtsi32_si128((int)ZL_readLE32(obPtr)));
+    __m256i const mask64    = _mm256_sub_epi64(_mm256_sllv_epi64(ones64, ob64), ones64);
+    return _mm256_and_si256(word64, mask64);
+}
 #endif
 
 #if ZL_HAS_WASM_SIMD128
@@ -530,21 +554,51 @@ ZL_FORCE_INLINE size_t pbs_simd_pass2(
         uint8_t* const d8       = (uint8_t*)outPtr;
         const uint8_t* const l8 = (const uint8_t*)lowTyped;
         __m256i const perm8     = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
-        for (; k + 32u <= fastN32; k += 32u) {
-            __m256i const o0   = pbs_avx2_off32_x8(batchOffPtr, bBitPos + k + 0u, bOb + k + 0u);
-            __m256i const o1   = pbs_avx2_off32_x8(batchOffPtr, bBitPos + k + 8u, bOb + k + 8u);
-            __m256i const o2   = pbs_avx2_off32_x8(batchOffPtr, bBitPos + k + 16u, bOb + k + 16u);
-            __m256i const o3   = pbs_avx2_off32_x8(batchOffPtr, bBitPos + k + 24u, bOb + k + 24u);
-            __m256i const off8 = _mm256_permutevar8x32_epi32(
-                    _mm256_packus_epi16(_mm256_packus_epi32(o0, o1), _mm256_packus_epi32(o2, o3)), perm8);
-            __m256i lowVec;
-            if (numBins <= 16u) {
-                __m256i const lut = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i_u*)l8));
-                lowVec = _mm256_shuffle_epi8(lut, _mm256_and_si256(
-                        _mm256_loadu_si256((const __m256i_u*)(const void*)(batchBins + k)), _mm256_set1_epi8(0x0F)));
-            } else {
+        if (numBins <= 16u) {
+            __m256i const lut = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i_u*)l8));
+            __m256i const m0F = _mm256_set1_epi8(0x0F);
+            for (; k + 32u <= fastN32; k += 32u) {
+                __m256i const o0   = pbs_avx2_off32_x8(batchOffPtr, bBitPos + k + 0u, bOb + k + 0u);
+                __m256i const o1   = pbs_avx2_off32_x8(batchOffPtr, bBitPos + k + 8u, bOb + k + 8u);
+                __m256i const o2   = pbs_avx2_off32_x8(batchOffPtr, bBitPos + k + 16u, bOb + k + 16u);
+                __m256i const o3   = pbs_avx2_off32_x8(batchOffPtr, bBitPos + k + 24u, bOb + k + 24u);
+                __m256i const off8 = _mm256_permutevar8x32_epi32(
+                        _mm256_packus_epi16(_mm256_packus_epi32(o0, o1), _mm256_packus_epi32(o2, o3)), perm8);
+                __m256i const bins = _mm256_loadu_si256((const __m256i_u*)(const void*)(batchBins + k));
+                __m256i const lowVec = _mm256_shuffle_epi8(lut, _mm256_and_si256(bins, m0F));
+                _mm256_storeu_si256((__m256i_u*)(void*)(d8 + k), pbs_avx2_latent8(_mm256_add_epi8(lowVec, off8), mode));
+            }
+        } else if (numBins <= 64u) {
+            __m256i const lut0 = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i_u*)(l8 + 0u)));
+            __m256i const lut1 = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i_u*)(l8 + 16u)));
+            __m256i const lut2 = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i_u*)(l8 + 32u)));
+            __m256i const lut3 = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i_u*)(l8 + 48u)));
+            __m256i const m0F  = _mm256_set1_epi8(0x0F);
+            for (; k + 32u <= fastN32; k += 32u) {
+                __m256i const o0   = pbs_avx2_off32_x8(batchOffPtr, bBitPos + k + 0u, bOb + k + 0u);
+                __m256i const o1   = pbs_avx2_off32_x8(batchOffPtr, bBitPos + k + 8u, bOb + k + 8u);
+                __m256i const o2   = pbs_avx2_off32_x8(batchOffPtr, bBitPos + k + 16u, bOb + k + 16u);
+                __m256i const o3   = pbs_avx2_off32_x8(batchOffPtr, bBitPos + k + 24u, bOb + k + 24u);
+                __m256i const off8 = _mm256_permutevar8x32_epi32(
+                        _mm256_packus_epi16(_mm256_packus_epi32(o0, o1), _mm256_packus_epi32(o2, o3)), perm8);
+                __m256i const bins = _mm256_loadu_si256((const __m256i_u*)(const void*)(batchBins + k));
+                __m256i const bIdx = _mm256_and_si256(bins, m0F);
+                __m256i const sel0 = _mm256_slli_epi16(bins, 3);
+                __m256i const l01  = _mm256_blendv_epi8(_mm256_shuffle_epi8(lut0, bIdx), _mm256_shuffle_epi8(lut1, bIdx), sel0);
+                __m256i const l23  = _mm256_blendv_epi8(_mm256_shuffle_epi8(lut2, bIdx), _mm256_shuffle_epi8(lut3, bIdx), sel0);
+                __m256i const lowVec = _mm256_blendv_epi8(l01, l23, _mm256_slli_epi16(bins, 2));
+                _mm256_storeu_si256((__m256i_u*)(void*)(d8 + k), pbs_avx2_latent8(_mm256_add_epi8(lowVec, off8), mode));
+            }
+        } else {
+            for (; k + 32u <= fastN32; k += 32u) {
+                __m256i const o0        = pbs_avx2_off32_x8(batchOffPtr, bBitPos + k + 0u, bOb + k + 0u);
+                __m256i const o1        = pbs_avx2_off32_x8(batchOffPtr, bBitPos + k + 8u, bOb + k + 8u);
+                __m256i const o2        = pbs_avx2_off32_x8(batchOffPtr, bBitPos + k + 16u, bOb + k + 16u);
+                __m256i const o3        = pbs_avx2_off32_x8(batchOffPtr, bBitPos + k + 24u, bOb + k + 24u);
+                __m256i const off8      = _mm256_permutevar8x32_epi32(
+                        _mm256_packus_epi16(_mm256_packus_epi32(o0, o1), _mm256_packus_epi32(o2, o3)), perm8);
                 const uint8_t* const bp = batchBins + k;
-                lowVec = _mm256_setr_epi8(
+                __m256i const lowVec    = _mm256_setr_epi8(
                         (char)l8[bp[0]], (char)l8[bp[1]], (char)l8[bp[2]], (char)l8[bp[3]],
                         (char)l8[bp[4]], (char)l8[bp[5]], (char)l8[bp[6]], (char)l8[bp[7]],
                         (char)l8[bp[8]], (char)l8[bp[9]], (char)l8[bp[10]], (char)l8[bp[11]],
@@ -553,8 +607,8 @@ ZL_FORCE_INLINE size_t pbs_simd_pass2(
                         (char)l8[bp[20]], (char)l8[bp[21]], (char)l8[bp[22]], (char)l8[bp[23]],
                         (char)l8[bp[24]], (char)l8[bp[25]], (char)l8[bp[26]], (char)l8[bp[27]],
                         (char)l8[bp[28]], (char)l8[bp[29]], (char)l8[bp[30]], (char)l8[bp[31]]);
+                _mm256_storeu_si256((__m256i_u*)(void*)(d8 + k), pbs_avx2_latent8(_mm256_add_epi8(lowVec, off8), mode));
             }
-            _mm256_storeu_si256((__m256i_u*)(void*)(d8 + k), pbs_avx2_latent8(_mm256_add_epi8(lowVec, off8), mode));
         }
     } else if (eltWidth == 2u) {
         uint16_t* const d16       = (uint16_t*)outPtr;
@@ -659,6 +713,16 @@ ZL_FORCE_INLINE size_t pbs_simd_pass2(
         const uint64_t* const l64 = (const uint64_t*)lowTyped;
         for (; k + 4u <= fastN64; k += 4u) {
             __m256i const off64     = pbs_avx2_off64_x4(batchOffPtr, bBitPos + k, bOb + k);
+            const uint8_t* const bp = batchBins + k;
+            __m256i const low64 = _mm256_setr_epi64x(
+                    (long long)l64[bp[0]], (long long)l64[bp[1]], (long long)l64[bp[2]], (long long)l64[bp[3]]);
+            _mm256_storeu_si256((__m256i_u*)(void*)(d64 + k), pbs_avx2_latent64(_mm256_add_epi64(low64, off64), mode));
+        }
+    } else {
+        uint64_t* const d64       = (uint64_t*)outPtr;
+        const uint64_t* const l64 = (const uint64_t*)lowTyped;
+        for (; k + 4u <= fastN64; k += 4u) {
+            __m256i const off64     = pbs_avx2_off64_x4_wide(batchOffPtr, bBitPos + k, bOb + k);
             const uint8_t* const bp = batchBins + k;
             __m256i const low64 = _mm256_setr_epi64x(
                     (long long)l64[bp[0]], (long long)l64[bp[1]], (long long)l64[bp[2]], (long long)l64[bp[3]]);
@@ -885,7 +949,7 @@ ZL_FORCE_INLINE size_t pbs_simd_pass2(
             for (size_t b = 0; b < numBins; b++) {                            \
                 lowTyped[b] = (TYPE)lowers[b];                                \
             }                                                                 \
-            size_t const padTo = (sizeof(TYPE) == 2u) ? 64u : 16u;            \
+            size_t const padTo = (sizeof(TYPE) <= 2u) ? 64u : 16u;            \
             if (numBins < padTo) {                                            \
                 memset(lowTyped + numBins, 0, (padTo - numBins) * sizeof(TYPE)); \
             }                                                                 \
@@ -911,31 +975,22 @@ ZL_FORCE_INLINE size_t pbs_simd_pass2(
             uint64_t const baseAligned = bitBase & ~(uint64_t)7ULL;           \
             uint64_t const endBit      = baseAligned + (uint64_t)endBitPos;   \
             ZL_ERR_IF_GT((endBit + 7ULL) >> 3, (uint64_t)packedBytes, corruption); \
-            size_t const baseByte          = (size_t)(bitBase >> 3);          \
-            size_t const remBytes          = packedBytes - baseByte;          \
-            const uint8_t* const batchOffP = offPtr + baseByte;               \
-            size_t fastN32                 = 0u;                              \
-            if (maxOb <= 25u && remBytes >= 4u) {                             \
-                size_t const maxByteOff32 = remBytes - 4u;                    \
-                fastN32                   = batchN;                           \
-                if (ZL_UNLIKELY(((size_t)endBitPos >> 3) > maxByteOff32)) {   \
-                    while (fastN32 > 0u && ((size_t)(bBitPos[fastN32 - 1u] >> 3) > maxByteOff32)) { \
-                        fastN32--;                                            \
-                    }                                                         \
+            size_t const baseByte     = (size_t)(bitBase >> 3);               \
+            size_t const remBytes     = packedBytes - baseByte;               \
+            const uint8_t* batchOffP  = offPtr + baseByte;                    \
+            uint8_t padBuf[PBS_BATCH_N * 8u + 24u];                           \
+            size_t const endByteBound = ((size_t)endBitPos >> 3) + 9u;        \
+            if (ZL_UNLIKELY(endByteBound > remBytes)) {                       \
+                if (remBytes > 0u) {                                          \
+                    memcpy(padBuf, batchOffP, remBytes);                      \
                 }                                                             \
+                memset(padBuf + remBytes, 0, 16u);                            \
+                batchOffP = padBuf;                                           \
             }                                                                 \
-            size_t fastN64 = 0u;                                              \
-            if (maxOb <= 57u && remBytes >= 8u) {                             \
-                size_t const maxByteOff64 = remBytes - 8u;                    \
-                fastN64                   = batchN;                           \
-                if (ZL_UNLIKELY(((size_t)endBitPos >> 3) > maxByteOff64)) {   \
-                    while (fastN64 > 0u && ((size_t)(bBitPos[fastN64 - 1u] >> 3) > maxByteOff64)) { \
-                        fastN64--;                                            \
-                    }                                                         \
-                }                                                             \
-            }                                                                 \
-            TYPE* const outPtr = dst + i;                                     \
-            size_t k           = pbs_simd_pass2(                              \
+            size_t const fastN32 = (maxOb <= 25u) ? batchN : 0u;              \
+            size_t const fastN64 = batchN;                                    \
+            TYPE* const outPtr   = dst + i;                                   \
+            size_t k             = pbs_simd_pass2(                            \
                     outPtr,                                                   \
                     sizeof(TYPE),                                             \
                     (MODE),                                                   \
@@ -948,17 +1003,23 @@ ZL_FORCE_INLINE size_t pbs_simd_pass2(
                     fastN64,                                                  \
                     bBitPos,                                                  \
                     bOb);                                                     \
-            for (; k < fastN64; k++) {                                        \
-                uint8_t const b    = binIds[i + k];                           \
-                uint16_t const bp  = bBitPos[k];                              \
-                uint64_t const off = (ZL_readLE64(batchOffP + (bp >> 3)) >> (bp & 7u)) & masks[b]; \
-                outPtr[k]          = (TYPE)(FROM_LATENT(lowers[b] + off, (ELT_BITS))); \
-            }                                                                 \
-            for (; k < batchN; k++) {                                         \
-                uint8_t const b    = binIds[i + k];                           \
-                uint64_t const off = pbs_read_bits(                           \
-                        offPtr, packedBytes, baseAligned + (uint64_t)bBitPos[k], bOb[k]); \
-                outPtr[k] = (TYPE)(FROM_LATENT(lowers[b] + off, (ELT_BITS))); \
+            if (maxOb <= 57u) {                                               \
+                for (; k < fastN64; k++) {                                    \
+                    uint8_t const b    = binIds[i + k];                       \
+                    uint16_t const bp  = bBitPos[k];                          \
+                    uint64_t const off = (ZL_readLE64(batchOffP + (bp >> 3)) >> (bp & 7u)) & masks[b]; \
+                    outPtr[k]          = (TYPE)(FROM_LATENT(lowers[b] + off, (ELT_BITS))); \
+                }                                                             \
+            } else {                                                          \
+                for (; k < fastN64; k++) {                                    \
+                    uint8_t const b        = binIds[i + k];                   \
+                    uint16_t const bp      = bBitPos[k];                      \
+                    const uint8_t* const p = batchOffP + (bp >> 3);           \
+                    unsigned const sh      = (unsigned)(bp & 7u);             \
+                    uint64_t const word    = (ZL_readLE64(p) >> sh) | (((uint64_t)p[8] << 1) << (63u - sh)); \
+                    uint64_t const off     = word & masks[b];                 \
+                    outPtr[k]              = (TYPE)(FROM_LATENT(lowers[b] + off, (ELT_BITS))); \
+                }                                                             \
             }                                                                 \
             bitBase = endBit;                                                 \
             i += batchN;                                                      \
