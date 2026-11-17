@@ -15,8 +15,8 @@
 #include "openzl/shared/varint.h"
 
 enum {
-    PBS_MAX_BINS_LOG = 7,
-    PBS_MAX_BINS     = 128,
+    PBS_MAX_BINS_LOG = 8,
+    PBS_MAX_BINS     = 256,
     PBS_SAMPLE_MAX   = 8192,
 };
 
@@ -243,6 +243,73 @@ static size_t pbs_build_histogram_1_counts(
         pbs_hb_apply_const_run(&hb, (uint64_t)vals[m], cnts[m]);
         pos += preSum + cnts[m];
         k = m + 1u;
+    }
+    if (hb.hasIncomplete) {
+        pbs_hb_complete_bin(&hb, (size_t)hb.nBins - 1u);
+    }
+    return hb.dstLen;
+}
+
+static size_t pbs_build_histogram_2_counts(
+        const uint32_t* counts,
+        uint16_t mn,
+        uint16_t mx,
+        size_t n,
+        PbsHistBin* outBins)
+{
+    unsigned nBinsLog = 0;
+    while ((size_t)(1u << (nBinsLog + 1u)) <= n
+           && nBinsLog < PBS_MAX_BINS_LOG) {
+        nBinsLog++;
+    }
+    PbsHistBuilder hb = {
+        .n               = (uint64_t)n,
+        .nBins           = (uint64_t)(1u << nBinsLog),
+        .nBinsLog        = nBinsLog,
+        .nApplied        = 0,
+        .nextAvailBinIdx = 0,
+        .hasIncomplete   = 0,
+        .dst             = outBins,
+        .dstLen          = 0,
+    };
+    uint32_t v          = (uint32_t)mn;
+    uint32_t const vEnd = (uint32_t)mx;
+    size_t pos          = 0;
+    while (v <= vEnd) {
+        while (v <= vEnd && counts[v] == 0u) {
+            v++;
+        }
+        if (v > vEnd) {
+            break;
+        }
+        size_t const rem          = n - pos;
+        size_t const targetBinIdx = pbs_hb_bin_idx(&hb, hb.nApplied);
+        size_t const targetCCount = pbs_hb_c_count(&hb, targetBinIdx);
+        size_t const targetI      = targetCCount - hb.nApplied;
+        if (targetI >= rem) {
+            pbs_hb_apply_incomplete(&hb, rem, (uint64_t)v, (uint64_t)vEnd);
+            if (targetI == rem) {
+                pbs_hb_complete_bin(&hb, targetBinIdx);
+            }
+            break;
+        }
+        uint32_t const firstV = v;
+        uint32_t lastPreV     = v;
+        size_t preSum         = 0;
+        while (preSum + counts[v] < targetI) {
+            if (counts[v] > 0u) {
+                preSum += counts[v];
+                lastPreV = v;
+            }
+            v++;
+        }
+        if (preSum > 0u) {
+            pbs_hb_apply_incomplete(
+                    &hb, preSum, (uint64_t)firstV, (uint64_t)lastPreV);
+        }
+        pbs_hb_apply_const_run(&hb, (uint64_t)v, counts[v]);
+        pos += preSum + counts[v];
+        v++;
     }
     if (hb.hasIncomplete) {
         pbs_hb_complete_bin(&hb, (size_t)hb.nBins - 1u);
@@ -1211,43 +1278,35 @@ ZL_Report EI_pco_bin_split(
                 hist[0].upper = mn2;
                 hist[0].count = (uint32_t)n;
                 nHist         = 1;
-            } else {
-                size_t sn = n;
-                const uint16_t* sSrc = latents2;
-                if (n > PBS_SAMPLE_MAX) {
-                    sampled             = 1;
-                    sn                  = PBS_SAMPLE_MAX;
-                    uint16_t* const smp = (uint16_t*)ZL_Encoder_getScratchSpace(
-                            eictx, sn * sizeof(uint16_t));
-                    ZL_ERR_IF_NULL(smp, allocation);
-                    for (size_t i = 0; i < sn; i++) {
-                        smp[i] = latents2[(i * n) / sn];
-                    }
-                    sSrc = smp;
+            } else if (n >= 512u) {
+                uint32_t* const counts2 = (uint32_t*)ZL_Encoder_getScratchSpace(
+                        eictx, 65536u * sizeof(uint32_t));
+                ZL_ERR_IF_NULL(counts2, allocation);
+                memset(counts2 + mn2,
+                       0,
+                       (size_t)((uint32_t)mx2 - (uint32_t)mn2 + 1u)
+                               * sizeof(uint32_t));
+                for (size_t i = 0; i < n; i++) {
+                    counts2[latents2[i]]++;
                 }
+                nHist = pbs_build_histogram_2_counts(
+                        counts2, mn2, mx2, n, hist);
+            } else {
                 uint32_t counts[2][256];
                 memset(counts, 0, sizeof(counts));
-                for (size_t i = 0; i < sn; i++) {
-                    uint16_t const v = sSrc[i];
+                for (size_t i = 0; i < n; i++) {
+                    uint16_t const v = latents2[i];
                     counts[0][v & 0xFFu]++;
                     counts[1][(v >> 8) & 0xFFu]++;
                 }
-                uint16_t const v0 = sSrc[0];
-                if (counts[0][v0 & 0xFFu] == sn && counts[1][(v0 >> 8) & 0xFFu] == sn) {
-                    hist[0].lower = minVal;
-                    hist[0].upper = maxVal;
-                    hist[0].count = (uint32_t)sn;
-                    nHist         = 1;
-                } else {
-                    uint16_t* const bufA = (uint16_t*)ZL_Encoder_getScratchSpace(
-                            eictx, sn * sizeof(uint16_t));
-                    uint16_t* const bufB = (uint16_t*)ZL_Encoder_getScratchSpace(
-                            eictx, sn * sizeof(uint16_t));
-                    ZL_ERR_IF(bufA == NULL || bufB == NULL, allocation);
-                    const uint16_t* const sorted =
-                            pbs_radix_sort_2(sSrc, bufA, bufB, sn, counts);
-                    nHist = pbs_build_histogram_2(sorted, sn, hist);
-                }
+                uint16_t* const bufA = (uint16_t*)ZL_Encoder_getScratchSpace(
+                        eictx, n * sizeof(uint16_t));
+                uint16_t* const bufB = (uint16_t*)ZL_Encoder_getScratchSpace(
+                        eictx, n * sizeof(uint16_t));
+                ZL_ERR_IF(bufA == NULL || bufB == NULL, allocation);
+                const uint16_t* const sorted =
+                        pbs_radix_sort_2(latents2, bufA, bufB, n, counts);
+                nHist = pbs_build_histogram_2(sorted, n, hist);
             }
             break;
         }

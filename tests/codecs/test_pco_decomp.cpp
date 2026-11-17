@@ -553,6 +553,35 @@ TEST_F(PcoDecompTest, PcoBinSplitSampledNearUint64MaxTightGap)
     testRoundTrip(Input::refNumeric(poly::span<const uint64_t>{ data }));
 }
 
+TEST_F(PcoDecompTest, PcoBinSplitExactU16And256Bins)
+{
+    compressor_.setParameter(CParam::FormatVersion, ZL_MAX_FORMAT_VERSION);
+    auto graph = nodes::PcoBinSplit{ nodes::PcoBinSplit::LatentMode::Unsigned }(
+            compressor_, graphs::Entropy{}(), graphs::Store{}());
+    compressor_.selectStartingGraph(graph);
+
+    // 256 sparse spikes spaced by 256 in uint16_t: exact u16 histogram finds
+    // all 256 zero-offset bins without sampling or radix sorting.
+    std::vector<uint16_t> sparse256(4096);
+    for (size_t i = 0; i < sparse256.size(); ++i) {
+        sparse256[i] = static_cast<uint16_t>((i & 255u) * 256u);
+    }
+    auto comp = testRoundTrip(
+            Input::refNumeric(poly::span<const uint16_t>{ sparse256 }));
+    // With 256 zero-offset bins, packed offset bytes are 0 and bin stream
+    // compresses to ~8 bits/elem + ~1 KB header (< 5 KB total vs 8192 raw).
+    EXPECT_LT(comp.size(), 5000u);
+
+    // Also verify n >= 512 with narrow tight clusters and rare outliers
+    // (non-trivial offsets + >128 bins).
+    std::vector<uint16_t> clustered(10000);
+    for (size_t i = 0; i < clustered.size(); ++i) {
+        clustered[i] = static_cast<uint16_t>((i % 200u) * 300u + (i & 3u));
+    }
+    clustered[9997] = 65535u;
+    testRoundTrip(Input::refNumeric(poly::span<const uint16_t>{ clustered }));
+}
+
 } // namespace
 } // namespace tests
 } // namespace openzl
