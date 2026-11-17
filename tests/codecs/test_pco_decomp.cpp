@@ -582,6 +582,47 @@ TEST_F(PcoDecompTest, PcoBinSplitExactU16And256Bins)
     testRoundTrip(Input::refNumeric(poly::span<const uint16_t>{ clustered }));
 }
 
+TEST_F(PcoDecompTest, PcoBinSplitPowerOfTwoRefinementAndSkewedUnique)
+{
+    compressor_.setParameter(CParam::FormatVersion, ZL_MAX_FORMAT_VERSION);
+    auto graph = nodes::PcoBinSplit{ nodes::PcoBinSplit::LatentMode::Unsigned }(
+            compressor_, graphs::Entropy{}(), graphs::Bitpack{}());
+    compressor_.selectStartingGraph(graph);
+
+    // 1. Skewed u16 stream with 200 distinct values (<= 256): adaptive exact
+    // runs keep zero-offset bins instead of merging consecutive heavy values.
+    std::vector<uint16_t> skewed200(32768);
+    for (size_t i = 0; i < skewed200.size(); ++i) {
+        uint32_t const r = static_cast<uint32_t>((i * 2654435761u) >> 16);
+        if ((r & 3u) == 0u) {
+            skewed200[i] = 0u;
+        } else {
+            uint16_t const v = static_cast<uint16_t>(1u + ((r * r) >> 24) % 199u);
+            skewed200[i]     = static_cast<uint16_t>(v * 17u);
+        }
+    }
+    auto compSkewed = testRoundTrip(
+            Input::refNumeric(poly::span<const uint16_t>{ skewed200 }));
+    EXPECT_LT(compSkewed.size(), 28500u);
+
+    // 2. Sampled u32 stream (n > 8192, > 256 distinct values) with a dense
+    // power-of-2 cluster [1000..1015] plus wide tail and unsampled gap values.
+    std::vector<uint32_t> powerAligned(32768);
+    for (size_t i = 0; i < powerAligned.size(); ++i) {
+        uint32_t const h = static_cast<uint32_t>(i * 2654435761u);
+        if ((h & 7u) != 0u) {
+            powerAligned[i] = 1000u + (h >> 28); // exact 16-value [1000..1015]
+        } else {
+            powerAligned[i] = 1016u + ((h >> 16) % 3500u);
+        }
+    }
+    powerAligned[32761] = 2047u;
+    powerAligned[32763] = 2048u;
+    auto compAligned = testRoundTrip(
+            Input::refNumeric(poly::span<const uint32_t>{ powerAligned }));
+    EXPECT_LT(compAligned.size(), 36000u);
+}
+
 } // namespace
 } // namespace tests
 } // namespace openzl

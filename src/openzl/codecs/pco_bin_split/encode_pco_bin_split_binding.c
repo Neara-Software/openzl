@@ -45,322 +45,248 @@ static inline float pbs_log2_approx(float x)
 {
     uint32_t bits = 0;
     memcpy(&bits, &x, sizeof(bits));
-    return (float)bits * (1.0f / 8388608.0f) - 126.942695f;
+    float const expPart  = (float)((int32_t)(bits >> 23) - 127);
+    uint32_t const mBits = (bits & 0x007FFFFFu) | 0x3F800000u;
+    float m              = 0.0f;
+    memcpy(&m, &mBits, sizeof(m));
+    float const t = m - 1.0f;
+    return expPart + t * (1.4208645f + t * (-0.5772507f + t * 0.1563861f));
 }
 
-typedef struct {
-    uint64_t n;
-    uint64_t nBins;
-    unsigned nBinsLog;
-    size_t nApplied;
-    size_t nextAvailBinIdx;
-    int hasIncomplete;
-    PbsHistBin incomplete;
-    PbsHistBin* dst;
-    size_t dstLen;
-} PbsHistBuilder;
-
-static inline size_t pbs_hb_bin_idx(const PbsHistBuilder* hb, size_t cCount)
+static inline unsigned pbs_varint_bits(uint64_t delta)
 {
-    return (size_t)(((uint64_t)cCount << hb->nBinsLog) / hb->n);
+    unsigned const bl = pbs_offset_bits(delta);
+    return bl <= 7u ? 8u : ((bl + 6u) / 7u) * 8u;
 }
 
-static inline size_t pbs_hb_c_count(const PbsHistBuilder* hb, size_t binIdx)
-{
-    return (size_t)((((uint64_t)(binIdx + 1u) * hb->n) + hb->nBins - 1ULL)
-                    >> hb->nBinsLog);
-}
-
-static void pbs_hb_apply_incomplete(
-        PbsHistBuilder* hb,
-        size_t count,
-        uint64_t lower,
-        uint64_t upper)
-{
-    if (count == 0) {
-        return;
-    }
-    if (hb->hasIncomplete) {
-        hb->incomplete.upper = upper;
-        hb->incomplete.count += (uint32_t)count;
-    } else {
-        hb->hasIncomplete    = 1;
-        hb->incomplete.lower = lower;
-        hb->incomplete.upper = upper;
-        hb->incomplete.count = (uint32_t)count;
-    }
-    hb->nApplied += count;
-}
-
-static int pbs_hb_complete_bin(PbsHistBuilder* hb, size_t binIdx)
-{
-    if (!hb->hasIncomplete) {
-        return 0;
-    }
-    ZL_ASSERT_GE(binIdx, hb->nextAvailBinIdx);
-    hb->nextAvailBinIdx   = binIdx + 1u;
-    hb->dst[hb->dstLen++] = hb->incomplete;
-    hb->hasIncomplete     = 0;
-    return 1;
-}
-
-static void pbs_hb_apply_const_run(
-        PbsHistBuilder* hb,
-        uint64_t val,
-        size_t runLen)
-{
-    size_t const start = hb->nApplied;
-    size_t const mid   = start + runLen / 2u;
-    size_t const end   = start + runLen;
-    size_t binIdx      = pbs_hb_bin_idx(hb, mid);
-    if (binIdx > hb->nextAvailBinIdx) {
-        size_t const spare = binIdx - 1u;
-        if (!pbs_hb_complete_bin(hb, spare)) {
-            binIdx = spare;
-        }
-    }
-    pbs_hb_apply_incomplete(hb, runLen, val, val);
-    if (end >= pbs_hb_c_count(hb, binIdx)) {
-        pbs_hb_complete_bin(hb, binIdx);
-    }
-}
-
-#define PBS_DEFINE_HIST_FN(W, T)                                                   \
-    static size_t pbs_build_histogram_##W(                                         \
-            const T* sorted, size_t n, PbsHistBin* outBins)                        \
-    {                                                                              \
-        unsigned nBinsLog = 0;                                                     \
-        while ((size_t)(1u << (nBinsLog + 1u)) <= n                                \
-               && nBinsLog < PBS_MAX_BINS_LOG) {                                   \
-            nBinsLog++;                                                            \
-        }                                                                          \
-        PbsHistBuilder hb = {                                                      \
-            .n               = (uint64_t)n,                                        \
-            .nBins           = (uint64_t)(1u << nBinsLog),                         \
-            .nBinsLog        = nBinsLog,                                           \
-            .nApplied        = 0,                                                  \
-            .nextAvailBinIdx = 0,                                                  \
-            .hasIncomplete   = 0,                                                  \
-            .dst             = outBins,                                            \
-            .dstLen          = 0,                                                  \
-        };                                                                         \
-        size_t pos = 0;                                                            \
-        while (pos < n) {                                                          \
-            size_t const rem          = n - pos;                                   \
-            size_t const targetBinIdx = pbs_hb_bin_idx(&hb, hb.nApplied);          \
-            size_t const targetCCount = pbs_hb_c_count(&hb, targetBinIdx);         \
-            size_t const targetI      = targetCCount - hb.nApplied;                \
-            if (targetI >= rem) {                                                  \
-                pbs_hb_apply_incomplete(                                           \
-                        &hb, rem, (uint64_t)sorted[pos], (uint64_t)sorted[n - 1u]); \
-                if (targetI == rem) {                                              \
-                    pbs_hb_complete_bin(&hb, targetBinIdx);                        \
-                }                                                                  \
-                break;                                                             \
-            }                                                                      \
-            size_t l    = pos + targetI - 1u;                                      \
-            size_t r    = pos + targetI;                                           \
-            T const tx  = sorted[l];                                               \
-            while (l > pos && sorted[l - 1u] == tx) {                              \
-                l--;                                                               \
-            }                                                                      \
-            while (r < n && sorted[r] == tx) {                                     \
-                r++;                                                               \
-            }                                                                      \
-            if (l > pos) {                                                         \
-                pbs_hb_apply_incomplete(                                           \
-                        &hb,                                                       \
-                        l - pos,                                                   \
-                        (uint64_t)sorted[pos],                                     \
-                        (uint64_t)sorted[l - 1u]);                                 \
-            }                                                                      \
-            pbs_hb_apply_const_run(&hb, (uint64_t)tx, r - l);                      \
-            pos = r;                                                               \
-        }                                                                          \
-        if (hb.hasIncomplete) {                                                    \
-            pbs_hb_complete_bin(&hb, (size_t)hb.nBins - 1u);                       \
-        }                                                                          \
-        return hb.dstLen;                                                          \
+#define PBS_DEFINE_RUNS_FN(W, T)                                 \
+    static size_t pbs_extract_runs_##W(                          \
+            const T* sorted,                                     \
+            size_t n,                                            \
+            uint64_t* uVals,                                     \
+            uint32_t* prefCnt)                                   \
+    {                                                            \
+        size_t u   = 0;                                          \
+        prefCnt[0] = 0;                                          \
+        size_t pos = 0;                                          \
+        while (pos < n) {                                        \
+            T const v = sorted[pos];                             \
+            size_t r  = pos + 1u;                                \
+            while (r < n && sorted[r] == v) {                    \
+                r++;                                             \
+            }                                                    \
+            uVals[u]        = (uint64_t)v;                       \
+            prefCnt[u + 1u] = (uint32_t)r;                       \
+            u++;                                                 \
+            pos = r;                                             \
+        }                                                        \
+        return u;                                                \
     }
 
-PBS_DEFINE_HIST_FN(2, uint16_t)
-PBS_DEFINE_HIST_FN(4, uint32_t)
-PBS_DEFINE_HIST_FN(8, uint64_t)
+PBS_DEFINE_RUNS_FN(2, uint16_t)
+PBS_DEFINE_RUNS_FN(4, uint32_t)
+PBS_DEFINE_RUNS_FN(8, uint64_t)
 
-static size_t pbs_build_histogram_1_counts(
-        const uint32_t counts[256], size_t n, PbsHistBin* outBins)
-{
-    uint8_t vals[256];
-    uint32_t cnts[256];
-    size_t u = 0;
-    for (unsigned v = 0; v < 256u; v++) {
-        if (counts[v] > 0u) {
-            vals[u] = (uint8_t)v;
-            cnts[u] = counts[v];
-            u++;
-        }
-    }
-    unsigned nBinsLog = 0;
-    while ((size_t)(1u << (nBinsLog + 1u)) <= n
-           && nBinsLog < PBS_MAX_BINS_LOG) {
-        nBinsLog++;
-    }
-    PbsHistBuilder hb = {
-        .n               = (uint64_t)n,
-        .nBins           = (uint64_t)(1u << nBinsLog),
-        .nBinsLog        = nBinsLog,
-        .nApplied        = 0,
-        .nextAvailBinIdx = 0,
-        .hasIncomplete   = 0,
-        .dst             = outBins,
-        .dstLen          = 0,
-    };
-    size_t k   = 0;
-    size_t pos = 0;
-    while (k < u) {
-        size_t const rem          = n - pos;
-        size_t const targetBinIdx = pbs_hb_bin_idx(&hb, hb.nApplied);
-        size_t const targetCCount = pbs_hb_c_count(&hb, targetBinIdx);
-        size_t const targetI      = targetCCount - hb.nApplied;
-        if (targetI >= rem) {
-            pbs_hb_apply_incomplete(
-                    &hb, rem, (uint64_t)vals[k], (uint64_t)vals[u - 1u]);
-            if (targetI == rem) {
-                pbs_hb_complete_bin(&hb, targetBinIdx);
-            }
-            break;
-        }
-        size_t m      = k;
-        size_t preSum = 0;
-        while (preSum + cnts[m] < targetI) {
-            preSum += cnts[m];
-            m++;
-        }
-        if (m > k) {
-            pbs_hb_apply_incomplete(
-                    &hb, preSum, (uint64_t)vals[k], (uint64_t)vals[m - 1u]);
-        }
-        pbs_hb_apply_const_run(&hb, (uint64_t)vals[m], cnts[m]);
-        pos += preSum + cnts[m];
-        k = m + 1u;
-    }
-    if (hb.hasIncomplete) {
-        pbs_hb_complete_bin(&hb, (size_t)hb.nBins - 1u);
-    }
-    return hb.dstLen;
-}
-
-static size_t pbs_build_histogram_2_counts(
-        const uint32_t* counts,
-        uint16_t mn,
-        uint16_t mx,
-        size_t n,
-        PbsHistBin* outBins)
-{
-    unsigned nBinsLog = 0;
-    while ((size_t)(1u << (nBinsLog + 1u)) <= n
-           && nBinsLog < PBS_MAX_BINS_LOG) {
-        nBinsLog++;
-    }
-    PbsHistBuilder hb = {
-        .n               = (uint64_t)n,
-        .nBins           = (uint64_t)(1u << nBinsLog),
-        .nBinsLog        = nBinsLog,
-        .nApplied        = 0,
-        .nextAvailBinIdx = 0,
-        .hasIncomplete   = 0,
-        .dst             = outBins,
-        .dstLen          = 0,
-    };
-    uint32_t v          = (uint32_t)mn;
-    uint32_t const vEnd = (uint32_t)mx;
-    size_t pos          = 0;
-    while (v <= vEnd) {
-        while (v <= vEnd && counts[v] == 0u) {
-            v++;
-        }
-        if (v > vEnd) {
-            break;
-        }
-        size_t const rem          = n - pos;
-        size_t const targetBinIdx = pbs_hb_bin_idx(&hb, hb.nApplied);
-        size_t const targetCCount = pbs_hb_c_count(&hb, targetBinIdx);
-        size_t const targetI      = targetCCount - hb.nApplied;
-        if (targetI >= rem) {
-            pbs_hb_apply_incomplete(&hb, rem, (uint64_t)v, (uint64_t)vEnd);
-            if (targetI == rem) {
-                pbs_hb_complete_bin(&hb, targetBinIdx);
-            }
-            break;
-        }
-        uint32_t const firstV = v;
-        uint32_t lastPreV     = v;
-        size_t preSum         = 0;
-        while (preSum + counts[v] < targetI) {
-            if (counts[v] > 0u) {
-                preSum += counts[v];
-                lastPreV = v;
-            }
-            v++;
-        }
-        if (preSum > 0u) {
-            pbs_hb_apply_incomplete(
-                    &hb, preSum, (uint64_t)firstV, (uint64_t)lastPreV);
-        }
-        pbs_hb_apply_const_run(&hb, (uint64_t)v, counts[v]);
-        pos += preSum + counts[v];
-        v++;
-    }
-    if (hb.hasIncomplete) {
-        pbs_hb_complete_bin(&hb, (size_t)hb.nBins - 1u);
-    }
-    return hb.dstLen;
-}
-
-static inline float pbs_bin_cost(
+static inline float pbs_iv_cost(
+        const uint64_t* uVals,
+        const uint32_t* prefCnt,
+        uint32_t s,
+        uint32_t e,
         float binMetaCost,
-        uint64_t lower,
-        uint64_t upper,
-        uint32_t count,
         float totalCountLog2)
 {
-    float const c          = (float)count;
-    float const ansCost    = totalCountLog2 - pbs_log2_approx(c);
-    float const offsetCost = (float)pbs_offset_bits(upper - lower);
-    return binMetaCost + (ansCost + offsetCost) * c;
+    float const c       = (float)(prefCnt[e + 1u] - prefCnt[s]);
+    float const ansCost = totalCountLog2 - pbs_log2_approx(c);
+    float const obCost  = (float)pbs_offset_bits(uVals[e] - uVals[s]);
+    return binMetaCost + (ansCost + obCost) * c;
 }
 
-static size_t pbs_optimize_bins(
-        const PbsHistBin* hist,
-        size_t nHist,
-        unsigned eltBits,
-        size_t totalElements,
-        PbsHistBin* mergedOut)
+static inline uint32_t pbs_last_le(
+        const uint64_t* uVals,
+        uint32_t loIdx,
+        uint32_t hiIdx,
+        uint64_t target)
 {
-    uint32_t cCounts[PBS_MAX_BINS + 1];
+    while (loIdx < hiIdx) {
+        uint32_t const mid = loIdx + (hiIdx - loIdx + 1u) / 2u;
+        if (uVals[mid] <= target) {
+            loIdx = mid;
+        } else {
+            hiIdx = mid - 1u;
+        }
+    }
+    return loIdx;
+}
+
+static inline uint32_t pbs_first_ge(
+        const uint64_t* uVals,
+        uint32_t loIdx,
+        uint32_t hiIdx,
+        uint64_t target)
+{
+    while (loIdx < hiIdx) {
+        uint32_t const mid = loIdx + (hiIdx - loIdx) / 2u;
+        if (uVals[mid] >= target) {
+            hiIdx = mid;
+        } else {
+            loIdx = mid + 1u;
+        }
+    }
+    return loIdx;
+}
+
+static void pbs_eval_best_split(
+        const uint64_t* uVals,
+        const uint32_t* prefCnt,
+        uint32_t s,
+        uint32_t e,
+        float binMetaCost,
+        float totalCountLog2,
+        float* outGain,
+        uint32_t* outMid)
+{
+    *outGain = 0.0f;
+    *outMid  = s;
+    if (s >= e) {
+        return;
+    }
+    uint64_t const lo = uVals[s];
+    uint64_t const hi = uVals[e];
+    unsigned const ob = pbs_offset_bits(hi - lo);
+    if (ob == 0u) {
+        return;
+    }
+    float const baseCost =
+            pbs_iv_cost(uVals, prefCnt, s, e, binMetaCost, totalCountLog2);
+    float bestGain   = 0.0f;
+    uint32_t bestMid = s;
+
+    uint32_t cands[7];
+    size_t nCands = 0;
+    for (unsigned sh = 1u; sh <= 3u && sh <= ob; sh++) {
+        uint64_t const msk   = pbs_mask64(ob - sh);
+        uint64_t const capLo = pbs_sat_add_u64(lo, msk);
+        cands[nCands++]      = pbs_last_le(uVals, s, e - 1u, capLo);
+        uint64_t const capHi = hi - msk;
+        cands[nCands++]      = pbs_first_ge(uVals, s + 1u, e, capHi) - 1u;
+    }
+    cands[nCands++] = s + (e - s - 1u) / 2u;
+
+    for (size_t ci = 0; ci < nCands; ci++) {
+        uint32_t const m = cands[ci];
+        int dup          = 0;
+        for (size_t prev = 0; prev < ci; prev++) {
+            if (cands[prev] == m) {
+                dup = 1;
+                break;
+            }
+        }
+        if (dup) {
+            continue;
+        }
+        float const splitCost =
+                pbs_iv_cost(uVals, prefCnt, s, m, binMetaCost, totalCountLog2)
+                + pbs_iv_cost(
+                        uVals, prefCnt, m + 1u, e, binMetaCost, totalCountLog2);
+        float const gain = baseCost - splitCost;
+        if (gain > bestGain) {
+            bestGain = gain;
+            bestMid  = m;
+        }
+    }
+    *outGain = bestGain;
+    *outMid  = bestMid;
+}
+
+static size_t pbs_optimize_from_runs(
+        const uint64_t* uVals,
+        const uint32_t* prefCnt,
+        size_t u,
+        size_t totalElements,
+        PbsHistBin* outBins)
+{
+    if (u <= 1u) {
+        outBins[0].lower = uVals[0];
+        outBins[0].upper = uVals[0];
+        outBins[0].count = prefCnt[1];
+        return 1u;
+    }
+
+    uint32_t const totalCount  = prefCnt[u];
+    float const totalCountLog2 = pbs_log2_approx((float)totalCount);
+    float const scale          = (float)totalCount / (float)totalElements;
+    uint64_t const totalSpan   = uVals[u - 1u] - uVals[0];
+    size_t const estBins       = u < 64u ? u : 64u;
+    float const varintBits =
+            (float)pbs_varint_bits(totalSpan / (uint64_t)estBins);
+    float const binMetaCost = (varintBits + 18.0f) * scale;
+
+    /* 1. Build adaptive remaining-budget initial intervals [hStart, hEnd]. */
+    uint32_t hStart[PBS_MAX_BINS];
+    uint32_t hEnd[PBS_MAX_BINS];
+    size_t nHist = 0;
+    if (u <= PBS_MAX_BINS) {
+        for (size_t k = 0; k < u; k++) {
+            hStart[k] = (uint32_t)k;
+            hEnd[k]   = (uint32_t)k;
+        }
+        nHist = u;
+    } else {
+        uint32_t remElts = totalCount;
+        size_t k         = 0;
+        while (k < u) {
+            size_t const remBins = (size_t)PBS_MAX_BINS - nHist;
+            if (remBins <= 1u) {
+                hStart[nHist] = (uint32_t)k;
+                hEnd[nHist]   = (uint32_t)(u - 1u);
+                nHist++;
+                break;
+            }
+            uint32_t const targ =
+                    (remElts + (uint32_t)remBins - 1u) / (uint32_t)remBins;
+            uint32_t const c0 = prefCnt[k + 1u] - prefCnt[k];
+            if (c0 >= targ || (u - k) <= remBins) {
+                hStart[nHist] = (uint32_t)k;
+                hEnd[nHist]   = (uint32_t)k;
+                nHist++;
+                remElts -= c0;
+                k++;
+            } else {
+                uint32_t acc = c0;
+                size_t m     = k + 1u;
+                while (m < u && (u - m) >= (remBins - 1u)) {
+                    uint32_t const cm = prefCnt[m + 1u] - prefCnt[m];
+                    if (acc + cm > targ) {
+                        break;
+                    }
+                    acc += cm;
+                    m++;
+                }
+                hStart[nHist] = (uint32_t)k;
+                hEnd[nHist]   = (uint32_t)(m - 1u);
+                nHist++;
+                remElts -= acc;
+                k = m;
+            }
+        }
+    }
+
+    /* 2. Exact DP bin merging over the nHist candidate intervals. */
     float bestCosts[PBS_MAX_BINS + 1];
     size_t bestJs[PBS_MAX_BINS];
-
-    cCounts[0]   = 0;
     bestCosts[0] = 0.0f;
-    for (size_t i = 0; i < nHist; i++) {
-        cCounts[i + 1] = cCounts[i] + hist[i].count;
-    }
-    uint32_t const totalCount  = cCounts[nHist];
-    float const totalCountLog2 = pbs_log2_approx((float)totalCount);
-    float const binMetaCost =
-            (24.0f + (float)eltBits) * ((float)totalCount / (float)totalElements);
-
     for (size_t i = 0; i < nHist; i++) {
         float bestCost       = FLT_MAX;
         size_t bestJ         = 0;
-        uint64_t const upper = hist[i].upper;
-        uint32_t const ccI   = cCounts[i + 1];
-        for (size_t j = i + 1; j-- > 0;) {
-            uint32_t const c      = ccI - cCounts[j];
-            unsigned const ob     = pbs_offset_bits(upper - hist[j].lower);
-            float const fc        = (float)c;
-            float const minBinLb  = binMetaCost + (float)ob * fc;
+        uint32_t const eIdx  = hEnd[i];
+        uint64_t const upper = uVals[eIdx];
+        uint32_t const ccI   = prefCnt[eIdx + 1u];
+        for (size_t j = i + 1u; j-- > 0u;) {
+            uint32_t const sIdx    = hStart[j];
+            uint32_t const c       = ccI - prefCnt[sIdx];
+            unsigned const ob      = pbs_offset_bits(upper - uVals[sIdx]);
+            float const fc         = (float)c;
+            float const minBinLb   = binMetaCost + (float)ob * fc;
             if (minBinLb >= bestCost) {
                 break;
             }
@@ -371,66 +297,143 @@ static size_t pbs_optimize_bins(
                 bestJ    = j;
             }
         }
-        bestCosts[i + 1] = bestCost;
-        bestJs[i]        = bestJ;
+        bestCosts[i + 1u] = bestCost;
+        bestJs[i]         = bestJ;
     }
 
-    float const bestCost      = bestCosts[nHist];
-    float const singleBinCost = pbs_bin_cost(
-            binMetaCost,
-            hist[0].lower,
-            hist[nHist - 1].upper,
-            totalCount,
-            totalCountLog2);
-    if (singleBinCost < bestCost + 0.1f * (float)totalCount) {
-        mergedOut[0].lower = hist[0].lower;
-        mergedOut[0].upper = hist[nHist - 1].upper;
-        mergedOut[0].count = totalCount;
-        return 1;
-    }
-
-    int allTrivial = 1;
-    float trivCost = 0.0f;
-    for (size_t i = 0; i < nHist; i++) {
-        if (hist[i].lower != hist[i].upper) {
-            allTrivial = 0;
-            break;
+    uint32_t bStart[PBS_MAX_BINS];
+    uint32_t bEnd[PBS_MAX_BINS];
+    size_t numBins = 0;
+    {
+        size_t revStart[PBS_MAX_BINS];
+        size_t revEnd[PBS_MAX_BINS];
+        size_t cur = nHist - 1u;
+        while (1) {
+            size_t const j    = bestJs[cur];
+            revStart[numBins] = j;
+            revEnd[numBins]   = cur;
+            numBins++;
+            if (j == 0u) {
+                break;
+            }
+            cur = j - 1u;
         }
-        trivCost += pbs_bin_cost(
-                binMetaCost,
-                hist[i].lower,
-                hist[i].upper,
-                hist[i].count,
-                totalCountLog2);
-    }
-    if (allTrivial && trivCost < bestCost + 0.1f * (float)totalCount) {
-        memcpy(mergedOut, hist, nHist * sizeof(PbsHistBin));
-        return nHist;
+        for (size_t b = 0; b < numBins; b++) {
+            size_t const rk = numBins - 1u - b;
+            bStart[b]       = hStart[revStart[rk]];
+            bEnd[b]         = hEnd[revEnd[rk]];
+        }
     }
 
-    size_t revStart[PBS_MAX_BINS];
-    size_t revEnd[PBS_MAX_BINS];
-    size_t nMerged = 0;
-    size_t cur     = nHist - 1u;
-    while (1) {
-        size_t const j    = bestJs[cur];
-        revStart[nMerged] = j;
-        revEnd[nMerged]   = cur;
-        nMerged++;
-        if (j == 0) {
-            break;
+    /* 3. Exact 1-value resolution power-of-2 capacity split when u > 256. */
+    if (u > PBS_MAX_BINS) {
+        float splitGain[PBS_MAX_BINS];
+        uint32_t splitMid[PBS_MAX_BINS];
+        for (size_t b = 0; b < numBins; b++) {
+            pbs_eval_best_split(
+                    uVals,
+                    prefCnt,
+                    bStart[b],
+                    bEnd[b],
+                    binMetaCost,
+                    totalCountLog2,
+                    &splitGain[b],
+                    &splitMid[b]);
         }
-        cur = j - 1u;
+        while (numBins < PBS_MAX_BINS) {
+            float maxGain = 32.0f * scale;
+            size_t bestB  = numBins;
+            for (size_t b = 0; b < numBins; b++) {
+                if (splitGain[b] > maxGain) {
+                    maxGain = splitGain[b];
+                    bestB   = b;
+                }
+            }
+            if (bestB == numBins) {
+                break;
+            }
+            uint32_t const mid = splitMid[bestB];
+            uint32_t const oldE = bEnd[bestB];
+            for (size_t sh = numBins; sh > bestB + 1u; sh--) {
+                bStart[sh]    = bStart[sh - 1u];
+                bEnd[sh]      = bEnd[sh - 1u];
+                splitGain[sh] = splitGain[sh - 1u];
+                splitMid[sh]  = splitMid[sh - 1u];
+            }
+            bEnd[bestB]          = mid;
+            bStart[bestB + 1u]   = mid + 1u;
+            bEnd[bestB + 1u]     = oldE;
+            numBins++;
+            pbs_eval_best_split(
+                    uVals,
+                    prefCnt,
+                    bStart[bestB],
+                    bEnd[bestB],
+                    binMetaCost,
+                    totalCountLog2,
+                    &splitGain[bestB],
+                    &splitMid[bestB]);
+            pbs_eval_best_split(
+                    uVals,
+                    prefCnt,
+                    bStart[bestB + 1u],
+                    bEnd[bestB + 1u],
+                    binMetaCost,
+                    totalCountLog2,
+                    &splitGain[bestB + 1u],
+                    &splitMid[bestB + 1u]);
+        }
     }
-    for (size_t k = 0; k < nMerged; k++) {
-        size_t const rk    = nMerged - 1u - k;
-        size_t const s     = revStart[rk];
-        size_t const e     = revEnd[rk];
-        mergedOut[k].lower = hist[s].lower;
-        mergedOut[k].upper = hist[e].upper;
-        mergedOut[k].count = cCounts[e + 1u] - cCounts[s];
+    float curTotalCost = 0.0f;
+    int anyNonZeroOb   = 0;
+    for (size_t b = 0; b < numBins; b++) {
+        curTotalCost += pbs_iv_cost(
+                uVals, prefCnt, bStart[b], bEnd[b], binMetaCost, totalCountLog2);
+        if (uVals[bEnd[b]] != uVals[bStart[b]]) {
+            anyNonZeroOb = 1;
+        }
     }
-    return nMerged;
+
+    /* 4. Check allZeroOffsets exact unique-value bins when u <= 256. */
+    if (u <= PBS_MAX_BINS && anyNonZeroOb) {
+        float trivCost = 0.0f;
+        for (size_t k = 0; k < u; k++) {
+            trivCost += pbs_iv_cost(
+                    uVals,
+                    prefCnt,
+                    (uint32_t)k,
+                    (uint32_t)k,
+                    binMetaCost,
+                    totalCountLog2);
+        }
+        if (trivCost <= curTotalCost) {
+            for (size_t k = 0; k < u; k++) {
+                outBins[k].lower = uVals[k];
+                outBins[k].upper = uVals[k];
+                outBins[k].count = prefCnt[k + 1u] - prefCnt[k];
+            }
+            return u;
+        }
+    }
+
+    /* 5. Check single-bin bypass (saves FSE bin-index stream). */
+    float const singleBinCost =
+            (float)pbs_offset_bits(totalSpan) * (float)totalCount
+            + (float)pbs_varint_bits(uVals[0]) * scale;
+    if (numBins > 1u
+        && singleBinCost < curTotalCost + 0.10f * (float)totalCount) {
+        outBins[0].lower = uVals[0];
+        outBins[0].upper = uVals[u - 1u];
+        outBins[0].count = totalCount;
+        return 1u;
+    }
+
+    for (size_t b = 0; b < numBins; b++) {
+        outBins[b].lower = uVals[bStart[b]];
+        outBins[b].upper = uVals[bEnd[b]];
+        outBins[b].count = prefCnt[bEnd[b] + 1u] - prefCnt[bStart[b]];
+    }
+    return numBins;
 }
 
 #define PBS_SHAR_STEP(BASE, V, LOWS, STEP)                                         \
@@ -1201,11 +1204,16 @@ ZL_Report EI_pco_bin_split(
     const uint32_t* latents4 = NULL;
     const uint64_t* latents8 = NULL;
 
-    PbsHistBin hist[PBS_MAX_BINS];
-    size_t nHist     = 0;
-    int sampled      = 0;
-    uint64_t minVal  = 0;
-    uint64_t maxVal  = 0;
+    PbsHistBin bins[PBS_MAX_BINS];
+    size_t numBins         = 0;
+    uint64_t uVals1[256];
+    uint32_t pref1[257];
+    const uint64_t* uVals  = NULL;
+    const uint32_t* pref   = NULL;
+    size_t uRuns           = 0;
+    int sampled            = 0;
+    uint64_t minVal        = 0;
+    uint64_t maxVal        = 0;
     uint32_t counts1[256];
 
     switch (eltWidth) {
@@ -1249,12 +1257,22 @@ ZL_Report EI_pco_bin_split(
                 counts1[v] = c0[v] + c1[v] + c2[v] + c3[v];
             }
             if (counts1[latents1[0]] == n) {
-                hist[0].lower = latents1[0];
-                hist[0].upper = latents1[0];
-                hist[0].count = (uint32_t)n;
-                nHist         = 1;
+                bins[0].lower = latents1[0];
+                bins[0].upper = latents1[0];
+                bins[0].count = (uint32_t)n;
+                numBins       = 1u;
             } else {
-                nHist = pbs_build_histogram_1_counts(counts1, n, hist);
+                pref1[0] = 0;
+                for (unsigned v = 0; v < 256u; v++) {
+                    uint32_t const cv = counts1[v];
+                    if (cv != 0u) {
+                        uVals1[uRuns]        = (uint64_t)v;
+                        pref1[uRuns + 1u]    = pref1[uRuns] + cv;
+                        uRuns++;
+                    }
+                }
+                uVals = uVals1;
+                pref  = pref1;
             }
             break;
         }
@@ -1274,23 +1292,36 @@ ZL_Report EI_pco_bin_split(
             minVal = mn2;
             maxVal = mx2;
             if (mn2 == mx2) {
-                hist[0].lower = mn2;
-                hist[0].upper = mn2;
-                hist[0].count = (uint32_t)n;
-                nHist         = 1;
+                bins[0].lower = mn2;
+                bins[0].upper = mn2;
+                bins[0].count = (uint32_t)n;
+                numBins       = 1u;
             } else if (n >= 512u) {
                 uint32_t* const counts2 = (uint32_t*)ZL_Encoder_getScratchSpace(
                         eictx, 65536u * sizeof(uint32_t));
                 ZL_ERR_IF_NULL(counts2, allocation);
-                memset(counts2 + mn2,
-                       0,
-                       (size_t)((uint32_t)mx2 - (uint32_t)mn2 + 1u)
-                               * sizeof(uint32_t));
+                size_t const rangeLen = (size_t)((uint32_t)mx2 - (uint32_t)mn2 + 1u);
+                memset(counts2 + mn2, 0, rangeLen * sizeof(uint32_t));
                 for (size_t i = 0; i < n; i++) {
                     counts2[latents2[i]]++;
                 }
-                nHist = pbs_build_histogram_2_counts(
-                        counts2, mn2, mx2, n, hist);
+                size_t const allocU = rangeLen < n ? rangeLen : n;
+                uint64_t* const uv  = (uint64_t*)ZL_Encoder_getScratchSpace(
+                        eictx, allocU * sizeof(uint64_t));
+                uint32_t* const pc = (uint32_t*)ZL_Encoder_getScratchSpace(
+                        eictx, (allocU + 1u) * sizeof(uint32_t));
+                ZL_ERR_IF(uv == NULL || pc == NULL, allocation);
+                pc[0] = 0;
+                for (uint32_t v = (uint32_t)mn2; v <= (uint32_t)mx2; v++) {
+                    uint32_t const cv = counts2[v];
+                    if (cv != 0u) {
+                        uv[uRuns]        = (uint64_t)v;
+                        pc[uRuns + 1u]   = pc[uRuns] + cv;
+                        uRuns++;
+                    }
+                }
+                uVals = uv;
+                pref  = pc;
             } else {
                 uint32_t counts[2][256];
                 memset(counts, 0, sizeof(counts));
@@ -1303,10 +1334,18 @@ ZL_Report EI_pco_bin_split(
                         eictx, n * sizeof(uint16_t));
                 uint16_t* const bufB = (uint16_t*)ZL_Encoder_getScratchSpace(
                         eictx, n * sizeof(uint16_t));
-                ZL_ERR_IF(bufA == NULL || bufB == NULL, allocation);
+                uint64_t* const uv = (uint64_t*)ZL_Encoder_getScratchSpace(
+                        eictx, n * sizeof(uint64_t));
+                uint32_t* const pc = (uint32_t*)ZL_Encoder_getScratchSpace(
+                        eictx, (n + 1u) * sizeof(uint32_t));
+                ZL_ERR_IF(
+                        bufA == NULL || bufB == NULL || uv == NULL || pc == NULL,
+                        allocation);
                 const uint16_t* const sorted =
                         pbs_radix_sort_2(latents2, bufA, bufB, n, counts);
-                nHist = pbs_build_histogram_2(sorted, n, hist);
+                uRuns = pbs_extract_runs_2(sorted, n, uv, pc);
+                uVals = uv;
+                pref  = pc;
             }
             break;
         }
@@ -1326,10 +1365,10 @@ ZL_Report EI_pco_bin_split(
             minVal = mn4;
             maxVal = mx4;
             if (mn4 == mx4) {
-                hist[0].lower = mn4;
-                hist[0].upper = mn4;
-                hist[0].count = (uint32_t)n;
-                nHist         = 1;
+                bins[0].lower = mn4;
+                bins[0].upper = mn4;
+                bins[0].count = (uint32_t)n;
+                numBins       = 1u;
             } else {
                 size_t sn            = n;
                 const uint32_t* sSrc = latents4;
@@ -1357,19 +1396,28 @@ ZL_Report EI_pco_bin_split(
                 if (counts[0][v0 & 0xFFu] == sn && counts[1][(v0 >> 8) & 0xFFu] == sn
                     && counts[2][(v0 >> 16) & 0xFFu] == sn
                     && counts[3][(v0 >> 24) & 0xFFu] == sn) {
-                    hist[0].lower = minVal;
-                    hist[0].upper = maxVal;
-                    hist[0].count = (uint32_t)sn;
-                    nHist         = 1;
+                    bins[0].lower = minVal;
+                    bins[0].upper = maxVal;
+                    bins[0].count = (uint32_t)sn;
+                    numBins       = 1u;
                 } else {
                     uint32_t* const bufA = (uint32_t*)ZL_Encoder_getScratchSpace(
                             eictx, sn * sizeof(uint32_t));
                     uint32_t* const bufB = (uint32_t*)ZL_Encoder_getScratchSpace(
                             eictx, sn * sizeof(uint32_t));
-                    ZL_ERR_IF(bufA == NULL || bufB == NULL, allocation);
+                    uint64_t* const uv = (uint64_t*)ZL_Encoder_getScratchSpace(
+                            eictx, sn * sizeof(uint64_t));
+                    uint32_t* const pc = (uint32_t*)ZL_Encoder_getScratchSpace(
+                            eictx, (sn + 1u) * sizeof(uint32_t));
+                    ZL_ERR_IF(
+                            bufA == NULL || bufB == NULL || uv == NULL
+                                    || pc == NULL,
+                            allocation);
                     const uint32_t* const sorted =
                             pbs_radix_sort_4(sSrc, bufA, bufB, sn, counts);
-                    nHist = pbs_build_histogram_4(sorted, sn, hist);
+                    uRuns = pbs_extract_runs_4(sorted, sn, uv, pc);
+                    uVals = uv;
+                    pref  = pc;
                 }
             }
             break;
@@ -1390,10 +1438,10 @@ ZL_Report EI_pco_bin_split(
             minVal = mn8;
             maxVal = mx8;
             if (mn8 == mx8) {
-                hist[0].lower = mn8;
-                hist[0].upper = mn8;
-                hist[0].count = (uint32_t)n;
-                nHist         = 1;
+                bins[0].lower = mn8;
+                bins[0].upper = mn8;
+                bins[0].count = (uint32_t)n;
+                numBins       = 1u;
             } else {
                 size_t sn            = n;
                 const uint64_t* sSrc = latents8;
@@ -1430,27 +1478,37 @@ ZL_Report EI_pco_bin_split(
                     }
                 }
                 if (allConst) {
-                    hist[0].lower = minVal;
-                    hist[0].upper = maxVal;
-                    hist[0].count = (uint32_t)sn;
-                    nHist         = 1;
+                    bins[0].lower = minVal;
+                    bins[0].upper = maxVal;
+                    bins[0].count = (uint32_t)sn;
+                    numBins       = 1u;
                 } else {
                     uint64_t* const bufA = (uint64_t*)ZL_Encoder_getScratchSpace(
                             eictx, sn * sizeof(uint64_t));
                     uint64_t* const bufB = (uint64_t*)ZL_Encoder_getScratchSpace(
                             eictx, sn * sizeof(uint64_t));
-                    ZL_ERR_IF(bufA == NULL || bufB == NULL, allocation);
+                    uint64_t* const uv = (uint64_t*)ZL_Encoder_getScratchSpace(
+                            eictx, sn * sizeof(uint64_t));
+                    uint32_t* const pc = (uint32_t*)ZL_Encoder_getScratchSpace(
+                            eictx, (sn + 1u) * sizeof(uint32_t));
+                    ZL_ERR_IF(
+                            bufA == NULL || bufB == NULL || uv == NULL
+                                    || pc == NULL,
+                            allocation);
                     const uint64_t* const sorted =
                             pbs_radix_sort_8(sSrc, bufA, bufB, sn, counts);
-                    nHist = pbs_build_histogram_8(sorted, sn, hist);
+                    uRuns = pbs_extract_runs_8(sorted, sn, uv, pc);
+                    uVals = uv;
+                    pref  = pc;
                 }
             }
             break;
         }
     }
 
-    PbsHistBin bins[PBS_MAX_BINS];
-    size_t const numBins = pbs_optimize_bins(hist, nHist, eltBits, n, bins);
+    if (numBins == 0u) {
+        numBins = pbs_optimize_from_runs(uVals, pref, uRuns, n, bins);
+    }
 
     if (sampled) {
         if (bins[0].lower > minVal) {
@@ -1460,14 +1518,28 @@ ZL_Report EI_pco_bin_split(
             bins[numBins - 1u].upper = maxVal;
         }
         for (size_t b = 0; b + 1u < numBins; b++) {
-            uint64_t const nextLoMinus1 = bins[b + 1u].lower - 1ULL;
-            if (pbs_offset_bits(nextLoMinus1 - bins[b].lower)
-                == pbs_offset_bits(bins[b].upper - bins[b].lower)) {
+            uint64_t const lo           = bins[b].lower;
+            unsigned const ob           = pbs_offset_bits(bins[b].upper - lo);
+            uint64_t const nextLo       = bins[b + 1u].lower;
+            uint64_t const nextLoMinus1 = nextLo - 1ULL;
+            if (pbs_offset_bits(nextLoMinus1 - lo) == ob) {
                 bins[b].upper = nextLoMinus1;
+            } else {
+                uint64_t const ms = (ob >= eltBits)
+                        ? UINT64_MAX
+                        : pbs_sat_add_u64(lo, pbs_mask64(ob));
+                if (ms < nextLoMinus1) {
+                    bins[b].upper         = ms;
+                    uint64_t const candLo = ms + 1ULL;
+                    uint64_t const nextHi = bins[b + 1u].upper;
+                    if (pbs_offset_bits(nextHi - candLo)
+                        == pbs_offset_bits(nextHi - nextLo)) {
+                        bins[b + 1u].lower = candLo;
+                    }
+                }
             }
         }
     }
-
     uint64_t lowers[PBS_MAX_BINS];
     uint8_t lowers1[PBS_MAX_BINS];
     uint16_t lowers2[PBS_MAX_BINS];

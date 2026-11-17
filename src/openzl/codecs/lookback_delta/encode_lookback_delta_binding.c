@@ -23,10 +23,11 @@ enum {
     LBD_REPEATING_N        = 4,
     LBD_DEFAULT_WLOG       = 15,
     LBD_SAMPLE_BLOCK_N     = 512,
-    LBD_SAMPLE_BLOCKS      = 3,
-    LBD_SAMPLE_MAX_N       = 1536,
+    LBD_SAMPLE_WARM_N      = 2048,
+    LBD_SAMPLE_BLOCKS      = 8,
+    LBD_SAMPLE_MAX_N       = 4096,
     LBD_EST_MAX_BINS       = 64,
-    LBD_LB_PENALTY_BITS_X8 = 1,  /* 0.125 bits/elem tie-breaker against lookback */
+    LBD_LB_PENALTY_BITS_X256 = 32, /* 0.125 bits/elem tie-breaker against lookback */
 };
 
 static inline uint32_t lbd_hash(uint64_t x, size_t hashMask)
@@ -72,13 +73,18 @@ static inline unsigned lbd_clz64(uint64_t x)
 #endif
 }
 
-static inline uint32_t lbd_log2_x8(uint32_t x)
+static inline uint32_t lbd_log2_x256(uint32_t x)
 {
-    static const uint8_t frac[8] = { 0, 1, 3, 4, 5, 6, 7, 7 };
-    unsigned const hb            = 31u - (unsigned)ZL_clz32(x);
-    uint32_t const idx           = (hb >= 3u) ? ((x >> (hb - 3u)) & 7u)
-                                              : ((x << (3u - hb)) & 7u);
-    return (uint32_t)hb * 8u + (uint32_t)frac[idx];
+    static const uint16_t lut[17] = {
+        0, 22, 44, 63, 82, 100, 118, 134, 150, 165, 179, 193, 207, 220, 232, 244, 256
+    };
+    unsigned const hb    = 31u - (unsigned)ZL_clz32(x);
+    uint32_t const frac8 = (uint32_t)(((uint64_t)x << 8) >> hb) & 0xFFu;
+    uint32_t const hi    = frac8 >> 4;
+    uint32_t const lo    = frac8 & 0xFu;
+    uint32_t const base  = lut[hi];
+    uint32_t const diff  = (uint32_t)(lut[hi + 1u] - base);
+    return (uint32_t)hb * 256u + base + ((diff * lo + 8u) >> 4);
 }
 
 static void lbd_sort_u64(
@@ -174,31 +180,36 @@ typedef struct {
     uint32_t cnt;
 } LbdBin;
 
-static inline uint64_t lbd_bin_cost_x8(
+static inline uint64_t lbd_bin_cost_x256(
         LbdBin b,
-        uint32_t logM8,
-        uint64_t metaBitsX8)
+        uint32_t logM256,
+        uint64_t metaBitsX256)
 {
-    uint64_t const span = b.hi - b.lo;
-    unsigned const ob   = (span == 0) ? 0u : (64u - lbd_clz64(span));
-    uint32_t const lc8  = lbd_log2_x8(b.cnt);
-    uint32_t const ent8 = (logM8 > lc8) ? (logM8 - lc8) : 0u;
-    return (uint64_t)b.cnt * (uint64_t)(ent8 + ob * 8u) + metaBitsX8;
+    uint64_t const span   = b.hi - b.lo;
+    unsigned const ob     = (span == 0) ? 0u : (64u - lbd_clz64(span));
+    uint32_t const lc256  = lbd_log2_x256(b.cnt);
+    uint32_t const ent256 = (logM256 > lc256) ? (logM256 - lc256) : 0u;
+    return (uint64_t)b.cnt * (uint64_t)(ent256 + ob * 256u) + metaBitsX256;
 }
 
-static uint64_t lbd_est_rle_bin_bits_x8(
+static uint64_t lbd_est_rle_bin_bits_x256(
         uint64_t* buf,
         uint64_t* tmp,
         size_t m,
+        size_t fullN,
         size_t eltWidth,
         int isSigned)
 {
     if (m == 0) {
         return 0;
     }
-    unsigned const eltBits    = (unsigned)eltWidth * 8u;
-    uint64_t const signBit    = 1ULL << (eltBits - 1u);
-    uint64_t const metaBitsX8 = (uint64_t)(eltBits + 16u) * 8ULL;
+    unsigned const eltBits         = (unsigned)eltWidth * 8u;
+    uint64_t const signBit         = 1ULL << (eltBits - 1u);
+    uint64_t const fullMetaX256    = (uint64_t)(eltBits + 16u) * 256ULL;
+    uint64_t const scaledMetaX256  = (fullN > m)
+            ? ((fullMetaX256 * (uint64_t)m + (uint64_t)fullN - 1ULL) / (uint64_t)fullN)
+            : fullMetaX256;
+    uint64_t const metaBitsX256    = scaledMetaX256 < 256ULL ? 256ULL : scaledMetaX256;
     LbdBin bins[LBD_EST_MAX_BINS];
     size_t nBins = 0;
 
@@ -299,8 +310,8 @@ static uint64_t lbd_est_rle_bin_bits_x8(
         }
     }
 
-    uint32_t const logM8 = lbd_log2_x8((uint32_t)m);
-    int changed          = 1;
+    uint32_t const logM256 = lbd_log2_x256((uint32_t)m);
+    int changed            = 1;
     while (changed && nBins > 1) {
         changed       = 0;
         size_t outIdx = 1;
@@ -308,9 +319,9 @@ static uint64_t lbd_est_rle_bin_bits_x8(
             LbdBin const cur    = bins[outIdx - 1];
             LbdBin const nxt    = bins[i];
             LbdBin const merged = { cur.lo, nxt.hi, cur.cnt + nxt.cnt };
-            if (lbd_bin_cost_x8(merged, logM8, metaBitsX8)
-                <= lbd_bin_cost_x8(cur, logM8, metaBitsX8)
-                        + lbd_bin_cost_x8(nxt, logM8, metaBitsX8)) {
+            if (lbd_bin_cost_x256(merged, logM256, metaBitsX256)
+                <= lbd_bin_cost_x256(cur, logM256, metaBitsX256)
+                        + lbd_bin_cost_x256(nxt, logM256, metaBitsX256)) {
                 bins[outIdx - 1] = merged;
                 changed          = 1;
             } else {
@@ -320,11 +331,11 @@ static uint64_t lbd_est_rle_bin_bits_x8(
         nBins = outIdx;
     }
 
-    uint64_t totalX8 = 0;
+    uint64_t totalX256 = 0;
     for (size_t i = 0; i < nBins; i++) {
-        totalX8 += lbd_bin_cost_x8(bins[i], logM8, metaBitsX8);
+        totalX256 += lbd_bin_cost_x256(bins[i], logM256, metaBitsX256);
     }
-    return totalX8;
+    return totalX256;
 }
 
 #define LBD_DEFINE_WIDTH(W, T, CLZ_FN, EBITS)                                  \
@@ -565,6 +576,227 @@ static uint64_t lbd_est_rle_bin_bits_x8(
             }                                                                  \
         }                                                                      \
     }                                                                          \
+    static size_t lbd_sample_lb_##W(                                           \
+            T* lbResSamp,                                                      \
+            uint16_t* lbDistSamp,                                              \
+            const T* src,                                                      \
+            size_t n,                                                          \
+            const size_t* offs,                                                \
+            const size_t* bLens,                                               \
+            size_t nBlocks,                                                    \
+            size_t windowN,                                                    \
+            size_t hashTableN,                                                 \
+            uint32_t* idxHashTable,                                            \
+            uint32_t* lbCounts,                                                \
+            uint8_t* lbGoodness)                                               \
+    {                                                                          \
+        size_t const hashMask = hashTableN - 1u;                               \
+        size_t const nLb      = windowN < n ? windowN : n;                     \
+        memset(lbGoodness, 1, nLb);                                            \
+        for (size_t k = 0; k < nLb; k++) {                                     \
+            lbCounts[k] = 1u;                                                  \
+        }                                                                      \
+        memset(idxHashTable, 0, 2u * hashTableN * sizeof(uint32_t));           \
+        uint32_t proposed[LBD_PROPOSED_N];                                     \
+        for (size_t k = 0; k < LBD_PROPOSED_N; k++) {                          \
+            proposed[k] = 1u;                                                  \
+        }                                                                      \
+        uint32_t bestLb            = 1u;                                       \
+        size_t repeatingIdx        = 0;                                        \
+        unsigned maxNonOneGoodness = 1u;                                       \
+        uint32_t* const ht1        = idxHashTable + hashTableN;                \
+        size_t outPos              = 0;                                        \
+                                                                               \
+        size_t const bl0       = bLens[0];                                     \
+        size_t const prefixEnd = (bl0 - 1u < (size_t)LBD_PROPOSED_N)           \
+                ? bl0                                                          \
+                : (size_t)LBD_PROPOSED_N + 1u;                                 \
+        for (size_t i = 1; i < prefixEnd; i++) {                               \
+            T const l             = src[i];                                    \
+            proposed[i - 1u]      = (uint32_t)i;                               \
+            uint64_t const lu64   = (uint64_t)l;                               \
+            uint64_t const b1     = lu64 >> 8;                                 \
+            T const prev1         = src[i - 1u];                               \
+            T const c1Fwd         = (T)(l - prev1);                            \
+            T const c1Rev         = (T)(prev1 - l);                            \
+            T const c1Abs         = c1Fwd < c1Rev ? c1Fwd : c1Rev;             \
+            unsigned const c1g    = CLZ_FN(c1Abs);                             \
+            unsigned bestGoodness = (unsigned)lbGoodness[0] + c1g;             \
+            {                                                                  \
+                uint32_t const h0 = lbd_hash(lu64 - 1ULL, hashMask);           \
+                uint32_t const h1 = lbd_hash(lu64, hashMask);                  \
+                uint32_t const h2 = lbd_hash(lu64 + 1ULL, hashMask);           \
+                size_t const d0   = i - (size_t)idxHashTable[h0];              \
+                size_t const d1   = i - (size_t)idxHashTable[h1];              \
+                size_t const d2   = i - (size_t)idxHashTable[h2];              \
+                proposed[10] = (uint32_t)(d0 <= windowN ? d0 : (10u < i ? 10u : i)); \
+                proposed[11] = (uint32_t)(d1 <= windowN ? d1 : (11u < i ? 11u : i)); \
+                proposed[12] = (uint32_t)(d2 <= windowN ? d2 : (12u < i ? 12u : i)); \
+                idxHashTable[h1] = (uint32_t)i;                                \
+            }                                                                  \
+            {                                                                  \
+                uint32_t const h0 = lbd_hash(b1 - 1ULL, hashMask);             \
+                uint32_t const h1 = lbd_hash(b1, hashMask);                    \
+                uint32_t const h2 = lbd_hash(b1 + 1ULL, hashMask);             \
+                size_t const d0   = i - (size_t)ht1[h0];                       \
+                size_t const d1   = i - (size_t)ht1[h1];                       \
+                size_t const d2   = i - (size_t)ht1[h2];                       \
+                proposed[13] = (uint32_t)(d0 <= windowN ? d0 : (13u < i ? 13u : i)); \
+                proposed[14] = (uint32_t)(d1 <= windowN ? d1 : (14u < i ? 14u : i)); \
+                proposed[15] = (uint32_t)(d2 <= windowN ? d2 : (15u < i ? 15u : i)); \
+                ht1[h1] = (uint32_t)i;                                         \
+            }                                                                  \
+            uint32_t newBestLb = 1u;                                           \
+            for (size_t k = 1; k < LBD_PROPOSED_N; k++) {                      \
+                uint32_t const cand = proposed[k];                             \
+                T const other       = src[i - cand];                           \
+                T const dFwd        = (T)(l - other);                          \
+                T const dRev        = (T)(other - l);                          \
+                T const dAbs        = dFwd < dRev ? dFwd : dRev;               \
+                unsigned const dg   = CLZ_FN(dAbs);                            \
+                unsigned const g    = (unsigned)lbGoodness[cand - 1u] + dg;    \
+                if (g > bestGoodness) {                                        \
+                    bestGoodness = g;                                          \
+                    newBestLb    = cand;                                       \
+                }                                                              \
+            }                                                                  \
+            if (newBestLb != bestLb) {                                         \
+                repeatingIdx++;                                                \
+            }                                                                  \
+            proposed[LBD_BRUTE_N + (repeatingIdx & 3u)] = newBestLb;           \
+            bestLb              = newBestLb;                                   \
+            lbResSamp[outPos]   = (T)(l - src[i - newBestLb]);                 \
+            lbDistSamp[outPos]  = (uint16_t)(newBestLb - 1u);                  \
+            outPos++;                                                          \
+            uint32_t const cnt = ++lbCounts[newBestLb - 1u];                   \
+            if (ZL_UNLIKELY((cnt & (cnt - 1u)) == 0u)) {                       \
+                uint8_t const ng = ++lbGoodness[newBestLb - 1u];               \
+                if (newBestLb != 1u && (unsigned)ng > maxNonOneGoodness) {     \
+                    maxNonOneGoodness = (unsigned)ng;                          \
+                }                                                              \
+            }                                                                  \
+        }                                                                      \
+                                                                               \
+        uint32_t rep0 = proposed[6];                                           \
+        uint32_t rep1 = proposed[7];                                           \
+        uint32_t rep2 = proposed[8];                                           \
+        uint32_t rep3 = proposed[9];                                           \
+        for (size_t b = 0; b < nBlocks; b++) {                                 \
+            size_t const bStart = offs[b];                                     \
+            size_t const bEnd   = bStart + bLens[b];                           \
+            if (b > 0u) {                                                      \
+                size_t const prevEnd   = offs[b - 1u] + bLens[b - 1u];         \
+                size_t const warmLimit = bStart > (size_t)LBD_SAMPLE_WARM_N    \
+                        ? (bStart - (size_t)LBD_SAMPLE_WARM_N)                 \
+                        : 0u;                                                  \
+                size_t const warmStart =                                       \
+                        prevEnd > warmLimit ? prevEnd : warmLimit;             \
+                for (size_t w = warmStart; w < bStart; w++) {                  \
+                    uint64_t const wu                    = (uint64_t)src[w];   \
+                    idxHashTable[lbd_hash(wu, hashMask)] = (uint32_t)w;        \
+                    ht1[lbd_hash(wu >> 8, hashMask)]     = (uint32_t)w;        \
+                }                                                              \
+            }                                                                  \
+            size_t const iStart = (b == 0u) ? prefixEnd : bStart;              \
+            for (size_t i = iStart; i < bEnd; i++) {                           \
+                T const l             = src[i];                                \
+                uint64_t const lu64   = (uint64_t)l;                           \
+                uint64_t const b1     = lu64 >> 8;                             \
+                T const prev1         = src[i - 1u];                           \
+                T const c1Fwd         = (T)(l - prev1);                        \
+                T const c1Rev         = (T)(prev1 - l);                        \
+                T const c1Abs         = c1Fwd < c1Rev ? c1Fwd : c1Rev;         \
+                unsigned const c1g    = CLZ_FN(c1Abs);                         \
+                unsigned bestGoodness = (unsigned)lbGoodness[0] + c1g;         \
+                                                                               \
+                if (ZL_UNLIKELY(bestGoodness >= maxNonOneGoodness + (EBITS))) {\
+                    idxHashTable[lbd_hash(lu64, hashMask)] = (uint32_t)i;      \
+                    ht1[lbd_hash(b1, hashMask)]            = (uint32_t)i;      \
+                    if (bestLb != 1u) {                                        \
+                        repeatingIdx++;                                        \
+                        bestLb = 1u;                                           \
+                    }                                                          \
+                    switch (repeatingIdx & 3u) {                               \
+                        case 0: rep0 = 1u; break;                              \
+                        case 1: rep1 = 1u; break;                              \
+                        case 2: rep2 = 1u; break;                              \
+                        case 3: rep3 = 1u; break;                              \
+                    }                                                          \
+                    lbResSamp[outPos]  = c1Fwd;                                \
+                    lbDistSamp[outPos] = 0u;                                   \
+                    outPos++;                                                  \
+                    uint32_t const cnt = ++lbCounts[0];                        \
+                    if (ZL_UNLIKELY((cnt & (cnt - 1u)) == 0u)) {               \
+                        lbGoodness[0]++;                                       \
+                    }                                                          \
+                    continue;                                                  \
+                }                                                              \
+                                                                               \
+                uint32_t const h0a = lbd_hash(lu64 - 1ULL, hashMask);          \
+                uint32_t const h1a = lbd_hash(lu64, hashMask);                 \
+                uint32_t const h2a = lbd_hash(lu64 + 1ULL, hashMask);          \
+                uint32_t const h0b = lbd_hash(b1 - 1ULL, hashMask);            \
+                uint32_t const h1b = lbd_hash(b1, hashMask);                   \
+                uint32_t const h2b = lbd_hash(b1 + 1ULL, hashMask);            \
+                size_t const d0a   = i - (size_t)idxHashTable[h0a];            \
+                size_t const d1a   = i - (size_t)idxHashTable[h1a];            \
+                size_t const d2a   = i - (size_t)idxHashTable[h2a];            \
+                idxHashTable[h1a]  = (uint32_t)i;                              \
+                size_t const d0b   = i - (size_t)ht1[h0b];                     \
+                size_t const d1b   = i - (size_t)ht1[h1b];                     \
+                size_t const d2b   = i - (size_t)ht1[h2b];                     \
+                ht1[h1b]           = (uint32_t)i;                              \
+                                                                               \
+                uint32_t const cands[15] = {                                   \
+                    2u, 3u, 4u, 5u, 6u,                                        \
+                    rep0, rep1, rep2, rep3,                                    \
+                    (uint32_t)(d0a <= windowN ? d0a : 10u),                    \
+                    (uint32_t)(d1a <= windowN ? d1a : 11u),                    \
+                    (uint32_t)(d2a <= windowN ? d2a : 12u),                    \
+                    (uint32_t)(d0b <= windowN ? d0b : 13u),                    \
+                    (uint32_t)(d1b <= windowN ? d1b : 14u),                    \
+                    (uint32_t)(d2b <= windowN ? d2b : 15u),                    \
+                };                                                             \
+                                                                               \
+                uint32_t newBestLb = 1u;                                       \
+                for (size_t k = 0; k < 15; k++) {                              \
+                    uint32_t const cand = cands[k];                            \
+                    T const other       = src[i - cand];                       \
+                    T const dFwd        = (T)(l - other);                      \
+                    T const dRev        = (T)(other - l);                      \
+                    T const dAbs        = dFwd < dRev ? dFwd : dRev;           \
+                    unsigned const dg   = CLZ_FN(dAbs);                        \
+                    unsigned const g    = (unsigned)lbGoodness[cand - 1u] + dg;\
+                    if (g > bestGoodness) {                                    \
+                        bestGoodness = g;                                      \
+                        newBestLb    = cand;                                   \
+                    }                                                          \
+                }                                                              \
+                                                                               \
+                if (newBestLb != bestLb) {                                     \
+                    repeatingIdx++;                                            \
+                }                                                              \
+                switch (repeatingIdx & 3u) {                                   \
+                    case 0: rep0 = newBestLb; break;                           \
+                    case 1: rep1 = newBestLb; break;                           \
+                    case 2: rep2 = newBestLb; break;                           \
+                    case 3: rep3 = newBestLb; break;                           \
+                }                                                              \
+                bestLb             = newBestLb;                                \
+                lbResSamp[outPos]  = (T)(l - src[i - newBestLb]);              \
+                lbDistSamp[outPos] = (uint16_t)(newBestLb - 1u);               \
+                outPos++;                                                      \
+                uint32_t const cnt = ++lbCounts[newBestLb - 1u];               \
+                if (ZL_UNLIKELY((cnt & (cnt - 1u)) == 0u)) {                   \
+                    uint8_t const ng = ++lbGoodness[newBestLb - 1u];           \
+                    if (newBestLb != 1u && (unsigned)ng > maxNonOneGoodness) { \
+                        maxNonOneGoodness = (unsigned)ng;                      \
+                    }                                                          \
+                }                                                              \
+            }                                                                  \
+        }                                                                      \
+        return outPos;                                                         \
+    }                                                                          \
     static int lbd_choose_and_encode_##W(                                      \
             T* resDst,                                                         \
             uint16_t* lbDst,                                                   \
@@ -576,7 +808,6 @@ static uint64_t lbd_est_rle_bin_bits_x8(
             uint8_t* lbGoodness,                                               \
             uint64_t* sortBuf,                                                 \
             uint64_t* tmpBuf,                                                  \
-            T* sampBuf,                                                        \
             T* lbResSamp,                                                      \
             uint16_t* lbDistSamp)                                              \
     {                                                                          \
@@ -590,14 +821,14 @@ static uint64_t lbd_est_rle_bin_bits_x8(
             nBlocks  = 1;                                                      \
             m        = n;                                                      \
         } else {                                                               \
-            offs[0]  = 0;                                                      \
-            offs[1]  = n / 2 - LBD_SAMPLE_BLOCK_N / 2;                         \
-            offs[2]  = n - LBD_SAMPLE_BLOCK_N;                                 \
-            bLens[0] = LBD_SAMPLE_BLOCK_N;                                     \
-            bLens[1] = LBD_SAMPLE_BLOCK_N;                                     \
-            bLens[2] = LBD_SAMPLE_BLOCK_N;                                     \
-            nBlocks  = LBD_SAMPLE_BLOCKS;                                      \
-            m        = LBD_SAMPLE_MAX_N;                                       \
+            size_t const span = n - (size_t)LBD_SAMPLE_BLOCK_N;                \
+            for (size_t b = 0; b < LBD_SAMPLE_BLOCKS; b++) {                   \
+                offs[b] = (size_t)(((uint64_t)b * (uint64_t)span)              \
+                                   / (uint64_t)(LBD_SAMPLE_BLOCKS - 1u));      \
+                bLens[b] = LBD_SAMPLE_BLOCK_N;                                 \
+            }                                                                  \
+            nBlocks = LBD_SAMPLE_BLOCKS;                                       \
+            m       = LBD_SAMPLE_MAX_N;                                        \
         }                                                                      \
                                                                                \
         /* 0. RAW */                                                           \
@@ -611,8 +842,8 @@ static uint64_t lbd_est_rle_bin_bits_x8(
                 }                                                              \
             }                                                                  \
         }                                                                      \
-        uint64_t bestCostX8 =                                                  \
-                (lbd_est_rle_bin_bits_x8(sortBuf, tmpBuf, m, W, 0)             \
+        uint64_t bestCostX256 =                                                  \
+                (lbd_est_rle_bin_bits_x256(sortBuf, tmpBuf, m, n, W, 0)             \
                  * (uint64_t)n)                                                \
                 / (uint64_t)m;                                                 \
         int bestMode = LBD_MODE_RAW;                                           \
@@ -627,12 +858,12 @@ static uint64_t lbd_est_rle_bin_bits_x8(
                     sortBuf[m1++] = (uint64_t)(T)(blk[i] - blk[i - 1]);        \
                 }                                                              \
             }                                                                  \
-            uint64_t const c1X8 = (uint64_t)(EBITS) * 8ULL                     \
-                    + (lbd_est_rle_bin_bits_x8(sortBuf, tmpBuf, m1, W, 1)      \
+            uint64_t const c1X256 = (uint64_t)(EBITS) * 256ULL                     \
+                    + (lbd_est_rle_bin_bits_x256(sortBuf, tmpBuf, m1, n - 1, W, 1)      \
                        * (uint64_t)(n - 1))                                    \
                             / (uint64_t)m1;                                    \
-            if (c1X8 < bestCostX8) {                                           \
-                bestCostX8 = c1X8;                                             \
+            if (c1X256 < bestCostX256) {                                           \
+                bestCostX256 = c1X256;                                             \
                 bestMode   = LBD_MODE_CONSECUTIVE;                             \
             }                                                                  \
         }                                                                      \
@@ -653,12 +884,12 @@ static uint64_t lbd_est_rle_bin_bits_x8(
                 }                                                              \
             }                                                                  \
             if (m2 > 0) {                                                      \
-                uint64_t const c2X8 = 2ULL * (uint64_t)(EBITS) * 8ULL          \
-                        + (lbd_est_rle_bin_bits_x8(sortBuf, tmpBuf, m2, W, 1)  \
+                uint64_t const c2X256 = 2ULL * (uint64_t)(EBITS) * 256ULL          \
+                        + (lbd_est_rle_bin_bits_x256(sortBuf, tmpBuf, m2, n - 2, W, 1)  \
                            * (uint64_t)(n - 2))                                \
                                 / (uint64_t)m2;                                \
-                if (c2X8 < bestCostX8) {                                       \
-                    bestCostX8 = c2X8;                                         \
+                if (c2X256 < bestCostX256) {                                       \
+                    bestCostX256 = c2X256;                                         \
                     bestMode   = LBD_MODE_CONSECUTIVE_2;                       \
                 }                                                              \
             }                                                                  \
@@ -685,23 +916,23 @@ static uint64_t lbd_est_rle_bin_bits_x8(
                 }                                                              \
             }                                                                  \
             if (m3 > 0) {                                                      \
-                uint64_t const c3X8 = 3ULL * (uint64_t)(EBITS) * 8ULL          \
-                        + (lbd_est_rle_bin_bits_x8(sortBuf, tmpBuf, m3, W, 1)  \
+                uint64_t const c3X256 = 3ULL * (uint64_t)(EBITS) * 256ULL          \
+                        + (lbd_est_rle_bin_bits_x256(sortBuf, tmpBuf, m3, n - 3, W, 1)  \
                            * (uint64_t)(n - 3))                                \
                                 / (uint64_t)m3;                                \
-                if (c3X8 < bestCostX8) {                                       \
-                    bestCostX8 = c3X8;                                         \
+                if (c3X256 < bestCostX256) {                                       \
+                    bestCostX256 = c3X256;                                         \
                     bestMode   = LBD_MODE_CONSECUTIVE_3;                       \
                 }                                                              \
             }                                                                  \
         }                                                                      \
                                                                                \
         /* 4. LOOKBACK (only if n > 16 and best consec/raw can be beaten by >= 2 b/elt) */ \
-        uint64_t const lbMinX8 = (uint64_t)(EBITS) * 8ULL                      \
-                + (uint64_t)LBD_LB_PENALTY_BITS_X8 * (uint64_t)(n - 1);        \
-        uint64_t const lbSkipX8 = (uint64_t)(EBITS) * 8ULL                     \
-                + 2ULL * (uint64_t)(n - 1);                                    \
-        if (n > LBD_PROPOSED_N && bestCostX8 > lbSkipX8) {                      \
+        uint64_t const lbMinX256 = (uint64_t)(EBITS) * 256ULL                      \
+                + (uint64_t)LBD_LB_PENALTY_BITS_X256 * (uint64_t)(n - 1);        \
+        uint64_t const lbSkipX256 = (uint64_t)(EBITS) * 256ULL                     \
+                + 64ULL * (uint64_t)(n - 1);                                    \
+        if (n > LBD_PROPOSED_N && bestCostX256 > lbSkipX256) {                      \
             size_t const fullWindowN    = (size_t)1u << windowLog;             \
             size_t const fullHashTableN = (size_t)1u << (windowLog + 1);       \
             if (n <= LBD_SAMPLE_MAX_N) {                                       \
@@ -718,52 +949,48 @@ static uint64_t lbd_est_rle_bin_bits_x8(
                 for (size_t i = 1; i < n; i++) {                               \
                     sortBuf[i - 1] = (uint64_t)resDst[i];                      \
                 }                                                              \
-                uint64_t const resCostX8 = lbd_est_rle_bin_bits_x8(            \
-                        sortBuf, tmpBuf, n - 1, W, 1);                         \
+                uint64_t const resCostX256 = lbd_est_rle_bin_bits_x256(            \
+                        sortBuf, tmpBuf, n - 1, n - 1, W, 1);                         \
                 for (size_t i = 0; i < n - 1; i++) {                           \
                     sortBuf[i] = (uint64_t)lbDst[i];                           \
                 }                                                              \
-                uint64_t const distCostX8 = lbd_est_rle_bin_bits_x8(           \
-                        sortBuf, tmpBuf, n - 1, 2, 0);                         \
-                uint64_t const lbCostX8 = lbMinX8 + resCostX8 + distCostX8;    \
-                if (lbCostX8 < bestCostX8) {                                   \
+                uint64_t const distCostX256 = lbd_est_rle_bin_bits_x256(           \
+                        sortBuf, tmpBuf, n - 1, n - 1, 2, 0);                         \
+                uint64_t const lbCostX256 = lbMinX256 + resCostX256 + distCostX256;    \
+                if (lbCostX256 < bestCostX256) {                                   \
                     return LBD_MODE_LOOKBACK;                                  \
                 }                                                              \
             } else {                                                           \
-                size_t pos = 0;                                                \
-                for (size_t b = 0; b < nBlocks; b++) {                         \
-                    memcpy(sampBuf + pos,                                      \
-                           src + offs[b],                                      \
-                           bLens[b] * sizeof(T));                              \
-                    pos += bLens[b];                                           \
-                }                                                              \
-                int const sampWLog = windowLog < 12 ? windowLog : 12;          \
+                int const sampWLog = windowLog < 14 ? windowLog : 14;          \
                 size_t const sampWindowN    = (size_t)1u << sampWLog;          \
                 size_t const sampHashTableN = (size_t)1u << (sampWLog + 1);    \
-                lbd_encode_lb_##W(                                             \
+                size_t const mLb            = lbd_sample_lb_##W(               \
                         lbResSamp,                                             \
                         lbDistSamp,                                            \
-                        sampBuf,                                               \
-                        m,                                                     \
+                        src,                                                   \
+                        n,                                                     \
+                        offs,                                                  \
+                        bLens,                                                 \
+                        nBlocks,                                               \
                         sampWindowN,                                           \
                         sampHashTableN,                                        \
                         idxHashTable,                                          \
                         lbCounts,                                              \
                         lbGoodness);                                           \
-                for (size_t i = 1; i < m; i++) {                               \
-                    sortBuf[i - 1] = (uint64_t)lbResSamp[i];                   \
+                for (size_t i = 0; i < mLb; i++) {                             \
+                    sortBuf[i] = (uint64_t)lbResSamp[i];                       \
                 }                                                              \
-                uint64_t const resCostX8 = lbd_est_rle_bin_bits_x8(            \
-                        sortBuf, tmpBuf, m - 1, W, 1);                         \
-                for (size_t i = 0; i < m - 1; i++) {                           \
+                uint64_t const resCostX256 = lbd_est_rle_bin_bits_x256(            \
+                        sortBuf, tmpBuf, mLb, n - 1, W, 1);                           \
+                for (size_t i = 0; i < mLb; i++) {                             \
                     sortBuf[i] = (uint64_t)lbDistSamp[i];                      \
                 }                                                              \
-                uint64_t const distCostX8 = lbd_est_rle_bin_bits_x8(           \
-                        sortBuf, tmpBuf, m - 1, 2, 0);                         \
-                uint64_t const lbCostX8 = lbMinX8                              \
-                        + ((resCostX8 + distCostX8) * (uint64_t)(n - 1))       \
-                                / (uint64_t)(m - 1);                           \
-                if (lbCostX8 < bestCostX8) {                                   \
+                uint64_t const distCostX256 = lbd_est_rle_bin_bits_x256(           \
+                        sortBuf, tmpBuf, mLb, n - 1, 2, 0);                           \
+                uint64_t const lbCostX256 = lbMinX256                              \
+                        + ((resCostX256 + distCostX256) * (uint64_t)(n - 1))       \
+                                / (uint64_t)mLb;                               \
+                if (lbCostX256 < bestCostX256) {                                   \
                     lbd_encode_lb_##W(                                         \
                             resDst,                                            \
                             lbDst,                                             \
@@ -946,17 +1173,13 @@ ZL_Report EI_lookback_delta(
             eictx, mMax * sizeof(uint64_t));
     ZL_ERR_IF(sortBuf == NULL || tmpBuf == NULL, allocation);
 
-    void* sampBuf        = NULL;
     void* lbResSamp      = NULL;
     uint16_t* lbDistSamp = NULL;
     if (n > LBD_SAMPLE_MAX_N) {
-        sampBuf = ZL_Encoder_getScratchSpace(eictx, mMax * eltWidth);
         lbResSamp = ZL_Encoder_getScratchSpace(eictx, mMax * eltWidth);
         lbDistSamp = (uint16_t*)ZL_Encoder_getScratchSpace(
                 eictx, mMax * sizeof(uint16_t));
-        ZL_ERR_IF(
-                sampBuf == NULL || lbResSamp == NULL || lbDistSamp == NULL,
-                allocation);
+        ZL_ERR_IF(lbResSamp == NULL || lbDistSamp == NULL, allocation);
     }
 
     int mode = LBD_MODE_RAW;
@@ -973,7 +1196,6 @@ ZL_Report EI_lookback_delta(
                     lbGoodness,
                     sortBuf,
                     tmpBuf,
-                    (uint8_t*)sampBuf,
                     (uint8_t*)lbResSamp,
                     lbDistSamp);
             break;
@@ -989,7 +1211,6 @@ ZL_Report EI_lookback_delta(
                     lbGoodness,
                     sortBuf,
                     tmpBuf,
-                    (uint16_t*)sampBuf,
                     (uint16_t*)lbResSamp,
                     lbDistSamp);
             break;
@@ -1005,7 +1226,6 @@ ZL_Report EI_lookback_delta(
                     lbGoodness,
                     sortBuf,
                     tmpBuf,
-                    (uint32_t*)sampBuf,
                     (uint32_t*)lbResSamp,
                     lbDistSamp);
             break;
@@ -1021,7 +1241,6 @@ ZL_Report EI_lookback_delta(
                     lbGoodness,
                     sortBuf,
                     tmpBuf,
-                    (uint64_t*)sampBuf,
                     (uint64_t*)lbResSamp,
                     lbDistSamp);
             break;

@@ -442,6 +442,45 @@ TEST_F(LookbackDeltaTest, RejectsOutOfBoundsLookbacksAtSimdBoundaries)
     }
 }
 
+TEST_F(LookbackDeltaTest, MultiRegionSamplingFindsLookbackInMixedStream)
+{
+    // Build a 32768-element stream whose start, exact midpoint, and end are
+    // single-track ramps, while the interior octiles are 4 interleaved tracks
+    // separated by 10^12 (requiring LOOKBACK with distance 4).
+    constexpr size_t kN = 32768;
+    std::vector<uint64_t> data(kN);
+    constexpr uint64_t kBases[4] = {
+        1000000000000ULL,
+        2500000000000ULL,
+        4000000000000ULL,
+        5500000000000ULL,
+    };
+    for (size_t i = 0; i < kN; ++i) {
+        bool const inRamp =
+                (i < 1024u) || (i >= 15800u && i < 16900u) || (i >= kN - 1024u);
+        if (inRamp) {
+            data[i] = 1000000ULL + i * 100ULL;
+        } else {
+            data[i] = kBases[i & 3u] + (i >> 2u) * 10ULL;
+        }
+    }
+
+    size_t lbCount = 0;
+    compressor_.setParameter(CParam::FormatVersion, ZL_MAX_FORMAT_VERSION);
+    auto lbProbe = compressor_.registerFunctionGraph(
+            std::make_shared<CaptureResidualsGraph>(nullptr, &lbCount));
+    auto resGraph = nodes::PcoBinSplit{ nodes::PcoBinSplit::LatentMode::Signed }(
+            compressor_, graphs::Entropy{}(), graphs::Store{}());
+    auto node  = nodes::LookbackDelta{ 15, true }.parameterize(compressor_);
+    auto graph = compressor_.buildStaticGraph(node, { resGraph, lbProbe });
+    compressor_.selectStartingGraph(graph);
+
+    auto comp = testRoundTrip(
+            Input::refNumeric(poly::span<const uint64_t>{ data }));
+    EXPECT_EQ(lbCount, kN - 1u);
+    EXPECT_LT(comp.size(), kN * sizeof(uint64_t) / 2u);
+}
+
 } // namespace
 } // namespace tests
 } // namespace openzl
