@@ -88,6 +88,11 @@ class ACEMutate {
         return true;
     }
 
+    static bool isCtxSplitNodeName(std::string_view nm)
+    {
+        return nm == "zl.ctx_split" || nm == "zl.ctx_split_num";
+    }
+
     template <typename VisitorFn>
     static void visitMutable(
             const ACECompressor& comp,
@@ -136,6 +141,11 @@ class ACEMutate {
                             outWidth,
                             depth + 1,
                             replaceFn);
+                    while (isCtxSplitNodeName(node.node.name) && s.isNode()
+                           && isCtxSplitNodeName(s.asNode().node.name)) {
+                        ACECompressor unwrapped = *s.asNode().successors[0];
+                        s                       = std::move(unwrapped);
+                    }
                     successors.push_back(
                             std::make_unique<ACECompressor>(std::move(s)));
                 }
@@ -398,7 +408,9 @@ class ACEMutate {
                 || nc.node.name == "zl.lookback_delta"
                 || nc.node.name == "zl.partition"
                 || nc.node.name == "zl.sparse_num"
-                || nc.node.name == "zl.bitunpack") {
+                || nc.node.name == "zl.bitunpack"
+                || nc.node.name == "zl.ctx_split"
+                || nc.node.name == "zl.ctx_split_num") {
             const auto compatible =
                     getNodesComptabileWith(inputType, formatVersion_);
             std::vector<ACENode> variants;
@@ -481,7 +493,9 @@ class ACEMutate {
                 || (node.name == "zl.lookback_delta"
                     && childNodeName == "zl.lookback_delta")
                 || (node.name == "zl.pco_bin_split"
-                    && childNodeName == "zl.pco_bin_split")) {
+                    && childNodeName == "zl.pco_bin_split")
+                || (isCtxSplitNodeName(node.name)
+                    && isCtxSplitNodeName(childNodeName))) {
                 continue;
             }
             if (!node.outputTypes.empty()

@@ -99,6 +99,8 @@ enum class OpenZLComponentID {
     PcoBinSplitFloat,
     IntMultSplit,
     FloatMultSplit,
+    CtxSplit,
+    CtxSplitNum,
     // Must be last enum value
     NumComponents,
 };
@@ -184,6 +186,8 @@ std::unique_ptr<OpenZLComponent> makePcoBinSplitComponent();
 std::unique_ptr<OpenZLComponent> makePcoBinSplitFloatComponent();
 std::unique_ptr<OpenZLComponent> makeIntMultSplitComponent();
 std::unique_ptr<OpenZLComponent> makeFloatMultSplitComponent();
+std::unique_ptr<OpenZLComponent> makeCtxSplitComponent();
+std::unique_ptr<OpenZLComponent> makeCtxSplitNumComponent();
 
 } // namespace components
 
@@ -339,6 +343,10 @@ inline std::unique_ptr<OpenZLComponent> makeOpenZLComponent(
             return components::makeIntMultSplitComponent();
         case OpenZLComponentID::FloatMultSplit:
             return components::makeFloatMultSplitComponent();
+        case OpenZLComponentID::CtxSplit:
+            return components::makeCtxSplitComponent();
+        case OpenZLComponentID::CtxSplitNum:
+            return components::makeCtxSplitNumComponent();
         case OpenZLComponentID::NumComponents:
         default:
             throw std::runtime_error("Invalid component");

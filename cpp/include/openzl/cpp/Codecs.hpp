@@ -11,6 +11,7 @@
 #include "openzl/cpp/codecs/Concat.hpp"           // IWYU pragma: export
 #include "openzl/cpp/codecs/Constant.hpp"         // IWYU pragma: export
 #include "openzl/cpp/codecs/Conversion.hpp"       // IWYU pragma: export
+#include "openzl/cpp/codecs/CtxSplit.hpp"         // IWYU pragma: export
 #include "openzl/cpp/codecs/Dedup.hpp"            // IWYU pragma: export
 #include "openzl/cpp/codecs/Delta.hpp"            // IWYU pragma: export
 #include "openzl/cpp/codecs/Dispatch.hpp"         // IWYU pragma: export

@@ -671,6 +671,70 @@ TEST_F(ACETest, WeightedMutateRoundTrips)
     EXPECT_TRUE(sawSiblingCopy);
 }
 
+TEST(ACECtxSplitTest, SeedsWidthAndNoSelfChaining)
+{
+    const auto allNodes = getAllNodes();
+    size_t serialCount  = 0;
+    size_t numCount     = 0;
+    for (const auto& nd : allNodes) {
+        if (nd.name == "zl.ctx_split") {
+            serialCount++;
+        } else if (nd.name == "zl.ctx_split_num") {
+            numCount++;
+            EXPECT_EQ(inferNodeOutputWidth(nd, 0, 4), 4u);
+            EXPECT_EQ(inferNodeOutputWidth(nd, 0, 8), 8u);
+        }
+    }
+    EXPECT_EQ(serialCount, 2u);
+    EXPECT_EQ(numCount, 2u);
+
+    const auto serPre = getPrebuiltCompressors(Type::Serial);
+    const auto numPre = getPrebuiltCompressors(Type::Numeric);
+    EXPECT_FALSE(serPre.empty());
+    EXPECT_FALSE(numPre.empty());
+
+    auto checkNoChainedCtxSplit = [](const ACECompressor& root, Type inType) {
+        bool bad = false;
+        root.forEachComponent(inType, [&](const ACECompressor& c, Type) {
+            if (!c.isNode()) {
+                return;
+            }
+            const auto& nm = c.asNode().node.name;
+            if (nm == "zl.ctx_split" || nm == "zl.ctx_split_num") {
+                for (const auto& succ : c.asNode().successors) {
+                    if (succ->isNode()) {
+                        const auto& snm = succ->asNode().node.name;
+                        if (snm == "zl.ctx_split"
+                            || snm == "zl.ctx_split_num") {
+                            bad = true;
+                        }
+                    }
+                }
+            }
+        });
+        return !bad;
+    };
+
+    std::mt19937_64 rng(0xC7859117ULL);
+    for (Type t : { Type::Serial, Type::Numeric }) {
+        ACEMutate mutator(rng, t, ZL_MAX_FORMAT_VERSION);
+        for (size_t i = 0; i < 200; ++i) {
+            auto c = buildRandomCompressor(rng, t, ZL_MAX_FORMAT_VERSION);
+            ASSERT_TRUE(checkNoChainedCtxSplit(c, t));
+            {
+                Compressor comp;
+                (void)c.build(comp);
+            }
+            for (size_t m = 0; m < 5; ++m) {
+                c = mutator(c);
+                ASSERT_TRUE(checkNoChainedCtxSplit(c, t));
+                Compressor comp;
+                (void)c.build(comp);
+            }
+        }
+    }
+}
+
 } // namespace tests
 } // namespace training
 } // namespace openzl

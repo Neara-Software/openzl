@@ -21,6 +21,7 @@
 #include "openzl/codecs/float_deconstruct/encode_float_deconstruct_binding.h"
 #include "openzl/codecs/hilbert3/encode_hilbert3_binding.h"
 #include "openzl/codecs/lookback_delta/encode_lookback_delta_binding.h"
+#include "openzl/codecs/ctx_split/encode_ctx_split_binding.h"
 #include "openzl/codecs/int_mult_split/encode_int_mult_split_binding.h"
 #include "openzl/codecs/float_mult_split/encode_float_mult_split_binding.h"
 #include "openzl/codecs/pco_bin_split/encode_pco_bin_split_binding.h"
@@ -154,6 +155,8 @@ const CNode ER_standardNodes[STANDARD_ENCODERS_NB] = {
     REGISTER_TRANSFORM(ZL_StandardNodeID_pco_bin_split, ZL_StandardTransformID_pco_bin_split, 27, 204, EI_PCO_BIN_SPLIT),
     REGISTER_TRANSFORM(ZL_StandardNodeID_int_mult_split, ZL_StandardTransformID_int_mult_split, 27, 204, EI_INT_MULT_SPLIT),
     REGISTER_TRANSFORM(ZL_StandardNodeID_float_mult_split, ZL_StandardTransformID_float_mult_split, 27, 204, EI_FLOAT_MULT_SPLIT),
+    REGISTER_TRANSFORM(ZL_StandardNodeID_ctx_split, ZL_StandardTransformID_ctx_split, 27, 204, EI_CTX_SPLIT),
+    REGISTER_TRANSFORM(ZL_StandardNodeID_ctx_split_num, ZL_StandardTransformID_ctx_split, 27, 204, EI_CTX_SPLIT_NUM),
 
     // Private Nodes
     REGISTER_TRANSFORM(ZL_PrivateStandardNodeID_set_string_lens,           ZL_StandardTransformID_convert_serial_string, 10, 200, EI_SETSTRINGLENS),

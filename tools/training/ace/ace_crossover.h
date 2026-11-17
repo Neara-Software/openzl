@@ -100,11 +100,18 @@ class ACECrossover {
                     successors.push_back(
                             std::make_unique<ACECompressor>(*node.successors[i]));
                 } else {
-                    successors.push_back(std::make_unique<ACECompressor>(
-                            replaceMutable(
-                                    *node.successors[i],
-                                    node.node.outputTypes[i],
-                                    fn)));
+                    auto s = replaceMutable(
+                            *node.successors[i], node.node.outputTypes[i], fn);
+                    while ((node.node.name == "zl.ctx_split"
+                            || node.node.name == "zl.ctx_split_num")
+                           && s.isNode()
+                           && (s.asNode().node.name == "zl.ctx_split"
+                               || s.asNode().node.name == "zl.ctx_split_num")) {
+                        ACECompressor unwrapped = *s.asNode().successors[0];
+                        s                       = std::move(unwrapped);
+                    }
+                    successors.push_back(
+                            std::make_unique<ACECompressor>(std::move(s)));
                 }
             }
             return ACENodeCompressor(node.node, std::move(successors));

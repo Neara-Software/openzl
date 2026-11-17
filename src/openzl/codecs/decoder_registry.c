@@ -18,6 +18,7 @@
 #include "openzl/codecs/float_deconstruct/decode_float_deconstruct_binding.h"
 #include "openzl/codecs/hilbert3/decode_hilbert3_binding.h"
 #include "openzl/codecs/lookback_delta/decode_lookback_delta_binding.h"
+#include "openzl/codecs/ctx_split/decode_ctx_split_binding.h"
 #include "openzl/codecs/int_mult_split/decode_int_mult_split_binding.h"
 #include "openzl/codecs/float_mult_split/decode_float_mult_split_binding.h"
 #include "openzl/codecs/pco_bin_split/decode_pco_bin_split_binding.h"
@@ -169,6 +170,7 @@ const StandardDTransform SDecoders_array[ZL_StandardTransformID_end] = {
     REGISTER_MITRANSFORM_G(ZL_StandardTransformID_dedup_num, 16, DI_DEDUP_NUM, DEDUP_NUM_GRAPH),
     REGISTER_MITRANSFORM_G(ZL_StandardTransformID_interleave_string, 20, DI_INTERLEAVE, INTERLEAVE_STRING_GRAPH),
     REGISTER_VOTRANSFORM_G(ZL_StandardTransformID_bitSplit, 24, DI_BITSPLIT, GRAPH_VO_NUM),
+    REGISTER_VOTRANSFORM_G(ZL_StandardTransformID_ctx_split, 27, DI_CTX_SPLIT, GRAPH_CTX_SPLIT_DEC),
 
     // Conversion operations
     REGISTER_TTRANSFORM_G(ZL_StandardTransformID_convert_serial_to_struct,    3, DI_REVERT_SERIAL_TO_STRUCT, CONVERT_SERIAL_TOKEN_GRAPH),

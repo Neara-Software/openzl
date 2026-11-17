@@ -19,6 +19,7 @@
 #include "openzl/codecs/zl_concat.h"               // IWYU pragma: export
 #include "openzl/codecs/zl_constant.h"             // IWYU pragma: export
 #include "openzl/codecs/zl_conversion.h"           // IWYU pragma: export
+#include "openzl/codecs/zl_ctx_split.h"            // IWYU pragma: export
 #include "openzl/codecs/zl_dedup.h"                // IWYU pragma: export
 #include "openzl/codecs/zl_delta.h"                // IWYU pragma: export
 #include "openzl/codecs/zl_dispatch.h"             // IWYU pragma: export

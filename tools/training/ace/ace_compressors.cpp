@@ -11,6 +11,7 @@
 #include "tools/training/ace/ace_sampling.h"
 
 #include "openzl/cpp/codecs/Bitsplit.hpp"
+#include "openzl/cpp/codecs/CtxSplit.hpp"
 #include "openzl/cpp/codecs/FloatMultSplit.hpp"
 #include "openzl/cpp/codecs/IntMultSplit.hpp"
 #include "openzl/cpp/codecs/Partition.hpp"
@@ -76,6 +77,10 @@ std::vector<ACENode> makeAllNodes()
             nodes::PcoBinSplit{ nodes::PcoBinSplit::LatentMode::Signed }));
     n.push_back(buildNode(
             nodes::PcoBinSplit{ nodes::PcoBinSplit::LatentMode::Float }));
+    for (int nCtxLog : { 2, 3 }) {
+        n.push_back(buildNode(nodes::CtxSplit{ nCtxLog }));
+        n.push_back(buildNode(nodes::CtxSplitNum{ nCtxLog }));
+    }
     n.push_back(buildNode(nodes::TransposeSplit{}));
     n.push_back(buildNode(nodes::BitsplitFP{}));
     n.push_back(buildNode(nodes::BitsplitBF16{}));
@@ -256,6 +261,25 @@ std::vector<ACECompressor> makePrebuiltNumericCompressors()
             buildNode(nodes::IntMultSplit{
                     nodes::IntMultSplit::Mode::Signed }),
             { lookbackPcoBin2, compressGeneric });
+    ACECompressor ctxSplitNumFse(buildNode(nodes::CtxSplitNum{ 3 }), { fse });
+    ACECompressor ctxSplitNumEntropy(
+            buildNode(nodes::CtxSplitNum{ 3 }), { entropy });
+    ACECompressor pcoBinUnsignedCtxFse(
+            buildNode(nodes::PcoBinSplit{
+                    nodes::PcoBinSplit::LatentMode::Unsigned }),
+            { ctxSplitNumFse, store });
+    ACECompressor pcoBinSignedCtxFse(
+            buildNode(nodes::PcoBinSplit{
+                    nodes::PcoBinSplit::LatentMode::Signed }),
+            { ctxSplitNumFse, store });
+    ACECompressor deltaPcoBinSignedCtx(
+            buildNode(nodes::DeltaInt{}), { pcoBinSignedCtxFse });
+    ACECompressor lookbackPcoBinCtx(
+            buildNode(nodes::LookbackDelta{}),
+            { pcoBinSignedCtxFse, pcoBinUnsignedCtxFse });
+    ACECompressor deltaZigzagCtxFse(
+            buildNode(nodes::DeltaInt{}),
+            { ACECompressor(buildNode(nodes::Zigzag{}), { ctxSplitNumFse }) });
     std::vector<ACECompressor> prebuilt = {
         fieldLz,
         zstd,
@@ -299,6 +323,13 @@ std::vector<ACECompressor> makePrebuiltNumericCompressors()
         floatMultDeltaPcoBin,
         floatMultPcoBin,
         intMultSignedLookbackPcoBin,
+        ctxSplitNumFse,
+        ctxSplitNumEntropy,
+        pcoBinUnsignedCtxFse,
+        pcoBinSignedCtxFse,
+        deltaPcoBinSignedCtx,
+        lookbackPcoBinCtx,
+        deltaZigzagCtxFse,
     };
     if (transformerAllowed()) {
         prebuilt.insert(prebuilt.begin(), transformer);
@@ -502,6 +533,24 @@ std::vector<ACECompressor> makePrebuiltSerialCompressors()
     ACECompressor floatMultLookbackPcoBin(
             buildNode(nodes::FloatMultSplit{}),
             { lookbackPcoBin2, pcoBinSignedFse });
+    ACECompressor ctxSplitFse(buildNode(nodes::CtxSplit{ 3 }), { fse });
+    ACECompressor ctxSplitEntropy(buildNode(nodes::CtxSplit{ 3 }), { entropy });
+    ACECompressor ctxSplit4Fse(buildNode(nodes::CtxSplit{ 2 }), { fse });
+    compressors.push_back(ctxSplitFse);
+    compressors.push_back(ctxSplitEntropy);
+    compressors.push_back(ctxSplit4Fse);
+
+    ACECompressor ctxSplitNumFse(buildNode(nodes::CtxSplitNum{ 3 }), { fse });
+    ACECompressor pcoBinUnsignedCtxFse(
+            buildNode(nodes::PcoBinSplit{
+                    nodes::PcoBinSplit::LatentMode::Unsigned }),
+            { ctxSplitNumFse, store });
+    ACECompressor pcoBinSignedCtxFse(
+            buildNode(nodes::PcoBinSplit{
+                    nodes::PcoBinSplit::LatentMode::Signed }),
+            { ctxSplitNumFse, store });
+    ACECompressor deltaPcoBinSignedCtx(
+            buildNode(nodes::DeltaInt{}), { pcoBinSignedCtxFse });
     std::vector<ACECompressor> coreNumeric = {
         zstd,
         fieldLz,
@@ -518,6 +567,9 @@ std::vector<ACECompressor> makePrebuiltSerialCompressors()
         lookbackPcoBin2,
         intMultDeltaPcoBin,
         floatMultLookbackPcoBin,
+        ctxSplitNumFse,
+        pcoBinUnsignedCtxFse,
+        deltaPcoBinSignedCtx,
     };
     const bool bigEndian = std::getenv("ACE_BIG_ENDIAN") != nullptr;
     for (const auto& compressor : coreNumeric) {
@@ -824,7 +876,8 @@ uint32_t inferNodeOutputWidth(
     }
     if (nm == "zl.delta_int" || nm == "zl.zigzag" || nm == "zl.range_pack"
         || nm == "zl.divide_by" || nm == "zl.int_mult_split"
-        || nm == "zl.float_mult_split" || nm == "zl.merge_sorted") {
+        || nm == "zl.float_mult_split" || nm == "zl.ctx_split_num"
+        || nm == "zl.merge_sorted") {
         return inputWidth;
     }
     if (nm == "zl.tokenize_numeric") {
@@ -949,6 +1002,13 @@ ACECompressor buildRandomNodeCompressor(
                             maxDepth - 1,
                             outWidth)));
         }
+    }
+    const auto isCtxSplit = [](std::string_view nm) {
+        return nm == "zl.ctx_split" || nm == "zl.ctx_split_num";
+    };
+    if (isCtxSplit(node.name) && successors[0]->isNode()
+        && isCtxSplit(successors[0]->asNode().node.name)) {
+        return *successors[0];
     }
     if ((node.name == "zl.zigzag" || node.name == "zl.range_pack"
          || node.name == "zl.int_mult_split"
