@@ -165,6 +165,151 @@ ZL_FORCE_INLINE bool tokenizeDecodeEltWidthIdxWidth(
         size_t idxWidth)
 {
     ZL_ASSERT_NE(alphabetSize, 0, "Already validated");
+    if (idxWidth == 1 && eltWidth == 2) {
+        uint16_t const* const alpha16 = (uint16_t const*)alphabet;
+        uint8_t const* const idx8     = (uint8_t const*)indices;
+        uint16_t* const dst16         = (uint16_t*)dst;
+        size_t i                      = 0;
+#if ZL_HAS_AVX2
+        if (alphabetSize <= 16u && nbElts >= 32u) {
+            uint8_t aLo[16], aHi[16];
+            uint16_t const a0 = alpha16[0];
+            for (size_t a = 0; a < 16u; ++a) {
+                uint16_t const v = (a < alphabetSize) ? alpha16[a] : a0;
+                aLo[a]           = (uint8_t)(v & 0xFFu);
+                aHi[a]           = (uint8_t)(v >> 8);
+            }
+            __m256i const vLo = _mm256_broadcastsi128_si256(
+                    _mm_loadu_si128((const __m128i*)(const void*)aLo));
+            __m256i const vHi = _mm256_broadcastsi128_si256(
+                    _mm_loadu_si128((const __m128i*)(const void*)aHi));
+            __m256i const vMaxIdx =
+                    _mm256_set1_epi8((char)(uint8_t)(alphabetSize - 1u));
+            __m256i anyBad = _mm256_setzero_si256();
+            for (; i + 32u <= nbElts; i += 32u) {
+                __m256i const idx = _mm256_loadu_si256(
+                        (const __m256i*)(const void*)(idx8 + i));
+                anyBad = _mm256_or_si256(
+                        anyBad, _mm256_subs_epu8(idx, vMaxIdx));
+                __m256i const rLo = _mm256_shuffle_epi8(vLo, idx);
+                __m256i const rHi = _mm256_shuffle_epi8(vHi, idx);
+                __m256i const p0  = _mm256_unpacklo_epi8(rLo, rHi);
+                __m256i const p1  = _mm256_unpackhi_epi8(rLo, rHi);
+                _mm256_storeu_si256((__m256i*)(void*)(dst16 + i),
+                        _mm256_permute2x128_si256(p0, p1, 0x20));
+                _mm256_storeu_si256((__m256i*)(void*)(dst16 + i + 16u),
+                        _mm256_permute2x128_si256(p0, p1, 0x31));
+            }
+            if (!_mm256_testz_si256(anyBad, anyBad)) {
+                i = 0; /* Out-of-range index on corrupted input: run scalar */
+            }
+        } else if (alphabetSize <= 32u && nbElts >= 32u) {
+            uint8_t aLo0[16], aHi0[16], aLo1[16], aHi1[16];
+            uint16_t const a0 = alpha16[0];
+            for (size_t a = 0; a < 16u; ++a) {
+                uint16_t const v0 = alpha16[a];
+                uint16_t const v1 =
+                        (16u + a < alphabetSize) ? alpha16[16u + a] : a0;
+                aLo0[a] = (uint8_t)(v0 & 0xFFu);
+                aHi0[a] = (uint8_t)(v0 >> 8);
+                aLo1[a] = (uint8_t)(v1 & 0xFFu);
+                aHi1[a] = (uint8_t)(v1 >> 8);
+            }
+            __m256i const vLo0 = _mm256_broadcastsi128_si256(
+                    _mm_loadu_si128((const __m128i*)(const void*)aLo0));
+            __m256i const vHi0 = _mm256_broadcastsi128_si256(
+                    _mm_loadu_si128((const __m128i*)(const void*)aHi0));
+            __m256i const vLo1 = _mm256_broadcastsi128_si256(
+                    _mm_loadu_si128((const __m128i*)(const void*)aLo1));
+            __m256i const vHi1 = _mm256_broadcastsi128_si256(
+                    _mm_loadu_si128((const __m128i*)(const void*)aHi1));
+            __m256i const vMaxIdx =
+                    _mm256_set1_epi8((char)(uint8_t)(alphabetSize - 1u));
+            __m256i anyBad = _mm256_setzero_si256();
+            for (; i + 32u <= nbElts; i += 32u) {
+                __m256i const idx = _mm256_loadu_si256(
+                        (const __m256i*)(const void*)(idx8 + i));
+                anyBad = _mm256_or_si256(
+                        anyBad, _mm256_subs_epu8(idx, vMaxIdx));
+                __m256i const sel = _mm256_slli_epi16(idx, 3); /* bit4 -> bit7 */
+                __m256i const rLo = _mm256_blendv_epi8(
+                        _mm256_shuffle_epi8(vLo0, idx),
+                        _mm256_shuffle_epi8(vLo1, idx),
+                        sel);
+                __m256i const rHi = _mm256_blendv_epi8(
+                        _mm256_shuffle_epi8(vHi0, idx),
+                        _mm256_shuffle_epi8(vHi1, idx),
+                        sel);
+                __m256i const p0 = _mm256_unpacklo_epi8(rLo, rHi);
+                __m256i const p1 = _mm256_unpackhi_epi8(rLo, rHi);
+                _mm256_storeu_si256((__m256i*)(void*)(dst16 + i),
+                        _mm256_permute2x128_si256(p0, p1, 0x20));
+                _mm256_storeu_si256((__m256i*)(void*)(dst16 + i + 16u),
+                        _mm256_permute2x128_si256(p0, p1, 0x31));
+            }
+            if (!_mm256_testz_si256(anyBad, anyBad)) {
+                i = 0;
+            }
+        }
+#elif ZL_HAS_WASM_SIMD128
+        if (alphabetSize <= 16u && nbElts >= 16u) {
+            uint8_t aLo[16], aHi[16];
+            uint16_t const a0 = alpha16[0];
+            for (size_t a = 0; a < 16u; ++a) {
+                uint16_t const v = (a < alphabetSize) ? alpha16[a] : a0;
+                aLo[a]           = (uint8_t)(v & 0xFFu);
+                aHi[a]           = (uint8_t)(v >> 8);
+            }
+            v128_t const vLo     = wasm_v128_load(aLo);
+            v128_t const vHi     = wasm_v128_load(aHi);
+            v128_t const vMaxIdx = wasm_u8x16_splat((uint8_t)(alphabetSize - 1u));
+            v128_t anyBad        = wasm_i64x2_const(0, 0);
+            for (; i + 16u <= nbElts; i += 16u) {
+                v128_t const idx = wasm_v128_load(idx8 + i);
+                anyBad           = wasm_v128_or(anyBad, wasm_u8x16_sub_sat(idx, vMaxIdx));
+                v128_t const rLo = wasm_i8x16_swizzle(vLo, idx);
+                v128_t const rHi = wasm_i8x16_swizzle(vHi, idx);
+                wasm_v128_store(dst16 + i,
+                        wasm_i8x16_shuffle(rLo, rHi, 0, 16, 1, 17, 2, 18, 3, 19,
+                                           4, 20, 5, 21, 6, 22, 7, 23));
+                wasm_v128_store(dst16 + i + 8u,
+                        wasm_i8x16_shuffle(rLo, rHi, 8, 24, 9, 25, 10, 26, 11, 27,
+                                           12, 28, 13, 29, 14, 30, 15, 31));
+            }
+            if (wasm_v128_any_true(anyBad)) {
+                i = 0;
+            }
+        }
+#endif
+        if (i < nbElts) {
+            uint16_t padded16[256];
+            uint16_t const* alphaPtr16 = alpha16;
+            if (alphabetSize < 256u) {
+                uint16_t const a0 = alpha16[0];
+                for (size_t a = 0; a < alphabetSize; ++a) {
+                    padded16[a] = alpha16[a];
+                }
+                for (size_t a = alphabetSize; a < 256u; ++a) {
+                    padded16[a] = a0;
+                }
+                alphaPtr16 = padded16;
+            }
+            for (; i + 8u <= nbElts; i += 8u) {
+                dst16[i + 0u] = alphaPtr16[idx8[i + 0u]];
+                dst16[i + 1u] = alphaPtr16[idx8[i + 1u]];
+                dst16[i + 2u] = alphaPtr16[idx8[i + 2u]];
+                dst16[i + 3u] = alphaPtr16[idx8[i + 3u]];
+                dst16[i + 4u] = alphaPtr16[idx8[i + 4u]];
+                dst16[i + 5u] = alphaPtr16[idx8[i + 5u]];
+                dst16[i + 6u] = alphaPtr16[idx8[i + 6u]];
+                dst16[i + 7u] = alphaPtr16[idx8[i + 7u]];
+            }
+            for (; i < nbElts; ++i) {
+                dst16[i] = alphaPtr16[idx8[i]];
+            }
+        }
+        return true;
+    }
     if (idxWidth == 1 && eltWidth <= 8) {
         uint8_t padded[256 * 8];
         void const* alphaPtr = alphabet;

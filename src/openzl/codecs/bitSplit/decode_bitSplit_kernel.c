@@ -4,6 +4,7 @@
 #include <stdbool.h> /* bool */
 
 #include "openzl/codecs/bitSplit/decode_bitSplit_kernel.h"
+#include "openzl/shared/portability.h"
 
 /*
  * Specialized decoder for bf16 pattern:
@@ -162,6 +163,70 @@ static inline bool isFp32Pattern(
 }
 
 /*
+ * Specialized decoder for 2-field u16 split: src0 (u8), src1 (u8), bitWidths {sh, <=8}.
+ */
+static inline void decodeU8PairToU16(
+        void* dst,
+        size_t nbElts,
+        const void* const srcPtrs[],
+        uint8_t shift)
+{
+    uint16_t* restrict const dst16     = (uint16_t*)dst;
+    const uint8_t* restrict const lo   = (const uint8_t*)srcPtrs[0];
+    const uint8_t* restrict const hi   = (const uint8_t*)srcPtrs[1];
+    size_t e                           = 0;
+#if ZL_HAS_AVX2
+    if (shift == 8) {
+        for (; e + 32 <= nbElts; e += 32) {
+            __m256i const vlo = _mm256_loadu_si256((const __m256i*)(const void*)(lo + e));
+            __m256i const vhi = _mm256_loadu_si256((const __m256i*)(const void*)(hi + e));
+            __m256i const p0  = _mm256_unpacklo_epi8(vlo, vhi);
+            __m256i const p1  = _mm256_unpackhi_epi8(vlo, vhi);
+            _mm256_storeu_si256((__m256i*)(void*)(dst16 + e),
+                    _mm256_permute2x128_si256(p0, p1, 0x20));
+            _mm256_storeu_si256((__m256i*)(void*)(dst16 + e + 16),
+                    _mm256_permute2x128_si256(p0, p1, 0x31));
+        }
+    } else {
+        __m128i const shCnt = _mm_cvtsi32_si128((int)shift);
+        for (; e + 16 <= nbElts; e += 16) {
+            __m256i const vlo = _mm256_cvtepu8_epi16(
+                    _mm_loadu_si128((const __m128i*)(const void*)(lo + e)));
+            __m256i const vhi = _mm256_cvtepu8_epi16(
+                    _mm_loadu_si128((const __m128i*)(const void*)(hi + e)));
+            __m256i const res =
+                    _mm256_or_si256(vlo, _mm256_sll_epi16(vhi, shCnt));
+            _mm256_storeu_si256((__m256i*)(void*)(dst16 + e), res);
+        }
+    }
+#elif ZL_HAS_WASM_SIMD128
+    if (shift == 8) {
+        for (; e + 16 <= nbElts; e += 16) {
+            v128_t const vlo = wasm_v128_load(lo + e);
+            v128_t const vhi = wasm_v128_load(hi + e);
+            wasm_v128_store(dst16 + e,
+                    wasm_i8x16_shuffle(vlo, vhi, 0, 16, 1, 17, 2, 18, 3, 19,
+                                       4, 20, 5, 21, 6, 22, 7, 23));
+            wasm_v128_store(dst16 + e + 8,
+                    wasm_i8x16_shuffle(vlo, vhi, 8, 24, 9, 25, 10, 26, 11, 27,
+                                       12, 28, 13, 29, 14, 30, 15, 31));
+        }
+    } else {
+        uint32_t const sh = (uint32_t)shift;
+        for (; e + 8 <= nbElts; e += 8) {
+            v128_t const vlo = wasm_u16x8_extend_low_u8x16(wasm_v128_load64_zero(lo + e));
+            v128_t const vhi = wasm_u16x8_extend_low_u8x16(wasm_v128_load64_zero(hi + e));
+            v128_t const res = wasm_v128_or(vlo, wasm_i16x8_shl(vhi, sh));
+            wasm_v128_store(dst16 + e, res);
+        }
+    }
+#endif
+    for (; e < nbElts; e++) {
+        dst16[e] = (uint16_t)lo[e] | (uint16_t)((uint16_t)hi[e] << shift);
+    }
+}
+
+/*
  * Check if parameters match the fp64 pattern.
  */
 static inline bool isFp64Pattern(
@@ -304,6 +369,11 @@ void ZL_bitSplitDecode(
     }
     if (isFp64Pattern(dstEltWidth, srcEltWidths, bitWidths, nbWidths)) {
         decodeFp64(dst, nbElts, srcPtrs);
+        return;
+    }
+    if (nbWidths == 2 && dstEltWidth == 2 && srcEltWidths[0] == 1
+        && srcEltWidths[1] == 1 && bitWidths[0] <= 8) {
+        decodeU8PairToU16(dst, nbElts, srcPtrs, bitWidths[0]);
         return;
     }
 

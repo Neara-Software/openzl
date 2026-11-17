@@ -16,7 +16,7 @@
 #    define ZS_HAS_FAST_BITPACK 0
 #endif
 
-#if ZS_HAS_FAST_BITPACK
+#if ZS_HAS_FAST_BITPACK || ZL_HAS_AVX2
 #    include <immintrin.h>
 #endif
 
@@ -1153,6 +1153,82 @@ ZS_BITPACK_DECODE_16_T(uint64_t, convert8U16ToU64, ZS_bitpackDecode64_generic)
 
 #endif // ZS_HAS_FAST_BITPACK
 
+#if !ZS_HAS_FAST_BITPACK && (ZL_HAS_AVX2 || ZL_HAS_WASM_SIMD128)
+static const uint8_t ZS_kBitpack8Shuf[8][32] = {
+    { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    { 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 1, 2, 1, 2, 1, 2, 1, 2, 1, 2, 1, 2, 1, 2, 1, 2 },
+    { 0, 1, 0, 1, 0, 1, 0, 1, 1, 2, 1, 2, 1, 2, 1, 2, 2, 3, 2, 3, 2, 3, 2, 3, 3, 4, 3, 4, 3, 4, 3, 4 },
+    { 0, 1, 0, 1, 0, 1, 1, 2, 1, 2, 1, 2, 2, 3, 2, 3, 3, 4, 3, 4, 3, 4, 4, 5, 4, 5, 4, 5, 5, 6, 5, 6 },
+    { 0, 1, 0, 1, 1, 2, 1, 2, 2, 3, 2, 3, 3, 4, 3, 4, 4, 5, 4, 5, 5, 6, 5, 6, 6, 7, 6, 7, 7, 8, 7, 8 },
+    { 0, 1, 0, 1, 1, 2, 1, 2, 2, 3, 3, 4, 3, 4, 4, 5, 5, 6, 5, 6, 6, 7, 6, 7, 7, 8, 8, 9, 8, 9, 9, 10 },
+    { 0, 1, 0, 1, 1, 2, 2, 3, 3, 4, 3, 4, 4, 5, 5, 6, 6, 7, 6, 7, 7, 8, 8, 9, 9, 10, 9, 10, 10, 11, 11, 12 },
+    { 0, 1, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13, 14 }
+};
+static const uint16_t ZS_kBitpack8Mul[8][16] = {
+    { 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u },
+    { 32768u, 16384u, 8192u, 4096u, 2048u, 1024u, 512u, 256u, 32768u, 16384u, 8192u, 4096u, 2048u, 1024u, 512u, 256u },
+    { 16384u, 4096u, 1024u, 256u, 16384u, 4096u, 1024u, 256u, 16384u, 4096u, 1024u, 256u, 16384u, 4096u, 1024u, 256u },
+    { 8192u, 1024u, 128u, 4096u, 512u, 64u, 2048u, 256u, 8192u, 1024u, 128u, 4096u, 512u, 64u, 2048u, 256u },
+    { 4096u, 256u, 4096u, 256u, 4096u, 256u, 4096u, 256u, 4096u, 256u, 4096u, 256u, 4096u, 256u, 4096u, 256u },
+    { 2048u, 64u, 512u, 16u, 128u, 1024u, 32u, 256u, 2048u, 64u, 512u, 16u, 128u, 1024u, 32u, 256u },
+    { 1024u, 16u, 64u, 256u, 1024u, 16u, 64u, 256u, 1024u, 16u, 64u, 256u, 1024u, 16u, 64u, 256u },
+    { 512u, 4u, 8u, 16u, 32u, 64u, 128u, 256u, 512u, 4u, 8u, 16u, 32u, 64u, 128u, 256u }
+};
+
+static size_t ZS_bitpackDecode8_simd(
+        uint8_t* restrict op,
+        size_t nbElts,
+        uint8_t const* restrict ip,
+        size_t nbBits)
+{
+    ZL_ASSERT(nbBits >= 1 && nbBits <= 7);
+    ZL_ASSERT(ZL_isLittleEndian());
+    size_t const srcSize      = (nbElts * nbBits + 7) / 8;
+    uint8_t const* const iend = ip + srcSize;
+    uint8_t* const oend       = op + nbElts;
+#    if ZL_HAS_AVX2
+    size_t const bytesPer16 = nbBits * 2;
+    __m256i const shuf256 =
+            _mm256_loadu_si256((const __m256i*)ZS_kBitpack8Shuf[nbBits]);
+    __m256i const mul256 =
+            _mm256_loadu_si256((const __m256i*)ZS_kBitpack8Mul[nbBits]);
+    __m128i const shiftCnt = _mm_cvtsi32_si128((int)(16 - nbBits));
+    while (ip + 16 <= iend && op + 16 <= oend) {
+        __m128i const raw  = _mm_loadu_si128((const __m128i*)ip);
+        __m256i const dup  = _mm256_broadcastsi128_si256(raw);
+        __m256i const w    = _mm256_shuffle_epi8(dup, shuf256);
+        __m256i const prod = _mm256_mullo_epi16(w, mul256);
+        __m256i const sh   = _mm256_srl_epi16(prod, shiftCnt);
+        __m128i const pk   = _mm_packus_epi16(
+                _mm256_castsi256_si128(sh),
+                _mm256_extracti128_si256(sh, 1));
+        _mm_storeu_si128((__m128i*)op, pk);
+        ip += bytesPer16;
+        op += 16;
+    }
+#    elif ZL_HAS_WASM_SIMD128
+    size_t const bytesPer8 = nbBits;
+    v128_t const shuf128   = wasm_v128_load(ZS_kBitpack8Shuf[nbBits]);
+    v128_t const mul128    = wasm_v128_load(ZS_kBitpack8Mul[nbBits]);
+    uint32_t const shAmt   = (uint32_t)(16 - nbBits);
+    while (ip + 16 <= iend && op + 8 <= oend) {
+        v128_t const raw  = wasm_v128_load(ip);
+        v128_t const w    = wasm_i8x16_swizzle(raw, shuf128);
+        v128_t const prod = wasm_i16x8_mul(w, mul128);
+        v128_t const sh   = wasm_u16x8_shr(prod, shAmt);
+        v128_t const pk   = wasm_u8x16_narrow_i16x8(sh, sh);
+        wasm_v128_store64_lane(op, pk, 0);
+        ip += bytesPer8;
+        op += 8;
+    }
+#    endif
+    ZL_ASSERT_LE(op, oend);
+    ip += ZS_bitpackDecode8_generic(op, (size_t)(oend - op), ip, nbBits);
+    ZL_ASSERT_EQ(ip, iend);
+    return srcSize;
+}
+#endif
+
 size_t ZS_bitpackDecode8(
         uint8_t* dst,
         size_t nbElts,
@@ -1171,6 +1247,9 @@ size_t ZS_bitpackDecode8(
 
 #if ZS_HAS_FAST_BITPACK
     return ZS_BITPACK_DECODE_8_T_FN(uint8_t)(dst, nbElts, src, (size_t)nbBits);
+#elif ZL_HAS_AVX2 || ZL_HAS_WASM_SIMD128
+    return ZS_bitpackDecode8_simd(
+            dst, nbElts, (uint8_t const*)src, (size_t)nbBits);
 #else
     return ZS_bitpackDecode8_generic(dst, nbElts, src, (size_t)nbBits);
 #endif
