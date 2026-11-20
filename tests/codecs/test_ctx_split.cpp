@@ -82,6 +82,278 @@ static ZL_Report rawInjectEncoder(
     return ZL_returnSuccess();
 }
 
+struct RawWidthCase {
+    std::vector<uint8_t> header;
+    size_t eltWidth;
+    // Each stream holds a whole number of eltWidth-byte elements.
+    std::vector<std::vector<uint8_t>> streams;
+};
+
+static ZL_Report rawWidthInjectEncoder(
+        ZL_Encoder* eictx,
+        const ZL_Input* in) noexcept
+{
+    ZL_RESULT_DECLARE_SCOPE_REPORT(eictx);
+    (void)in;
+    const auto* spec =
+            static_cast<const RawWidthCase*>(ZL_Encoder_getOpaquePtr(eictx));
+    ZL_Encoder_sendCodecHeader(
+            eictx, spec->header.data(), spec->header.size());
+    for (const auto& s : spec->streams) {
+        size_t const nbElts = s.size() / spec->eltWidth;
+        ZL_Output* out      = ZL_Encoder_createTypedStream(
+                eictx, 0, nbElts, spec->eltWidth);
+        ZL_ERR_IF_NULL(out, allocation);
+        if (!s.empty()) {
+            std::memcpy(ZL_Output_ptr(out), s.data(), s.size());
+        }
+        ZL_ERR_IF_ERR(ZL_Output_commit(out, nbElts));
+    }
+    return ZL_returnSuccess();
+}
+
+// Runs DI_ctx_split on hand-built streams. Returns false if decoding fails.
+static bool decodeRawWidthCase(
+        const RawWidthCase& spec,
+        std::vector<uint8_t>& decoded)
+{
+    constexpr ZL_IDType kCustomId = 4243;
+    ZL_Compressor* cgraph         = ZL_Compressor_create();
+    EXPECT_NE(cgraph, nullptr);
+    EXPECT_FALSE(ZL_isError(ZL_Compressor_setParameter(
+            cgraph, ZL_CParam_formatVersion, ZL_MAX_FORMAT_VERSION)));
+    EXPECT_FALSE(ZL_isError(ZL_Compressor_setParameter(
+            cgraph, ZL_CParam_minStreamSize, -1)));
+    EXPECT_FALSE(ZL_isError(ZL_Compressor_setParameter(
+            cgraph, ZL_CParam_storeOnExpansion, ZL_TernaryParam_disable)));
+    // The regenerated content differs from the compression input.
+    EXPECT_FALSE(ZL_isError(ZL_Compressor_setParameter(
+            cgraph, ZL_CParam_contentChecksum, ZL_TernaryParam_disable)));
+
+    const ZL_Type voType  = ZL_Type_numeric;
+    ZL_VOEncoderDesc encD = {};
+    encD.gd.CTid          = kCustomId;
+    encD.gd.inStreamType  = ZL_Type_numeric;
+    encD.gd.voTypes       = &voType;
+    encD.gd.nbVOs         = 1;
+    encD.transform_f      = rawWidthInjectEncoder;
+    encD.name             = "raw_width_ctx_split_inject";
+    encD.opaque.ptr       = const_cast<RawWidthCase*>(&spec);
+    ZL_NodeID nid    = ZL_Compressor_registerVOEncoder(cgraph, &encD);
+    ZL_GraphID store = ZL_GRAPH_STORE;
+    ZL_GraphID gid   = ZL_Compressor_registerStaticGraph_fromNode(
+            cgraph, nid, &store, 1);
+    EXPECT_FALSE(ZL_isError(ZL_Compressor_selectStartingGraphID(cgraph, gid)));
+
+    ZL_CCtx* cctx = ZL_CCtx_create();
+    EXPECT_NE(cctx, nullptr);
+    EXPECT_FALSE(ZL_isError(ZL_CCtx_refCompressor(cctx, cgraph)));
+
+    size_t totalBytes = 0;
+    for (const auto& s : spec.streams) {
+        totalBytes += s.size();
+    }
+    // The frame records the size of the compression input, so the input must
+    // be as large as the content that the decoder regenerates.
+    std::vector<uint64_t> placeholder(totalBytes / 8 + 1);
+    ZL_TypedRef* tref = ZL_TypedRef_createNumeric(
+            placeholder.data(), spec.eltWidth, totalBytes / spec.eltWidth);
+    std::string compressed(totalBytes + 4096, '\0');
+    ZL_Report cRep = ZL_CCtx_compressTypedRef(
+            cctx, compressed.data(), compressed.size(), tref);
+    EXPECT_FALSE(ZL_isError(cRep));
+    bool ok = !ZL_isError(cRep);
+    if (ok) {
+        compressed.resize(ZL_validResult(cRep));
+
+        ZL_DCtx* dctx = ZL_DCtx_create();
+        EXPECT_NE(dctx, nullptr);
+        ZL_VODecoderDesc decD = {};
+        decD.gd.CTid          = kCustomId;
+        decD.gd.inStreamType  = ZL_Type_numeric;
+        decD.gd.voTypes       = &voType;
+        decD.gd.nbVOs         = 1;
+        decD.transform_f      = DI_ctx_split;
+        decD.name             = "raw_width_ctx_split_decode";
+        EXPECT_FALSE(ZL_isError(ZL_DCtx_registerVODecoder(dctx, &decD)));
+
+        // 8-byte aligned storage for every element width
+        std::vector<uint64_t> outBuf(totalBytes / 8 + 2);
+        ZL_TypedBuffer* outTbuf = ZL_TypedBuffer_createWrapNumeric(
+                outBuf.data(),
+                spec.eltWidth,
+                outBuf.size() * 8 / spec.eltWidth);
+        ZL_Report dRep = ZL_DCtx_decompressTBuffer(
+                dctx, outTbuf, compressed.data(), compressed.size());
+        ok = !ZL_isError(dRep);
+        if (ok) {
+            size_t const size = ZL_TypedBuffer_byteSize(outTbuf);
+            decoded.assign(
+                    reinterpret_cast<const uint8_t*>(outBuf.data()),
+                    reinterpret_cast<const uint8_t*>(outBuf.data()) + size);
+        }
+        ZL_TypedBuffer_free(outTbuf);
+        ZL_DCtx_free(dctx);
+    }
+    ZL_TypedRef_free(tref);
+    ZL_CCtx_free(cctx);
+    ZL_Compressor_free(cgraph);
+    return ok;
+}
+
+struct RawSplitParams {
+    unsigned mode; // 0 = linear, 1 = log2
+    unsigned nCtxLog;
+    unsigned shift;
+    uint64_t minVal;
+};
+
+// Reference classifier: the wire-format definition of the context class.
+static uint32_t referenceClass(const RawSplitParams& p, uint64_t prev)
+{
+    uint32_t const maxCls = (1u << p.nCtxLog) - 1u;
+    if (p.mode == 0) {
+        if (prev <= p.minVal) {
+            return 0;
+        }
+        uint64_t const d = (prev - p.minVal) >> p.shift;
+        return d >= maxCls ? maxCls : static_cast<uint32_t>(d);
+    }
+    uint32_t bitLen = 0;
+    while (prev != 0) {
+        bitLen++;
+        prev >>= 1;
+    }
+    return bitLen >= maxCls ? maxCls : bitLen;
+}
+
+// Splits `values` into per-class streams with the reference state machine.
+template <typename T>
+static RawWidthCase splitWithReference(
+        const RawSplitParams& p,
+        const std::vector<T>& values)
+{
+    std::vector<std::vector<uint8_t>> perClass(size_t(1) << p.nCtxLog);
+    uint64_t prev = 0;
+    for (T const v : values) {
+        auto& stream = perClass[referenceClass(p, prev)];
+        const auto* bytes = reinterpret_cast<const uint8_t*>(&v);
+        stream.insert(stream.end(), bytes, bytes + sizeof(T));
+        prev = static_cast<uint64_t>(v);
+    }
+
+    RawWidthCase spec;
+    spec.eltWidth      = sizeof(T);
+    uint8_t activeMask = 0;
+    for (size_t c = 0; c < perClass.size(); ++c) {
+        if (!perClass[c].empty()) {
+            activeMask |= static_cast<uint8_t>(1u << c);
+            spec.streams.push_back(std::move(perClass[c]));
+        }
+    }
+    spec.header.push_back(static_cast<uint8_t>((p.mode << 4) | p.nCtxLog));
+    spec.header.push_back(activeMask);
+    if (p.mode == 0) {
+        spec.header.push_back(static_cast<uint8_t>(p.shift));
+        uint64_t minVal = p.minVal;
+        while (minVal >= 128) {
+            spec.header.push_back(static_cast<uint8_t>(0x80 | (minVal & 0x7F)));
+            minVal >>= 7;
+        }
+        spec.header.push_back(static_cast<uint8_t>(minVal));
+    }
+    return spec;
+}
+
+// Values with class runs of very different lengths: single elements, short
+// runs, and runs much longer than a SIMD vector.
+template <typename T>
+static std::vector<T> makeRunnyValues(
+        size_t n,
+        const RawSplitParams& p,
+        uint64_t seed,
+        unsigned maxRunLog)
+{
+    uint64_t const typeMax = std::numeric_limits<T>::max();
+    uint64_t rng           = seed * 0x9E3779B97F4A7C15ULL + 1;
+    auto next              = [&rng]() {
+        rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
+        return rng >> 24;
+    };
+    std::vector<T> out;
+    out.reserve(n);
+    while (out.size() < n) {
+        // Pick a base value near a class boundary, then emit a run around it.
+        uint64_t base;
+        uint64_t const cls = next() % (uint64_t(1) << p.nCtxLog);
+        if (p.mode == 0) {
+            base = p.minVal + (cls << p.shift);
+        } else {
+            base = cls == 0 ? 0 : (uint64_t(1) << (cls - 1));
+        }
+        if (next() % 16 == 0) {
+            base = typeMax - (next() % 4);
+        }
+        size_t const runLen = 1 + next() % (size_t(1) << (next() % maxRunLog));
+        uint64_t const jitterMask =
+                next() % 4 == 0 ? 0 : (uint64_t(1) << (next() % 4)) - 1;
+        for (size_t i = 0; i < runLen && out.size() < n; ++i) {
+            uint64_t v = base + (next() & jitterMask) - (next() % 3 == 0);
+            out.push_back(static_cast<T>(v & typeMax));
+        }
+    }
+    return out;
+}
+
+template <typename T>
+static void expectDecoderMatchesReference(
+        const RawSplitParams& p,
+        const std::vector<T>& values)
+{
+    RawWidthCase const spec = splitWithReference(p, values);
+    std::vector<uint8_t> decoded;
+    ASSERT_TRUE(decodeRawWidthCase(spec, decoded))
+            << "width=" << sizeof(T) << " mode=" << p.mode
+            << " nCtxLog=" << p.nCtxLog << " shift=" << p.shift
+            << " minVal=" << p.minVal << " n=" << values.size();
+    ASSERT_EQ(decoded.size(), values.size() * sizeof(T));
+    EXPECT_EQ(0, std::memcmp(decoded.data(), values.data(), decoded.size()))
+            << "width=" << sizeof(T) << " mode=" << p.mode
+            << " nCtxLog=" << p.nCtxLog << " shift=" << p.shift
+            << " minVal=" << p.minVal << " n=" << values.size();
+}
+
+template <typename T>
+static void runDecoderReferenceSweep()
+{
+    unsigned const widthBits = 8 * sizeof(T);
+    uint64_t const typeMax   = std::numeric_limits<T>::max();
+    std::vector<RawSplitParams> params;
+    for (unsigned nCtxLog = 1; nCtxLog <= 3; ++nCtxLog) {
+        params.push_back({ 1, nCtxLog, 0, 0 });
+        for (unsigned shift : { 0u, 1u, 3u, widthBits - 3, widthBits - 1 }) {
+            for (uint64_t minVal : { uint64_t(0),
+                                     uint64_t(1),
+                                     uint64_t(100),
+                                     typeMax - 9,
+                                     typeMax }) {
+                params.push_back({ 0, nCtxLog, shift, minVal });
+            }
+        }
+    }
+    uint64_t seed = 1;
+    for (const auto& p : params) {
+        for (size_t n : { size_t(1),   size_t(2),   size_t(15),  size_t(16),
+                          size_t(17),  size_t(63),  size_t(64),  size_t(65),
+                          size_t(66),  size_t(67),  size_t(68),  size_t(131),
+                          size_t(200), size_t(1000), size_t(5000) }) {
+            unsigned const maxRunLog = 1 + static_cast<unsigned>(seed % 10);
+            expectDecoderMatchesReference(
+                    p, makeRunnyValues<T>(n, p, seed++, maxRunLog));
+        }
+    }
+}
+
 class CtxSplitTest : public CodecTest {
    protected:
     template <typename T>
@@ -507,6 +779,84 @@ TEST_F(CtxSplitTest, ReflectionAndCorruptHeaderRejection)
     //    (so prev stays 0 -> class 0 forever), but stream 0 has 2 elts & stream 1 has 2 elts!
     expectRawCaseFails(
             RawCodecCase{ { 0x11, 0x03 }, { { 0, 0 }, { 5, 5 } } });
+}
+
+TEST_F(CtxSplitTest, DecoderMatchesReferenceStateMachineU8)
+{
+    runDecoderReferenceSweep<uint8_t>();
+}
+
+TEST_F(CtxSplitTest, DecoderMatchesReferenceStateMachineU16)
+{
+    runDecoderReferenceSweep<uint16_t>();
+}
+
+TEST_F(CtxSplitTest, DecoderMatchesReferenceStateMachineU32)
+{
+    runDecoderReferenceSweep<uint32_t>();
+}
+
+TEST_F(CtxSplitTest, DecoderMatchesReferenceStateMachineU64)
+{
+    runDecoderReferenceSweep<uint64_t>();
+}
+
+TEST_F(CtxSplitTest, DecoderRejectsStreamsThatDoNotMatchTheTrajectory)
+{
+    // Move elements between streams of a valid split. The stream sizes still
+    // sum to the output size, but the state machine now runs one stream dry.
+    for (unsigned mode : { 0u, 1u }) {
+        RawSplitParams const p = { mode, 3, 0, 0 };
+        for (size_t n : { size_t(40), size_t(70), size_t(300), size_t(4000) }) {
+            for (uint64_t seed = 0; seed < 6; ++seed) {
+                auto const values = makeRunnyValues<uint8_t>(
+                        n, p, 77 + seed, 2 + unsigned(seed));
+                RawWidthCase const good = splitWithReference(p, values);
+                if (good.streams.size() < 2) {
+                    continue;
+                }
+                for (size_t from = 0; from < good.streams.size(); ++from) {
+                    size_t const to = (from + 1) % good.streams.size();
+                    for (size_t moved : { size_t(1), size_t(5), size_t(100) }) {
+                        if (good.streams[from].size() <= moved) {
+                            continue;
+                        }
+                        RawWidthCase bad = good;
+                        auto& src        = bad.streams[from];
+                        auto& dst        = bad.streams[to];
+                        dst.insert(dst.end(), src.end() - moved, src.end());
+                        src.resize(src.size() - moved);
+                        // Appending values of the same class to `to` could in
+                        // rare cases still be a consistent split, so only
+                        // require that decoding never returns wrong data.
+                        std::vector<uint8_t> decoded;
+                        if (decodeRawWidthCase(bad, decoded)) {
+                            RawWidthCase const resplit = splitWithReference(
+                                    p,
+                                    std::vector<uint8_t>(
+                                            decoded.begin(), decoded.end()));
+                            EXPECT_EQ(resplit.streams, bad.streams);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // A class that is reached but has no stream must fail, at any position.
+    for (size_t n : { size_t(3), size_t(64), size_t(67), size_t(500) }) {
+        RawSplitParams const p = { 0, 3, 0, 0 };
+        std::vector<uint8_t> values(n, 1);
+        RawWidthCase bad = splitWithReference(p, values);
+        // Class 1 holds every value but the first. Make the last value select
+        // class 2, which has no stream, then append one more class-1 value so
+        // the sizes still add up.
+        ASSERT_EQ(bad.streams.size(), n > 1 ? 2u : 1u);
+        bad.streams.back().back() = 2;
+        bad.streams.back().push_back(1);
+        std::vector<uint8_t> decoded;
+        EXPECT_FALSE(decodeRawWidthCase(bad, decoded)) << n;
+    }
 }
 
 } // namespace
