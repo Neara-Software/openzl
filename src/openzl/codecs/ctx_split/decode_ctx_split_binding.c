@@ -400,8 +400,10 @@ static int ctx_prepStreams(CtxStreams8* s)
     return 1;
 }
 
-/* Load element k of an array of 8-byte elements from its bit offset 8 * k. */
-#define CTX_LANE_PTR(type, array, c8) ((type*)(void*)((char*)(array) + (c8)))
+/* Load element k of an array from bit offset 8 * k (stride 8 on 64-bit, k on 32-bit). */
+#define CTX_LANE_PTR(type, array, c8)                                          \
+    (sizeof(*(array)) == 8 ? (type*)(void*)((char*)(array) + (c8))             \
+                           : &(array)[(c8) >> 3])
 
 static int ctx_gather_8(
         uint8_t* restrict dst,
