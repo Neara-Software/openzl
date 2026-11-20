@@ -462,6 +462,169 @@ ZL_FORCE_NOINLINE Hilbert3Top walkTop(uint32_t hi, uint64_t lo)
     return r;
 }
 
+#if ZL_HAS_AVX2
+/* Single-level Hilbert step tables, derived from ZL_hilbert3_T3:
+ * hilbert3_L1[d][state] = next state | xyz << 4 for the 3-bit key digit d
+ * (xyz = x | y << 1 | z << 2). Each table is repeated for both 128-bit lanes. */
+static const uint8_t hilbert3_L1[8][32] = {
+    { 4, 54, 87, 101, 8, 106, 59, 89, 0, 82, 99, 49, 0, 0, 0, 0,
+      4, 54, 87, 101, 8, 106, 59, 89, 0, 82, 99, 49, 0, 0, 0, 0 },
+    { 40, 27, 121, 74, 64, 35, 113, 18, 20, 71, 117, 38, 0, 0, 0, 0,
+      40, 27, 121, 74, 64, 35, 113, 18, 20, 71, 117, 38, 0, 0, 0, 0 },
+    { 104, 91, 57, 10, 80, 51, 97, 2, 52, 103, 85, 6, 0, 0, 0, 0,
+      104, 91, 57, 10, 80, 51, 97, 2, 52, 103, 85, 6, 0, 0, 0, 0 },
+    { 67, 114, 17, 32, 23, 118, 37, 68, 43, 122, 73, 24, 0, 0, 0, 0,
+      67, 114, 17, 32, 23, 118, 37, 68, 43, 122, 73, 24, 0, 0, 0, 0 },
+    { 83, 98, 1, 48, 55, 86, 5, 100, 107, 58, 9, 88, 0, 0, 0, 0,
+      83, 98, 1, 48, 55, 86, 5, 100, 107, 58, 9, 88, 0, 0, 0, 0 },
+    { 121, 74, 40, 27, 113, 18, 64, 35, 117, 38, 20, 71, 0, 0, 0, 0,
+      121, 74, 40, 27, 113, 18, 64, 35, 117, 38, 20, 71, 0, 0, 0, 0 },
+    { 57, 10, 104, 91, 97, 2, 80, 51, 85, 6, 52, 103, 0, 0, 0, 0,
+      57, 10, 104, 91, 97, 2, 80, 51, 85, 6, 52, 103, 0, 0, 0, 0 },
+    { 22, 36, 69, 119, 42, 72, 25, 123, 66, 16, 33, 115, 0, 0, 0, 0,
+      22, 36, 69, 119, 42, 72, 25, 123, 66, 16, 33, 115, 0, 0, 0, 0 }
+};
+
+/* Byte vector whose per-byte MSB is bit `bit` of the matching byte of `plane`. */
+ZL_FORCE_INLINE __m256i hilbert3_msb(__m256i plane, int bit)
+{
+    return bit == 7 ? plane : _mm256_slli_epi16(plane, 7 - bit);
+}
+
+ZL_FORCE_INLINE void hilbert3_store4_i32(
+        uint8_t* out0, uint8_t* out1, __m256i r, __m256i c1, __m256i c2)
+{
+    /* r holds 2 points per lane as 16-bit words x, y, z, _, x, y, z, _. */
+    __m256i const m1 = _mm256_setr_epi8(
+            0, 1, -1, -1, 2, 3, -1, -1, 4, 5, -1, -1, 8, 9, -1, -1,
+            0, 1, -1, -1, 2, 3, -1, -1, 4, 5, -1, -1, 8, 9, -1, -1);
+    __m256i const m2 = _mm256_setr_epi8(
+            10, 11, -1, -1, 12, 13, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+            10, 11, -1, -1, 12, 13, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+    __m256i const o1 = _mm256_or_si256(_mm256_shuffle_epi8(r, m1), c1);
+    __m256i const o2 = _mm256_or_si256(_mm256_shuffle_epi8(r, m2), c2);
+    _mm_storeu_si128((__m128i_u*)(void*)out0, _mm256_castsi256_si128(o1));
+    _mm_storel_epi64((__m128i_u*)(void*)(out0 + 16), _mm256_castsi256_si128(o2));
+    _mm_storeu_si128((__m128i_u*)(void*)out1, _mm256_extracti128_si256(o1, 1));
+    _mm_storel_epi64((__m128i_u*)(void*)(out1 + 16), _mm256_extracti128_si256(o2, 1));
+}
+
+/* Decodes 32 keys that all share `top` (same key bits >= 36): g[0..31] are
+ * plain gaps and low36 is the low 36 key bits before g[0]. The state machine
+ * runs one Hilbert level (3 key bits) per step for all 32 keys at once in byte
+ * lanes: pshufb maps the state through the 8 per-digit tables and a blend tree
+ * picks the digit's result. Lane 0 holds keys 0..15, lane 1 keys 16..31.
+ * Returns 0 without writing if a gap or the running key leaves the low 36
+ * bits; otherwise writes 32 points and the new low 36 bits. */
+ZL_FORCE_INLINE int hilbert3_i32_block32(
+        uint8_t* out, const uint64_t* g, uint64_t low36, const Hilbert3Top* top,
+        uint64_t* newLow36)
+{
+    __m256i p[8];
+    __m256i orv = _mm256_setzero_si256();
+    for (int q = 0; q < 8; q++) {
+        p[q] = _mm256_inserti128_si256(
+                _mm256_castsi128_si256(_mm_loadu_si128((const __m128i_u*)(const void*)(g + 2 * q))),
+                _mm_loadu_si128((const __m128i_u*)(const void*)(g + 16 + 2 * q)), 1);
+        orv = _mm256_or_si256(orv, p[q]);
+    }
+    if (ZL_UNLIKELY(!_mm256_testz_si256(orv, _mm256_set1_epi64x(~0xFFFFFFFFFLL)))) {
+        return 0;
+    }
+    /* In-lane prefix sums; lane 1 gets the lane 0 total added afterwards. */
+    __m256i carry = _mm256_setr_epi64x((long long)low36, (long long)low36, 0, 0);
+    for (int q = 0; q < 8; q++) {
+        p[q]  = _mm256_add_epi64(_mm256_add_epi64(p[q], _mm256_slli_si256(p[q], 8)), carry);
+        carry = _mm256_unpackhi_epi64(p[q], p[q]);
+    }
+    uint64_t const last = (uint64_t)_mm_cvtsi128_si64(_mm256_castsi256_si128(carry))
+            + (uint64_t)_mm_cvtsi128_si64(_mm256_extracti128_si256(carry, 1));
+    if (ZL_UNLIKELY((last >> 36) != 0ULL)) {
+        return 0;
+    }
+    *newLow36 = last;
+    __m256i const half = _mm256_permute2x128_si256(carry, carry, 0x08);
+
+    /* Byte planes b[k]: byte k of every key. */
+    __m256i b[5];
+    {
+        __m256i const grp = _mm256_setr_epi8(
+                0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15,
+                0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15);
+        __m256i w[4], hi[4];
+        for (int q = 0; q < 4; q++) {
+            __m256 const a0 = _mm256_castsi256_ps(_mm256_add_epi64(p[2 * q], half));
+            __m256 const a1 = _mm256_castsi256_ps(_mm256_add_epi64(p[2 * q + 1], half));
+            w[q]  = _mm256_shuffle_epi8(_mm256_castps_si256(_mm256_shuffle_ps(a0, a1, 0x88)), grp);
+            hi[q] = _mm256_castps_si256(_mm256_shuffle_ps(a0, a1, 0xDD));
+        }
+        __m256i const t0 = _mm256_unpacklo_epi32(w[0], w[1]);
+        __m256i const t1 = _mm256_unpackhi_epi32(w[0], w[1]);
+        __m256i const t2 = _mm256_unpacklo_epi32(w[2], w[3]);
+        __m256i const t3 = _mm256_unpackhi_epi32(w[2], w[3]);
+        b[0] = _mm256_unpacklo_epi64(t0, t2);
+        b[1] = _mm256_unpackhi_epi64(t0, t2);
+        b[2] = _mm256_unpacklo_epi64(t1, t3);
+        b[3] = _mm256_unpackhi_epi64(t1, t3);
+        b[4] = _mm256_packus_epi16(_mm256_packus_epi32(hi[0], hi[1]), _mm256_packus_epi32(hi[2], hi[3]));
+    }
+
+    __m256i s = _mm256_set1_epi8((char)top->s);
+    /* ax/ay/az[grp]: 4 levels each; x bits at 0..3, y at 1..4, z at 2..5. */
+    __m256i ax[3], ay[3], az[3];
+    for (int q = 0; q < 3; q++) {
+        ax[q] = ay[q] = az[q] = _mm256_setzero_si256();
+    }
+    for (int L = 11; L >= 0; L--) {
+        __m256i const m0 = hilbert3_msb(b[(3 * L) >> 3], (3 * L) & 7);
+        __m256i const m1 = hilbert3_msb(b[(3 * L + 1) >> 3], (3 * L + 1) & 7);
+        __m256i const m2 = hilbert3_msb(b[(3 * L + 2) >> 3], (3 * L + 2) & 7);
+#define H3_L1(d) _mm256_shuffle_epi8(_mm256_loadu_si256((const __m256i_u*)(const void*)hilbert3_L1[d]), s)
+        __m256i const r01 = _mm256_blendv_epi8(H3_L1(0), H3_L1(1), m0);
+        __m256i const r23 = _mm256_blendv_epi8(H3_L1(2), H3_L1(3), m0);
+        __m256i const r45 = _mm256_blendv_epi8(H3_L1(4), H3_L1(5), m0);
+        __m256i const r67 = _mm256_blendv_epi8(H3_L1(6), H3_L1(7), m0);
+#undef H3_L1
+        s = _mm256_blendv_epi8(
+                _mm256_blendv_epi8(r01, r23, m1), _mm256_blendv_epi8(r45, r67, m1), m2);
+        int const j       = L & 3;
+        __m256i const t   = _mm256_srli_epi16(s, 4 - j);
+        ax[L >> 2] = _mm256_or_si256(ax[L >> 2], _mm256_and_si256(t, _mm256_set1_epi8((char)(1 << j))));
+        ay[L >> 2] = _mm256_or_si256(ay[L >> 2], _mm256_and_si256(t, _mm256_set1_epi8((char)(2 << j))));
+        az[L >> 2] = _mm256_or_si256(az[L >> 2], _mm256_and_si256(t, _mm256_set1_epi8((char)(4 << j))));
+    }
+    __m256i const xlo = _mm256_or_si256(ax[0], _mm256_slli_epi16(ax[1], 4));
+    __m256i const ylo = _mm256_or_si256(_mm256_srli_epi16(ay[0], 1), _mm256_slli_epi16(ay[1], 3));
+    __m256i const zlo = _mm256_or_si256(_mm256_srli_epi16(az[0], 2), _mm256_slli_epi16(az[1], 2));
+    __m256i const xhi = ax[2];
+    __m256i const yhi = _mm256_srli_epi16(ay[2], 1);
+    __m256i const zhi = _mm256_srli_epi16(az[2], 2);
+
+    uint32_t const tx = top->x ^ 0x80000000u;
+    uint32_t const ty = top->y ^ 0x80000000u;
+    uint32_t const tz = top->z ^ 0x80000000u;
+    __m256i const c1  = _mm256_setr_epi32((int)tx, (int)ty, (int)tz, (int)tx, (int)tx, (int)ty, (int)tz, (int)tx);
+    __m256i const c2  = _mm256_setr_epi32((int)ty, (int)tz, 0, 0, (int)ty, (int)tz, 0, 0);
+    for (int hh = 0; hh < 2; hh++) {
+        /* 16-bit x, y, z of points 8*hh.. (lane 0) and 16+8*hh.. (lane 1) */
+        __m256i const x16 = hh ? _mm256_unpackhi_epi8(xlo, xhi) : _mm256_unpacklo_epi8(xlo, xhi);
+        __m256i const y16 = hh ? _mm256_unpackhi_epi8(ylo, yhi) : _mm256_unpacklo_epi8(ylo, yhi);
+        __m256i const z16 = hh ? _mm256_unpackhi_epi8(zlo, zhi) : _mm256_unpacklo_epi8(zlo, zhi);
+        __m256i const xy0 = _mm256_unpacklo_epi16(x16, y16);
+        __m256i const xy1 = _mm256_unpackhi_epi16(x16, y16);
+        __m256i const z0  = _mm256_unpacklo_epi16(z16, z16);
+        __m256i const z1  = _mm256_unpackhi_epi16(z16, z16);
+        uint8_t* const o0 = out + 12 * (8 * hh);
+        uint8_t* const o1 = out + 12 * (16 + 8 * hh);
+        hilbert3_store4_i32(o0 + 0, o1 + 0, _mm256_unpacklo_epi32(xy0, z0), c1, c2);
+        hilbert3_store4_i32(o0 + 24, o1 + 24, _mm256_unpackhi_epi32(xy0, z0), c1, c2);
+        hilbert3_store4_i32(o0 + 48, o1 + 48, _mm256_unpacklo_epi32(xy1, z1), c1, c2);
+        hilbert3_store4_i32(o0 + 72, o1 + 72, _mm256_unpackhi_epi32(xy1, z1), c1, c2);
+    }
+    return 1;
+}
+#endif
+
 static inline void writeXYZ32(uint8_t* dst, uint32_t x, uint32_t y, uint32_t z)
 {
     ZL_writeLE32(dst, x ^ 0x80000000u);
@@ -481,7 +644,24 @@ static size_t hilbert3DecodeI32(uint8_t* dst, const uint64_t* g, size_t n)
     size_t np = 0, i = 0;
 
 #if ZL_HAS_AVX2
+    size_t skip32 = 0, fail32 = 0;
     while (i + 24 <= n) {
+        if (skip32 > 0) {
+            skip32--;
+        } else if (i + 32 <= n && topLo != UINT64_MAX) {
+            uint64_t newLow;
+            if (ZL_LIKELY(hilbert3_i32_block32(dst + 12 * np, g + i, lo & 0xFFFFFFFFFULL, &top, &newLow))) {
+                lo = (lo & ~0xFFFFFFFFFULL) | newLow;
+                i += 32;
+                np += 32;
+                fail32 = 0;
+                continue;
+            }
+            /* Let the 8-key path below handle the block boundary; back off
+             * when 32-key blocks keep failing. */
+            fail32 = fail32 < 6 ? fail32 + 1 : 6;
+            skip32 = ((size_t)1 << fail32) >> 2;
+        }
         uint64_t const g0 = g[i + 0], g1 = g[i + 1], g2 = g[i + 2], g3 = g[i + 3];
         uint64_t const g4 = g[i + 4], g5 = g[i + 5], g6 = g[i + 6], g7 = g[i + 7];
         if (ZL_LIKELY(topLo != UINT64_MAX && (((g0 | g1 | g2 | g3 | g4 | g5 | g6 | g7) >> 36) == 0ULL))) {

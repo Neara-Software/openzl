@@ -17,6 +17,8 @@ enum {
     PBS_BATCH_N  = 256,
 };
 
+#define PBS_USE_COMB ZL_HAS_AVX2
+
 static inline uint64_t pbs_read_bits(
         const uint8_t* src,
         size_t packedBytes,
@@ -136,6 +138,31 @@ ZL_FORCE_INLINE v128_t pbs_wasm_scan8_u16(v128_t v, v128_t* accVec)
 }
 #endif
 
+#if ZL_HAS_AVX2
+/* Byte (shift / 8) of 32 consecutive uint32 as 32 bytes, in order. */
+ZL_FORCE_INLINE __m256i pbs_avx2_comb_bytes_x32(const uint32_t* c, int shift)
+{
+    __m256i const m   = _mm256_set1_epi32(0xFF);
+    __m128i const cnt = _mm_cvtsi32_si128(shift);
+    __m256i const a0  = _mm256_and_si256(_mm256_srl_epi32(_mm256_loadu_si256((const __m256i_u*)(const void*)(c + 0)), cnt), m);
+    __m256i const a1  = _mm256_and_si256(_mm256_srl_epi32(_mm256_loadu_si256((const __m256i_u*)(const void*)(c + 8)), cnt), m);
+    __m256i const a2  = _mm256_and_si256(_mm256_srl_epi32(_mm256_loadu_si256((const __m256i_u*)(const void*)(c + 16)), cnt), m);
+    __m256i const a3  = _mm256_and_si256(_mm256_srl_epi32(_mm256_loadu_si256((const __m256i_u*)(const void*)(c + 24)), cnt), m);
+    return _mm256_permutevar8x32_epi32(
+            _mm256_packus_epi16(_mm256_packus_epi32(a0, a1), _mm256_packus_epi32(a2, a3)),
+            _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7));
+}
+
+/* Low 16 bits of 16 consecutive uint32 as 16 uint16, in order. */
+ZL_FORCE_INLINE __m256i pbs_avx2_comb_lo16_x16(const uint32_t* c)
+{
+    __m256i const m  = _mm256_set1_epi32(0xFFFF);
+    __m256i const a0 = _mm256_and_si256(_mm256_loadu_si256((const __m256i_u*)(const void*)(c + 0)), m);
+    __m256i const a1 = _mm256_and_si256(_mm256_loadu_si256((const __m256i_u*)(const void*)(c + 8)), m);
+    return _mm256_permute4x64_epi64(_mm256_packus_epi32(a0, a1), 0xD8);
+}
+#endif
+
 ZL_FORCE_INLINE int pbs_pass1_batch(
         const uint8_t* binIds,
         size_t batchN,
@@ -144,10 +171,28 @@ ZL_FORCE_INLINE int pbs_pass1_batch(
         uint16_t baseBitRem,
         uint16_t bBitPos[PBS_BATCH_N],
         uint8_t bOb[PBS_BATCH_N],
-        uint32_t* outEndBitPos)
+        uint32_t* outEndBitPos,
+        const uint32_t* comb,
+        uint32_t bComb[PBS_BATCH_N])
 {
     size_t k     = 0;
     uint32_t acc = (uint32_t)baseBitRem;
+    /* More than 64 bins and elements of <= 16 bits: one scalar lookup per
+     * element fetches (lower | offsetBits << 16); SIMD splits the two. */
+    if (comb != NULL) {
+        size_t j = 0;
+        for (; j + 8u <= batchN; j += 8u) {
+            /* One 8-byte load, then shifts: halves the load count. */
+            uint64_t const w = ZL_readLE64(binIds + j);
+            bComb[j + 0u] = comb[(uint8_t)w];         bComb[j + 1u] = comb[(uint8_t)(w >> 8)];
+            bComb[j + 2u] = comb[(uint8_t)(w >> 16)]; bComb[j + 3u] = comb[(uint8_t)(w >> 24)];
+            bComb[j + 4u] = comb[(uint8_t)(w >> 32)]; bComb[j + 5u] = comb[(uint8_t)(w >> 40)];
+            bComb[j + 6u] = comb[(uint8_t)(w >> 48)]; bComb[j + 7u] = comb[(uint8_t)(w >> 56)];
+        }
+        for (; j < batchN; j++) {
+            bComb[j] = comb[binIds[j]];
+        }
+    }
 #if ZL_HAS_AVX2
     if (batchN >= 32u) {
         size_t const simdN = batchN & ~(size_t)31u;
@@ -188,12 +233,18 @@ ZL_FORCE_INLINE int pbs_pass1_batch(
                     maxB = _mm256_max_epu8(maxB, _mm256_loadu_si256((const __m256i_u*)(const void*)(binIds + j)));
                 }
             }
-            for (size_t j = 0; j < simdN; j += 8u) {
-                const uint8_t* const bp = binIds + j;
-                bOb[j + 0u] = offsetBits[bp[0]]; bOb[j + 1u] = offsetBits[bp[1]];
-                bOb[j + 2u] = offsetBits[bp[2]]; bOb[j + 3u] = offsetBits[bp[3]];
-                bOb[j + 4u] = offsetBits[bp[4]]; bOb[j + 5u] = offsetBits[bp[5]];
-                bOb[j + 6u] = offsetBits[bp[6]]; bOb[j + 7u] = offsetBits[bp[7]];
+            if (comb != NULL) {
+                for (size_t j = 0; j < simdN; j += 32u) {
+                    _mm256_storeu_si256((__m256i_u*)(void*)(bOb + j), pbs_avx2_comb_bytes_x32(bComb + j, 16));
+                }
+            } else {
+                for (size_t j = 0; j < simdN; j += 8u) {
+                    const uint8_t* const bp = binIds + j;
+                    bOb[j + 0u] = offsetBits[bp[0]]; bOb[j + 1u] = offsetBits[bp[1]];
+                    bOb[j + 2u] = offsetBits[bp[2]]; bOb[j + 3u] = offsetBits[bp[3]];
+                    bOb[j + 4u] = offsetBits[bp[4]]; bOb[j + 5u] = offsetBits[bp[5]];
+                    bOb[j + 6u] = offsetBits[bp[6]]; bOb[j + 7u] = offsetBits[bp[7]];
+                }
             }
             for (; k < simdN; k += 32u) {
                 __m256i const obVec = _mm256_loadu_si256((const __m256i_u*)(const void*)(bOb + k));
@@ -319,20 +370,124 @@ ZL_FORCE_INLINE __m256i pbs_avx2_latent64(__m256i v, int mode)
     return v;
 }
 
+/* Extract 8 offsets of <= 25 bits. Each 128-bit half holds 4 consecutive
+ * offsets, which span at most 7 + 4 * 25 bits = 14 bytes, so one unaligned
+ * 16-byte load per half plus a pshufb replaces 8 scalar loads. Reads 16 bytes
+ * starting at the byte of bpPtr[0] and of bpPtr[4]. */
 ZL_FORCE_INLINE __m256i pbs_avx2_off32_x8(
         const uint8_t* batchOffPtr, const uint16_t* bpPtr, const uint8_t* obPtr)
 {
-    __m256i const ones = _mm256_set1_epi32(1);
-    __m256i const bp32 = _mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i_u*)(const void*)bpPtr));
-    __m256i const sh32 = _mm256_and_si256(bp32, _mm256_set1_epi32(7));
-    __m256i const raw32 = _mm256_setr_epi32(
-            (int)ZL_readLE32(batchOffPtr + (bpPtr[0] >> 3)), (int)ZL_readLE32(batchOffPtr + (bpPtr[1] >> 3)),
-            (int)ZL_readLE32(batchOffPtr + (bpPtr[2] >> 3)), (int)ZL_readLE32(batchOffPtr + (bpPtr[3] >> 3)),
-            (int)ZL_readLE32(batchOffPtr + (bpPtr[4] >> 3)), (int)ZL_readLE32(batchOffPtr + (bpPtr[5] >> 3)),
-            (int)ZL_readLE32(batchOffPtr + (bpPtr[6] >> 3)), (int)ZL_readLE32(batchOffPtr + (bpPtr[7] >> 3)));
+    __m256i const ones   = _mm256_set1_epi32(1);
+    __m256i const bp32   = _mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i_u*)(const void*)bpPtr));
+    __m256i const sh32   = _mm256_and_si256(bp32, _mm256_set1_epi32(7));
+    __m256i const byte32 = _mm256_srli_epi32(bp32, 3);
+    __m256i const rel32  = _mm256_sub_epi32(byte32, _mm256_shuffle_epi32(byte32, 0x00));
+    __m256i const ctrl   = _mm256_add_epi8(
+            _mm256_shuffle_epi8(rel32, _mm256_setr_epi8(
+                    0,0,0,0, 4,4,4,4, 8,8,8,8, 12,12,12,12,
+                    0,0,0,0, 4,4,4,4, 8,8,8,8, 12,12,12,12)),
+            _mm256_set1_epi32(0x03020100));
+    __m256i const data   = _mm256_inserti128_si256(
+            _mm256_castsi128_si256(_mm_loadu_si128((const __m128i_u*)(const void*)(batchOffPtr + (bpPtr[0] >> 3)))),
+            _mm_loadu_si128((const __m128i_u*)(const void*)(batchOffPtr + (bpPtr[4] >> 3))), 1);
+    __m256i const raw32  = _mm256_shuffle_epi8(data, ctrl);
     __m256i const ob32   = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i_u*)(const void*)obPtr));
     __m256i const mask32 = _mm256_sub_epi32(_mm256_sllv_epi32(ones, ob32), ones);
     return _mm256_and_si256(_mm256_srlv_epi32(raw32, sh32), mask32);
+}
+
+/* Extract 16 offsets of <= 8 bits into 16-bit lanes. Each 128-bit half holds
+ * 8 consecutive offsets, which span at most 7 + 8 * 8 bits = 9 bytes. Reads 16
+ * bytes starting at the byte of bpPtr[0] and of bpPtr[8]. */
+ZL_FORCE_INLINE __m256i pbs_avx2_off8_x16(
+        const uint8_t* batchOffPtr, const uint16_t* bpPtr, const uint8_t* obPtr)
+{
+    __m256i const bp16   = _mm256_loadu_si256((const __m256i_u*)(const void*)bpPtr);
+    __m256i const byte16 = _mm256_srli_epi16(bp16, 3);
+    __m256i const rel16  = _mm256_sub_epi16(
+            byte16, _mm256_shuffle_epi8(byte16, _mm256_set1_epi16(0x0100)));
+    __m256i const ctrl   = _mm256_add_epi8(
+            _mm256_shuffle_epi8(rel16, _mm256_setr_epi8(
+                    0,0, 2,2, 4,4, 6,6, 8,8, 10,10, 12,12, 14,14,
+                    0,0, 2,2, 4,4, 6,6, 8,8, 10,10, 12,12, 14,14)),
+            _mm256_set1_epi16(0x0100));
+    __m256i const data   = _mm256_inserti128_si256(
+            _mm256_castsi128_si256(_mm_loadu_si128((const __m128i_u*)(const void*)(batchOffPtr + (bpPtr[0] >> 3)))),
+            _mm_loadu_si128((const __m128i_u*)(const void*)(batchOffPtr + (bpPtr[8] >> 3))), 1);
+    __m256i const raw16  = _mm256_shuffle_epi8(data, ctrl);
+    /* (raw << (7 - sh)) >> 7 == (raw >> sh) & 0x1FF */
+    __m256i const mulLut = _mm256_setr_epi8(
+            (char)128, 64, 32, 16, 8, 4, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0,
+            (char)128, 64, 32, 16, 8, 4, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0);
+    __m256i const maskLut = _mm256_setr_epi8(
+            0, 1, 3, 7, 15, 31, 63, 127, (char)255, 0, 0, 0, 0, 0, 0, 0,
+            0, 1, 3, 7, 15, 31, 63, 127, (char)255, 0, 0, 0, 0, 0, 0, 0);
+    __m256i const shIdx  = _mm256_or_si256(
+            _mm256_and_si256(bp16, _mm256_set1_epi16(7)), _mm256_set1_epi16((short)0x8000u));
+    __m256i const mul16  = _mm256_shuffle_epi8(mulLut, shIdx);
+    __m256i const ob16   = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i_u*)(const void*)obPtr));
+    __m256i const mask16 = _mm256_shuffle_epi8(maskLut, ob16);
+    return _mm256_and_si256(_mm256_srli_epi16(_mm256_mullo_epi16(raw16, mul16), 7), mask16);
+}
+
+/* Extract 16 offsets of <= 15 bits into 16-bit lanes. Each 128-bit half holds
+ * 8 consecutive offsets, which span at most 7 + 8 * 15 bits = 16 bytes. An
+ * offset starting at bit sh of byte b is assembled from byte b (its low
+ * 8 - sh bits) and from the 16-bit word at byte b + 1 (the rest). Bytes the
+ * offset does not reach only land above bit offsetBits and are masked off.
+ * Reads 16 bytes starting at the byte of bpPtr[0] and of bpPtr[8]. */
+ZL_FORCE_INLINE __m256i pbs_avx2_off15_x16(
+        const uint8_t* batchOffPtr, const uint16_t* bpPtr, const uint8_t* obPtr)
+{
+    __m256i const bp16   = _mm256_loadu_si256((const __m256i_u*)(const void*)bpPtr);
+    __m256i const byte16 = _mm256_srli_epi16(bp16, 3);
+    __m256i const rel16  = _mm256_sub_epi16(
+            byte16, _mm256_shuffle_epi8(byte16, _mm256_set1_epi16(0x0100)));
+    __m256i const zeroHi = _mm256_set1_epi16((short)0x8000u);
+    __m256i const ctrlA  = _mm256_or_si256(rel16, zeroHi);
+    __m256i const ctrlB  = _mm256_add_epi8(
+            _mm256_shuffle_epi8(rel16, _mm256_setr_epi8(
+                    0,0, 2,2, 4,4, 6,6, 8,8, 10,10, 12,12, 14,14,
+                    0,0, 2,2, 4,4, 6,6, 8,8, 10,10, 12,12, 14,14)),
+            _mm256_set1_epi16(0x0201));
+    __m256i const data   = _mm256_inserti128_si256(
+            _mm256_castsi128_si256(_mm_loadu_si128((const __m128i_u*)(const void*)(batchOffPtr + (bpPtr[0] >> 3)))),
+            _mm_loadu_si128((const __m128i_u*)(const void*)(batchOffPtr + (bpPtr[8] >> 3))), 1);
+    __m256i const mulLut = _mm256_setr_epi8(
+            (char)128, 64, 32, 16, 8, 4, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0,
+            (char)128, 64, 32, 16, 8, 4, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0);
+    __m256i const maskLoLut = _mm256_setr_epi8(
+            0, 1, 3, 7, 15, 31, 63, 127, -1, -1, -1, -1, -1, -1, -1, -1,
+            0, 1, 3, 7, 15, 31, 63, 127, -1, -1, -1, -1, -1, -1, -1, -1);
+    __m256i const maskHiLut = _mm256_setr_epi8(
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 3, 7, 15, 31, 63, 127,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 3, 7, 15, 31, 63, 127);
+    /* mul16 = 1 << (7 - sh) */
+    __m256i const mul16  = _mm256_shuffle_epi8(
+            mulLut, _mm256_or_si256(_mm256_and_si256(bp16, _mm256_set1_epi16(7)), zeroHi));
+    /* byte b >> sh */
+    __m256i const partA  = _mm256_srli_epi16(
+            _mm256_mullo_epi16(_mm256_shuffle_epi8(data, ctrlA), mul16), 7);
+    /* (word at byte b + 1) << (8 - sh) */
+    __m256i const partB  = _mm256_slli_epi16(
+            _mm256_mullo_epi16(_mm256_shuffle_epi8(data, ctrlB), mul16), 1);
+    __m256i const ob16   = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i_u*)(const void*)obPtr));
+    __m256i const mask16 = _mm256_or_si256(
+            _mm256_shuffle_epi8(maskLoLut, ob16),
+            _mm256_shuffle_epi8(maskHiLut, _mm256_slli_epi16(ob16, 8)));
+    return _mm256_and_si256(_mm256_or_si256(partA, partB), mask16);
+}
+
+/* 16 offsets of 16-bit elements into 16-bit lanes. */
+ZL_FORCE_INLINE __m256i pbs_avx2_off16_x16(
+        const uint8_t* batchOffPtr, const uint16_t* bpPtr, const uint8_t* obPtr, unsigned maxOb)
+{
+    if (maxOb <= 15u) {
+        return pbs_avx2_off15_x16(batchOffPtr, bpPtr, obPtr);
+    }
+    __m256i const o0 = pbs_avx2_off32_x8(batchOffPtr, bpPtr + 0u, obPtr + 0u);
+    __m256i const o1 = pbs_avx2_off32_x8(batchOffPtr, bpPtr + 8u, obPtr + 8u);
+    return _mm256_permute4x64_epi64(_mm256_packus_epi32(o0, o1), 0xD8);
 }
 
 ZL_FORCE_INLINE __m256i pbs_avx2_off64_x4(
@@ -546,24 +701,21 @@ ZL_FORCE_INLINE size_t pbs_simd_pass2(
         size_t fastN32,
         size_t fastN64,
         const uint16_t bBitPos[PBS_BATCH_N],
-        const uint8_t bOb[PBS_BATCH_N])
+        const uint8_t bOb[PBS_BATCH_N],
+        const uint32_t* bComb)
 {
     size_t k = 0;
 #if ZL_HAS_AVX2
     if (eltWidth == 1u) {
         uint8_t* const d8       = (uint8_t*)outPtr;
         const uint8_t* const l8 = (const uint8_t*)lowTyped;
-        __m256i const perm8     = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
         if (numBins <= 16u) {
             __m256i const lut = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i_u*)l8));
             __m256i const m0F = _mm256_set1_epi8(0x0F);
             for (; k + 32u <= fastN32; k += 32u) {
-                __m256i const o0   = pbs_avx2_off32_x8(batchOffPtr, bBitPos + k + 0u, bOb + k + 0u);
-                __m256i const o1   = pbs_avx2_off32_x8(batchOffPtr, bBitPos + k + 8u, bOb + k + 8u);
-                __m256i const o2   = pbs_avx2_off32_x8(batchOffPtr, bBitPos + k + 16u, bOb + k + 16u);
-                __m256i const o3   = pbs_avx2_off32_x8(batchOffPtr, bBitPos + k + 24u, bOb + k + 24u);
-                __m256i const off8 = _mm256_permutevar8x32_epi32(
-                        _mm256_packus_epi16(_mm256_packus_epi32(o0, o1), _mm256_packus_epi32(o2, o3)), perm8);
+                __m256i const o0   = pbs_avx2_off8_x16(batchOffPtr, bBitPos + k + 0u, bOb + k + 0u);
+                __m256i const o1   = pbs_avx2_off8_x16(batchOffPtr, bBitPos + k + 16u, bOb + k + 16u);
+                __m256i const off8 = _mm256_permute4x64_epi64(_mm256_packus_epi16(o0, o1), 0xD8);
                 __m256i const bins = _mm256_loadu_si256((const __m256i_u*)(const void*)(batchBins + k));
                 __m256i const lowVec = _mm256_shuffle_epi8(lut, _mm256_and_si256(bins, m0F));
                 _mm256_storeu_si256((__m256i_u*)(void*)(d8 + k), pbs_avx2_latent8(_mm256_add_epi8(lowVec, off8), mode));
@@ -575,12 +727,9 @@ ZL_FORCE_INLINE size_t pbs_simd_pass2(
             __m256i const lut3 = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i_u*)(l8 + 48u)));
             __m256i const m0F  = _mm256_set1_epi8(0x0F);
             for (; k + 32u <= fastN32; k += 32u) {
-                __m256i const o0   = pbs_avx2_off32_x8(batchOffPtr, bBitPos + k + 0u, bOb + k + 0u);
-                __m256i const o1   = pbs_avx2_off32_x8(batchOffPtr, bBitPos + k + 8u, bOb + k + 8u);
-                __m256i const o2   = pbs_avx2_off32_x8(batchOffPtr, bBitPos + k + 16u, bOb + k + 16u);
-                __m256i const o3   = pbs_avx2_off32_x8(batchOffPtr, bBitPos + k + 24u, bOb + k + 24u);
-                __m256i const off8 = _mm256_permutevar8x32_epi32(
-                        _mm256_packus_epi16(_mm256_packus_epi32(o0, o1), _mm256_packus_epi32(o2, o3)), perm8);
+                __m256i const o0   = pbs_avx2_off8_x16(batchOffPtr, bBitPos + k + 0u, bOb + k + 0u);
+                __m256i const o1   = pbs_avx2_off8_x16(batchOffPtr, bBitPos + k + 16u, bOb + k + 16u);
+                __m256i const off8 = _mm256_permute4x64_epi64(_mm256_packus_epi16(o0, o1), 0xD8);
                 __m256i const bins = _mm256_loadu_si256((const __m256i_u*)(const void*)(batchBins + k));
                 __m256i const bIdx = _mm256_and_si256(bins, m0F);
                 __m256i const sel0 = _mm256_slli_epi16(bins, 3);
@@ -591,22 +740,24 @@ ZL_FORCE_INLINE size_t pbs_simd_pass2(
             }
         } else {
             for (; k + 32u <= fastN32; k += 32u) {
-                __m256i const o0        = pbs_avx2_off32_x8(batchOffPtr, bBitPos + k + 0u, bOb + k + 0u);
-                __m256i const o1        = pbs_avx2_off32_x8(batchOffPtr, bBitPos + k + 8u, bOb + k + 8u);
-                __m256i const o2        = pbs_avx2_off32_x8(batchOffPtr, bBitPos + k + 16u, bOb + k + 16u);
-                __m256i const o3        = pbs_avx2_off32_x8(batchOffPtr, bBitPos + k + 24u, bOb + k + 24u);
-                __m256i const off8      = _mm256_permutevar8x32_epi32(
-                        _mm256_packus_epi16(_mm256_packus_epi32(o0, o1), _mm256_packus_epi32(o2, o3)), perm8);
-                const uint8_t* const bp = batchBins + k;
-                __m256i const lowVec    = _mm256_setr_epi8(
-                        (char)l8[bp[0]], (char)l8[bp[1]], (char)l8[bp[2]], (char)l8[bp[3]],
-                        (char)l8[bp[4]], (char)l8[bp[5]], (char)l8[bp[6]], (char)l8[bp[7]],
-                        (char)l8[bp[8]], (char)l8[bp[9]], (char)l8[bp[10]], (char)l8[bp[11]],
-                        (char)l8[bp[12]], (char)l8[bp[13]], (char)l8[bp[14]], (char)l8[bp[15]],
-                        (char)l8[bp[16]], (char)l8[bp[17]], (char)l8[bp[18]], (char)l8[bp[19]],
-                        (char)l8[bp[20]], (char)l8[bp[21]], (char)l8[bp[22]], (char)l8[bp[23]],
-                        (char)l8[bp[24]], (char)l8[bp[25]], (char)l8[bp[26]], (char)l8[bp[27]],
-                        (char)l8[bp[28]], (char)l8[bp[29]], (char)l8[bp[30]], (char)l8[bp[31]]);
+                __m256i const o0   = pbs_avx2_off8_x16(batchOffPtr, bBitPos + k + 0u, bOb + k + 0u);
+                __m256i const o1   = pbs_avx2_off8_x16(batchOffPtr, bBitPos + k + 16u, bOb + k + 16u);
+                __m256i const off8 = _mm256_permute4x64_epi64(_mm256_packus_epi16(o0, o1), 0xD8);
+                __m256i lowVec;
+                if (bComb != NULL) {
+                    lowVec = pbs_avx2_comb_bytes_x32(bComb + k, 0);
+                } else {
+                    const uint8_t* const bp = batchBins + k;
+                    lowVec = _mm256_setr_epi8(
+                            (char)l8[bp[0]], (char)l8[bp[1]], (char)l8[bp[2]], (char)l8[bp[3]],
+                            (char)l8[bp[4]], (char)l8[bp[5]], (char)l8[bp[6]], (char)l8[bp[7]],
+                            (char)l8[bp[8]], (char)l8[bp[9]], (char)l8[bp[10]], (char)l8[bp[11]],
+                            (char)l8[bp[12]], (char)l8[bp[13]], (char)l8[bp[14]], (char)l8[bp[15]],
+                            (char)l8[bp[16]], (char)l8[bp[17]], (char)l8[bp[18]], (char)l8[bp[19]],
+                            (char)l8[bp[20]], (char)l8[bp[21]], (char)l8[bp[22]], (char)l8[bp[23]],
+                            (char)l8[bp[24]], (char)l8[bp[25]], (char)l8[bp[26]], (char)l8[bp[27]],
+                            (char)l8[bp[28]], (char)l8[bp[29]], (char)l8[bp[30]], (char)l8[bp[31]]);
+                }
                 _mm256_storeu_si256((__m256i_u*)(void*)(d8 + k), pbs_avx2_latent8(_mm256_add_epi8(lowVec, off8), mode));
             }
         }
@@ -621,9 +772,7 @@ ZL_FORCE_INLINE size_t pbs_simd_pass2(
             __m128i const lutLo = _mm256_castsi256_si128(p0);
             __m128i const lutHi = _mm256_extracti128_si256(p0, 1);
             for (; k + 16u <= fastN32; k += 16u) {
-                __m256i const o0     = pbs_avx2_off32_x8(batchOffPtr, bBitPos + k + 0u, bOb + k + 0u);
-                __m256i const o1     = pbs_avx2_off32_x8(batchOffPtr, bBitPos + k + 8u, bOb + k + 8u);
-                __m256i const off16  = _mm256_permute4x64_epi64(_mm256_packus_epi32(o0, o1), 0xD8);
+                __m256i const off16 = pbs_avx2_off16_x16(batchOffPtr, bBitPos + k, bOb + k, maxOb);
                 __m128i const bins   = _mm_loadu_si128((const __m128i_u*)(const void*)(batchBins + k));
                 __m128i const loB    = _mm_shuffle_epi8(lutLo, bins);
                 __m128i const hiB    = _mm_shuffle_epi8(lutHi, bins);
@@ -641,9 +790,7 @@ ZL_FORCE_INLINE size_t pbs_simd_pass2(
             __m128i const lo3 = _mm256_castsi256_si128(p3), hi3 = _mm256_extracti128_si256(p3, 1);
             __m128i const m0F = _mm_set1_epi8(0x0F);
             for (; k + 16u <= fastN32; k += 16u) {
-                __m256i const o0     = pbs_avx2_off32_x8(batchOffPtr, bBitPos + k + 0u, bOb + k + 0u);
-                __m256i const o1     = pbs_avx2_off32_x8(batchOffPtr, bBitPos + k + 8u, bOb + k + 8u);
-                __m256i const off16  = _mm256_permute4x64_epi64(_mm256_packus_epi32(o0, o1), 0xD8);
+                __m256i const off16 = pbs_avx2_off16_x16(batchOffPtr, bBitPos + k, bOb + k, maxOb);
                 __m128i const bins   = _mm_loadu_si128((const __m128i_u*)(const void*)(batchBins + k));
                 __m128i const idx    = _mm_and_si128(bins, m0F);
                 __m128i const m1     = _mm_slli_epi16(bins, 3);
@@ -661,15 +808,18 @@ ZL_FORCE_INLINE size_t pbs_simd_pass2(
             }
         } else {
             for (; k + 16u <= fastN32; k += 16u) {
-                __m256i const o0        = pbs_avx2_off32_x8(batchOffPtr, bBitPos + k + 0u, bOb + k + 0u);
-                __m256i const o1        = pbs_avx2_off32_x8(batchOffPtr, bBitPos + k + 8u, bOb + k + 8u);
-                __m256i const off16     = _mm256_permute4x64_epi64(_mm256_packus_epi32(o0, o1), 0xD8);
-                const uint8_t* const bp = batchBins + k;
-                __m256i const lowVec    = _mm256_setr_epi16(
-                        (short)l16[bp[0]], (short)l16[bp[1]], (short)l16[bp[2]], (short)l16[bp[3]],
-                        (short)l16[bp[4]], (short)l16[bp[5]], (short)l16[bp[6]], (short)l16[bp[7]],
-                        (short)l16[bp[8]], (short)l16[bp[9]], (short)l16[bp[10]], (short)l16[bp[11]],
-                        (short)l16[bp[12]], (short)l16[bp[13]], (short)l16[bp[14]], (short)l16[bp[15]]);
+                __m256i const off16 = pbs_avx2_off16_x16(batchOffPtr, bBitPos + k, bOb + k, maxOb);
+                __m256i lowVec;
+                if (bComb != NULL) {
+                    lowVec = pbs_avx2_comb_lo16_x16(bComb + k);
+                } else {
+                    const uint8_t* const bp = batchBins + k;
+                    lowVec = _mm256_setr_epi16(
+                            (short)l16[bp[0]], (short)l16[bp[1]], (short)l16[bp[2]], (short)l16[bp[3]],
+                            (short)l16[bp[4]], (short)l16[bp[5]], (short)l16[bp[6]], (short)l16[bp[7]],
+                            (short)l16[bp[8]], (short)l16[bp[9]], (short)l16[bp[10]], (short)l16[bp[11]],
+                            (short)l16[bp[12]], (short)l16[bp[13]], (short)l16[bp[14]], (short)l16[bp[15]]);
+                }
                 _mm256_storeu_si256((__m256i_u*)(void*)(d16 + k), pbs_avx2_latent16(_mm256_add_epi16(lowVec, off16), mode));
             }
         }
@@ -839,7 +989,7 @@ ZL_FORCE_INLINE size_t pbs_simd_pass2(
     (void)outPtr; (void)eltWidth; (void)mode; (void)batchBins; (void)lowTyped;
     (void)maxOb; (void)batchOffPtr; (void)fastN32; (void)fastN64; (void)bBitPos; (void)bOb;
 #endif
-    (void)numBins;
+    (void)numBins; (void)bComb;
     return k;
 }
 
@@ -954,12 +1104,23 @@ ZL_FORCE_INLINE size_t pbs_simd_pass2(
                 memset(lowTyped + numBins, 0, (padTo - numBins) * sizeof(TYPE)); \
             }                                                                 \
         }                                                                     \
+        uint32_t comb[PBS_MAX_BINS];                                          \
+        int const useComb = PBS_USE_COMB && sizeof(TYPE) <= 2u && numBins > 64u; \
+        if (useComb) {                                                        \
+            for (size_t b = 0; b < numBins; b++) {                            \
+                comb[b] = (uint32_t)lowTyped[b] | ((uint32_t)offsetBits[b] << 16); \
+            }                                                                 \
+            if (numBins < PBS_MAX_BINS) {                                     \
+                memset(comb + numBins, 0, (PBS_MAX_BINS - numBins) * sizeof(comb[0])); \
+            }                                                                 \
+        }                                                                     \
         uint64_t bitBase = 0;                                                 \
         size_t i         = 0;                                                 \
         while (i < n) {                                                       \
             size_t const batchN = (n - i < PBS_BATCH_N) ? (n - i) : PBS_BATCH_N; \
             uint16_t bBitPos[PBS_BATCH_N];                                    \
             uint8_t bOb[PBS_BATCH_N];                                         \
+            uint32_t bComb[PBS_BATCH_N];                                      \
             uint32_t endBitPos = 0;                                           \
             ZL_ERR_IF(                                                        \
                     !pbs_pass1_batch(                                         \
@@ -970,7 +1131,9 @@ ZL_FORCE_INLINE size_t pbs_simd_pass2(
                             (uint16_t)(bitBase & 7ULL),                       \
                             bBitPos,                                          \
                             bOb,                                              \
-                            &endBitPos),                                      \
+                            &endBitPos,                                       \
+                            useComb ? comb : NULL,                            \
+                            bComb),                                           \
                     corruption);                                              \
             uint64_t const baseAligned = bitBase & ~(uint64_t)7ULL;           \
             uint64_t const endBit      = baseAligned + (uint64_t)endBitPos;   \
@@ -978,8 +1141,8 @@ ZL_FORCE_INLINE size_t pbs_simd_pass2(
             size_t const baseByte     = (size_t)(bitBase >> 3);               \
             size_t const remBytes     = packedBytes - baseByte;               \
             const uint8_t* batchOffP  = offPtr + baseByte;                    \
-            uint8_t padBuf[PBS_BATCH_N * 8u + 24u];                           \
-            size_t const endByteBound = ((size_t)endBitPos >> 3) + 9u;        \
+            uint8_t padBuf[PBS_BATCH_N * 8u + 40u];                           \
+            size_t const endByteBound = ((size_t)endBitPos >> 3) + 16u;       \
             if (ZL_UNLIKELY(endByteBound > remBytes)) {                       \
                 if (remBytes > 0u) {                                          \
                     memcpy(padBuf, batchOffP, remBytes);                      \
@@ -1002,7 +1165,8 @@ ZL_FORCE_INLINE size_t pbs_simd_pass2(
                     fastN32,                                                  \
                     fastN64,                                                  \
                     bBitPos,                                                  \
-                    bOb);                                                     \
+                    bOb,                                                      \
+                    useComb ? bComb : NULL);                                  \
             if (maxOb <= 57u) {                                               \
                 for (; k < fastN64; k++) {                                    \
                     uint8_t const b    = binIds[i + k];                       \
