@@ -38,6 +38,22 @@ size_t ZL_dispatchN_byTag_decode(
         const uint16_t* restrict tags,
         size_t nbSegments);
 
+/* ZL_dispatchN_byTag_decodeRoundRobin():
+ * Specialization of ZL_dispatchN_byTag_decode() for the case where
+ * all segments have the same size @segSize (> 0)
+ * and tags cycle through 0, 1, ..., @nbSrcs-1, 0, 1, ...
+ * In other words: interleaves @nbSrcs arrays of @segSize-byte elements.
+ * Writes exactly @nbSegments * @segSize bytes into @dst.
+ * srcs[n] must hold ceil((nbSegments - n) / nbSrcs) elements.
+ * @srcs is not modified.
+ */
+void ZL_dispatchN_byTag_decodeRoundRobin(
+        void* restrict dst,
+        const void* const restrict srcs[],
+        size_t nbSrcs,
+        size_t segSize,
+        size_t nbSegments);
+
 #if defined(__cplusplus)
 } // extern "C"
 #endif
